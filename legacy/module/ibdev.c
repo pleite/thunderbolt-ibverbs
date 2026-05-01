@@ -441,6 +441,16 @@ static int u4r_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 		pr_info("modify_qp[%u]: dest_qp = %u\n",
 			ibqp->qp_num, attr->dest_qp_num);
 	}
+	if (attr_mask & IB_QP_AV) {
+		/* Store dgid from av.grh on the QP. Single-peer routing
+		 * ignores it today; multi-peer (multi-cable) will resolve
+		 * dgid → peer at this point. */
+		const struct ib_global_route *grh = rdma_ah_read_grh(&attr->ah_attr);
+
+		qp->attr.ah_attr = attr->ah_attr;
+		pr_info("modify_qp[%u]: AV set (sgid_index=%u, hop=%u)\n",
+			ibqp->qp_num, grh->sgid_index, grh->hop_limit);
+	}
 	if (attr_mask & IB_QP_SQ_PSN)
 		qp->send_psn = attr->sq_psn;
 	if (attr_mask & IB_QP_RQ_PSN)
@@ -828,7 +838,15 @@ static int u4r_query_gid(struct ib_device *ibdev, u32 port, int idx,
 {
 	if (port != 1 || idx > 0)
 		return -EINVAL;
+	/* RoCEv2 link-local GID: fe80::/64 prefix + EUI-64 from node_guid.
+	 * RCCL and other libibverbs apps use the GID to identify the peer
+	 * out of band, then plumb it back via modify_qp(RTR).av.grh.dgid.
+	 * Our wire transport routes by tb_xdomain peer + qp_num, not by
+	 * GID — but the GID still needs to be unique per peer and in a
+	 * shape consumers will accept. */
 	memset(gid, 0, sizeof(*gid));
+	gid->raw[0] = 0xfe;
+	gid->raw[1] = 0x80;
 	memcpy(gid->raw + 8, &ibdev->node_guid, 8);
 	return 0;
 }
