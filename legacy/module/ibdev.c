@@ -58,6 +58,8 @@
 #include <linux/mutex.h>
 #include <linux/workqueue.h>
 #include <linux/dma-mapping.h>
+#include <linux/idr.h>
+#include <linux/uaccess.h>
 #include <net/addrconf.h>
 #include <net/net_namespace.h>
 
@@ -76,6 +78,9 @@
 #define U4_MAX_SGE             4
 #define U4_IB_GRH_NEXT_HDR     0x1b
 #define U4_MAX_READ_CTX        128
+#define U4_QPN_MIN             2
+#define U4_QPN_MAX             0x00ffffff
+#define U4_MAX_MSG_SIZE        SZ_1G
 
 /* ----- types ------------------------------------------------------- */
 
@@ -156,6 +161,9 @@ struct usb4_rdma_qp {
 	int attr_mask;
 	refcount_t refs;
 	wait_queue_head_t ref_wait;
+	bool qpn_allocated;
+	bool registered;
+	bool sq_sig_all;
 	struct mutex send_lock;
 	u32 send_psn;
 	u32 recv_psn;
@@ -183,6 +191,7 @@ struct usb4_rdma_ib_dev {
 
 static struct usb4_rdma_ib_dev *u4r_dev;
 static atomic_t u4r_lkey_counter = ATOMIC_INIT(1);
+static DEFINE_IDA(u4r_qpn_ida);
 
 /* ----- helpers: PD ↔ MR lookup ------------------------------------ */
 
@@ -431,6 +440,69 @@ static int u4r_cq_push_wc(struct usb4_rdma_cq *cq, const struct ib_wc *wc)
 	return 0;
 }
 
+static void u4r_flush_qp(struct usb4_rdma_qp *qp)
+{
+	struct usb4_rdma_cq *recv_cq =
+		container_of(qp->base.recv_cq, struct usb4_rdma_cq, base);
+	struct usb4_rdma_cq *send_cq =
+		container_of(qp->base.send_cq, struct usb4_rdma_cq, base);
+	LIST_HEAD(recv_flush);
+	LIST_HEAD(read_flush);
+	struct usb4_rdma_recv_wr *r, *rtmp, *in_progress;
+	struct usb4_rdma_read_ctx *read_ctx, *read_tmp;
+	unsigned long flags;
+
+	spin_lock_irqsave(&qp->recv_lock, flags);
+	list_splice_init(&qp->recv_q, &recv_flush);
+	in_progress = qp->in_progress_recv;
+	qp->in_progress_recv = NULL;
+	qp->recv_byte_offset = 0;
+	qp->recv_truncated = false;
+	spin_unlock_irqrestore(&qp->recv_lock, flags);
+
+	list_for_each_entry_safe(r, rtmp, &recv_flush, list) {
+		struct ib_wc wc = {};
+
+		list_del(&r->list);
+		wc.wr_id = r->wr_id;
+		wc.wr_cqe = r->wr_cqe;
+		wc.status = IB_WC_WR_FLUSH_ERR;
+		wc.opcode = IB_WC_RECV;
+		wc.qp = &qp->base;
+		u4r_cq_push_wc(recv_cq, &wc);
+		kfree(r);
+	}
+	if (in_progress) {
+		struct ib_wc wc = {};
+
+		wc.wr_id = in_progress->wr_id;
+		wc.wr_cqe = in_progress->wr_cqe;
+		wc.status = IB_WC_WR_FLUSH_ERR;
+		wc.opcode = IB_WC_RECV;
+		wc.qp = &qp->base;
+		u4r_cq_push_wc(recv_cq, &wc);
+		kfree(in_progress);
+	}
+
+	spin_lock_irqsave(&qp->read_lock, flags);
+	list_splice_init(&qp->read_ctxs, &read_flush);
+	qp->read_depth = 0;
+	spin_unlock_irqrestore(&qp->read_lock, flags);
+
+	list_for_each_entry_safe(read_ctx, read_tmp, &read_flush, list) {
+		struct ib_wc wc = {};
+
+		list_del(&read_ctx->list);
+		wc.wr_id = read_ctx->wr_id;
+		wc.wr_cqe = read_ctx->wr_cqe;
+		wc.status = IB_WC_WR_FLUSH_ERR;
+		wc.opcode = IB_WC_RDMA_READ;
+		wc.qp = &qp->base;
+		u4r_cq_push_wc(send_cq, &wc);
+		kfree(read_ctx);
+	}
+}
+
 /* ----- ucontext, PD, MR ------------------------------------------- */
 
 static int u4r_alloc_ucontext(struct ib_ucontext *ibuc, struct ib_udata *udata)
@@ -658,7 +730,7 @@ static int u4r_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 			 struct ib_udata *udata)
 {
 	struct usb4_rdma_qp *qp = container_of(ibqp, struct usb4_rdma_qp, base);
-	int ret;
+	int qpn, ret;
 
 	if (attr->qp_type != IB_QPT_RC && attr->qp_type != IB_QPT_GSI)
 		return -EOPNOTSUPP;
@@ -667,6 +739,9 @@ static int u4r_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 	qp->state = attr->qp_type == IB_QPT_GSI ? IB_QPS_RTS : IB_QPS_RESET;
 	refcount_set(&qp->refs, 1);
 	init_waitqueue_head(&qp->ref_wait);
+	qp->qpn_allocated = false;
+	qp->registered = false;
+	qp->sq_sig_all = attr->sq_sig_type == IB_SIGNAL_ALL_WR;
 	mutex_init(&qp->send_lock);
 	qp->send_psn = 0;
 	qp->recv_psn = 0;
@@ -680,16 +755,21 @@ static int u4r_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 		ret = usb4_rdma_data_register_qp(ibqp->qp_num, qp);
 		if (ret)
 			return ret;
+		qp->registered = true;
+	} else {
+		qpn = ida_alloc_range(&u4r_qpn_ida, U4_QPN_MIN, U4_QPN_MAX,
+				      GFP_KERNEL);
+		if (qpn < 0)
+			return qpn;
+		ibqp->qp_num = qpn;
+		qp->qpn_allocated = true;
 	}
 
-	/* Register with the data layer so RX dispatch finds us by qp_num.
-	 * IB core hasn't filled qp->qp_num yet at this point — but
-	 * qp->qp_num is the address-of-uobject hash, which is determined.
-	 * Defer RC registration until the first modify_qp INIT. QP1 is
-	 * fixed-numbered and is registered immediately above. */
-	pr_info("create_qp ok (%s, max_send_wr=%u max_recv_wr=%u)\n",
+	/* Register RC QPs with the data layer on RESET->INIT, matching
+	 * verbs lifetime. QP1 is fixed-numbered and registered immediately. */
+	pr_info("create_qp ok (%s qpn=%u, max_send_wr=%u max_recv_wr=%u)\n",
 		attr->qp_type == IB_QPT_GSI ? "GSI" : "RC",
-		attr->cap.max_send_wr, attr->cap.max_recv_wr);
+		ibqp->qp_num, attr->cap.max_send_wr, attr->cap.max_recv_wr);
 	return 0;
 }
 
@@ -698,9 +778,11 @@ static int u4r_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 {
 	struct usb4_rdma_qp *qp = container_of(ibqp, struct usb4_rdma_qp, base);
 	enum ib_qp_state old = qp->state;
+	bool flush = false;
 
 	if (attr_mask & IB_QP_STATE) {
 		qp->state = attr->qp_state;
+		flush = old != IB_QPS_ERR && attr->qp_state == IB_QPS_ERR;
 		pr_info("modify_qp[%u]: %d -> %d\n",
 			ibqp->qp_num, old, attr->qp_state);
 	}
@@ -731,12 +813,21 @@ static int u4r_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 		if (attr_mask & IB_QP_PATH_MTU)  a->path_mtu = attr->path_mtu;
 	}
 
-	if (qp->qp_type == IB_QPT_RC &&
-	    old == IB_QPS_RESET && qp->state == IB_QPS_INIT)
-		usb4_rdma_data_register_qp(ibqp->qp_num, qp);
-	if (qp->qp_type == IB_QPT_RC &&
-	    (qp->state == IB_QPS_RESET || qp->state == IB_QPS_ERR))
+	if (qp->qp_type == IB_QPT_RC && !qp->registered &&
+	    old == IB_QPS_RESET && qp->state == IB_QPS_INIT) {
+		int ret = usb4_rdma_data_register_qp(ibqp->qp_num, qp);
+
+		if (ret)
+			return ret;
+		qp->registered = true;
+	}
+	if (qp->qp_type == IB_QPT_RC && flush)
+		u4r_flush_qp(qp);
+	if (qp->qp_type == IB_QPT_RC && qp->registered &&
+	    (qp->state == IB_QPS_RESET || qp->state == IB_QPS_ERR)) {
 		usb4_rdma_data_unregister_qp(ibqp->qp_num);
+		qp->registered = false;
+	}
 	return 0;
 }
 
@@ -750,6 +841,8 @@ static int u4r_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 	attr->rq_psn   = qp->recv_psn;
 	memset(init_attr, 0, sizeof(*init_attr));
 	init_attr->qp_type = qp->qp_type;
+	init_attr->sq_sig_type = qp->sq_sig_all ? IB_SIGNAL_ALL_WR :
+				 IB_SIGNAL_REQ_WR;
 	return 0;
 }
 
@@ -767,7 +860,10 @@ static int u4r_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 	struct usb4_rdma_read_ctx *read_ctx, *tmp_read_ctx;
 	unsigned long flags;
 
-	usb4_rdma_data_unregister_qp(ibqp->qp_num);
+	if (qp->registered) {
+		usb4_rdma_data_unregister_qp(ibqp->qp_num);
+		qp->registered = false;
+	}
 	wait_event(qp->ref_wait, refcount_read(&qp->refs) == 1);
 
 	spin_lock_irqsave(&qp->recv_lock, flags);
@@ -788,6 +884,8 @@ static int u4r_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 	}
 	qp->read_depth = 0;
 	spin_unlock_irqrestore(&qp->read_lock, flags);
+	if (qp->qpn_allocated)
+		ida_free(&u4r_qpn_ida, ibqp->qp_num);
 	return 0;
 }
 
@@ -799,6 +897,7 @@ struct u4r_sge_cursor {
 	int num_sge;
 	int idx;
 	u32 off;
+	bool inline_data;
 };
 
 struct u4r_gsi_send_ctx {
@@ -918,7 +1017,8 @@ out:
 }
 
 static int u4r_validate_sges(struct usb4_rdma_pd *pd,
-			     const struct ib_send_wr *wr)
+			     const struct ib_send_wr *wr,
+			     bool inline_data)
 {
 	int i;
 
@@ -928,6 +1028,12 @@ static int u4r_validate_sges(struct usb4_rdma_pd *pd,
 
 		if (!sge->length)
 			continue;
+		if (inline_data) {
+			if (!access_ok((const void __user *)(uintptr_t)sge->addr,
+				       sge->length))
+				return -EFAULT;
+			continue;
+		}
 		mr = u4r_pd_get_mr_by_lkey(pd, sge->lkey);
 		if (!mr)
 			return -EINVAL;
@@ -997,6 +1103,17 @@ static int u4r_fill_from_sges(void *dst, u32 length, void *ctx)
 		}
 
 		chunk = min_t(u32, sge->length - c->off, length - copied);
+		if (c->inline_data) {
+			if (copy_from_user((u8 *)dst + copied,
+					   (const void __user *)(uintptr_t)
+						   (sge->addr + c->off),
+					   chunk))
+				return -EFAULT;
+			copied += chunk;
+			c->off += chunk;
+			continue;
+		}
+
 		mr = u4r_pd_get_mr_by_lkey(c->pd, sge->lkey);
 		if (!mr)
 			return -EINVAL;
@@ -1024,6 +1141,7 @@ static int u4r_send_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 		.pd = pd,
 		.sg_list = wr->sg_list,
 		.num_sge = wr->num_sge,
+		.inline_data = !!(wr->send_flags & IB_SEND_INLINE),
 	};
 	u32 total_len, sent = 0;
 	int ret;
@@ -1031,7 +1149,7 @@ static int u4r_send_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 	ret = u4r_wr_total_len(wr, &total_len);
 	if (ret)
 		return ret;
-	ret = u4r_validate_sges(pd, wr);
+	ret = u4r_validate_sges(pd, wr, cursor.inline_data);
 	if (ret)
 		return ret;
 
@@ -1074,6 +1192,7 @@ static int u4r_write_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 		.pd = pd,
 		.sg_list = wr->sg_list,
 		.num_sge = wr->num_sge,
+		.inline_data = !!(wr->send_flags & IB_SEND_INLINE),
 	};
 	u8 opcode = wr->opcode == IB_WR_RDMA_WRITE_WITH_IMM ?
 		    U4_OP_RDMA_WRITE_WITH_IMM : U4_OP_RDMA_WRITE;
@@ -1085,7 +1204,7 @@ static int u4r_write_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 	ret = u4r_wr_total_len(wr, &total_len);
 	if (ret)
 		return ret;
-	ret = u4r_validate_sges(pd, wr);
+	ret = u4r_validate_sges(pd, wr, cursor.inline_data);
 	if (ret)
 		return ret;
 	if (total_len && rwr->remote_addr > U64_MAX - total_len)
@@ -1133,7 +1252,7 @@ static int u4r_read_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 	ret = u4r_wr_total_len(wr, &total_len);
 	if (ret)
 		return ret;
-	ret = u4r_validate_sges(pd, wr);
+	ret = u4r_validate_sges(pd, wr, false);
 	if (ret)
 		return ret;
 	if (total_len && rwr->remote_addr > U64_MAX - total_len)
@@ -1145,7 +1264,7 @@ static int u4r_read_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 	INIT_LIST_HEAD(&ctx->list);
 	ctx->wr_id = wr->wr_id;
 	ctx->wr_cqe = wr->wr_cqe;
-	ctx->signaled = wr->send_flags & IB_SEND_SIGNALED;
+	ctx->signaled = qp->sq_sig_all || (wr->send_flags & IB_SEND_SIGNALED);
 	ctx->num_sge = wr->num_sge;
 	ctx->total_len = total_len;
 	ctx->status = IB_WC_SUCCESS;
@@ -1251,7 +1370,8 @@ static int u4r_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
 			return ret;
 		}
 
-		if (!defer_wc && (wr->send_flags & IB_SEND_SIGNALED)) {
+		if (!defer_wc &&
+		    (qp->sq_sig_all || (wr->send_flags & IB_SEND_SIGNALED))) {
 			wc.wr_id        = wr->wr_id;
 			wc.status       = IB_WC_SUCCESS;
 			wc.opcode       = wc_opcode;
@@ -1909,6 +2029,7 @@ static int u4r_query_port(struct ib_device *ibdev, u32 port_num,
 				: IB_PORT_PHYS_STATE_DISABLED;
 	attr->max_mtu        = IB_MTU_4096;
 	attr->active_mtu     = IB_MTU_4096;
+	attr->max_msg_sz     = U4_MAX_MSG_SIZE;
 	/* Hold link-local v1 + per-IP v2 GIDs (×2 for v4 and v6 per IP).
 	 * Kernel populates from add_gid(); we only need a sane upper bound. */
 	attr->gid_tbl_len    = 32;
@@ -2181,4 +2302,5 @@ void usb4_rdma_ibdev_exit(void)
 	u4r_dev = NULL;
 	if (ndev)
 		dev_put(ndev);
+	ida_destroy(&u4r_qpn_ida);
 }

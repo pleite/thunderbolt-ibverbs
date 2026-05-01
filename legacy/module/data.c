@@ -1565,8 +1565,9 @@ out_put:
 
 int usb4_rdma_data_register_qp(u32 qp_num, void *qp)
 {
-	struct u4_data_qp_entry *qe;
+	struct u4_data_qp_entry *qe, *cur;
 	unsigned long flags;
+	int ret = 0;
 
 	qe = kzalloc(sizeof(*qe), GFP_KERNEL);
 	if (!qe)
@@ -1575,9 +1576,18 @@ int usb4_rdma_data_register_qp(u32 qp_num, void *qp)
 	qe->qp = qp;
 
 	spin_lock_irqsave(&u4_data_qp_lock, flags);
+	hash_for_each_possible(u4_data_qp_table, cur, node, qp_num) {
+		if (cur->qp_num == qp_num) {
+			ret = -EEXIST;
+			goto out_unlock;
+		}
+	}
 	hash_add_rcu(u4_data_qp_table, &qe->node, qp_num);
+out_unlock:
 	spin_unlock_irqrestore(&u4_data_qp_lock, flags);
-	return 0;
+	if (ret)
+		kfree(qe);
+	return ret;
 }
 
 void usb4_rdma_data_unregister_qp(u32 qp_num)
