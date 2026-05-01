@@ -1255,7 +1255,24 @@ static int u4r_send_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 		goto out;
 	}
 
-	if (!cursor.inline_data) {
+	/* Zero-copy SEND is only safe with active_lane_count == 1.
+	 *
+	 * usb4_rdma_data_send_page_stream() stripes payload across lanes for
+	 * bandwidth. RC SEND's RX-side reassembly (u4r_rx_send_handler →
+	 * recv_byte_offset) is order-dependent: each frame is appended at
+	 * the running offset, so out-of-order delivery between cables would
+	 * scatter bytes to the wrong positions and U4_F_LAST could fire on
+	 * an incomplete WR. RDMA WRITE doesn't have this issue because each
+	 * wire frame carries its own remote_addr in the header — the
+	 * receiver writes each frame at the address it names, no implicit
+	 * order required.
+	 *
+	 * Until we add offset metadata to the SEND wire frames (or move to
+	 * per-fragment-PSN reassembly on RX), restrict zero-copy SEND to
+	 * single-lane. Multi-lane SENDs fall back to the staging-frame path
+	 * which serializes through one peer and preserves PSN order.
+	 */
+	if (!cursor.inline_data && usb4_rdma_data_active_lane_count() == 1) {
 		struct u4r_zc_send_cursor zc;
 
 		u4r_zc_send_cursor_init(&zc, pd, wr->sg_list, wr->num_sge);
