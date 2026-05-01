@@ -35,7 +35,8 @@
  *     accesses from process context, but mr lookup may also happen
  *     from RX path in future RDMA-write).
  *
- * No atomics, no SRQ, no RDMA-WRITE/READ yet — RC SEND/RECV only.
+ * No atomics, no SRQ, no RDMA-READ yet — RC SEND/RECV plus copied
+ * RDMA-WRITE/WRITE_WITH_IMM.
  */
 
 #define pr_fmt(fmt) "usb4_rdma/ibdev: " fmt
@@ -51,6 +52,8 @@
 #include <linux/spinlock.h>
 #include <linux/list.h>
 #include <linux/sched/mm.h>
+#include <linux/refcount.h>
+#include <linux/wait.h>
 #include <net/addrconf.h>
 
 #include <rdma/ib_verbs.h>
@@ -75,6 +78,9 @@ struct usb4_rdma_ucontext {
 struct usb4_rdma_mr {
 	struct ib_mr base;
 	struct list_head pd_link;
+	refcount_t refs;
+	wait_queue_head_t ref_wait;
+	bool dying;
 	u64 user_va;
 	u64 length;
 	int access_flags;
@@ -140,20 +146,55 @@ static atomic_t u4r_lkey_counter = ATOMIC_INIT(1);
 /* ----- helpers: PD ↔ MR lookup ------------------------------------ */
 
 static struct usb4_rdma_mr *
-u4r_pd_find_mr_by_lkey(struct usb4_rdma_pd *pd, u32 lkey)
+u4r_pd_get_mr_by_lkey(struct usb4_rdma_pd *pd, u32 lkey)
 {
 	struct usb4_rdma_mr *mr;
 	unsigned long flags;
 
 	spin_lock_irqsave(&pd->mr_lock, flags);
 	list_for_each_entry(mr, &pd->mrs, pd_link) {
-		if (mr->base.lkey == lkey) {
+		if (mr->base.lkey == lkey && !mr->dying) {
+			refcount_inc(&mr->refs);
 			spin_unlock_irqrestore(&pd->mr_lock, flags);
 			return mr;
 		}
 	}
 	spin_unlock_irqrestore(&pd->mr_lock, flags);
 	return NULL;
+}
+
+static struct usb4_rdma_mr *
+u4r_pd_get_mr_by_rkey(struct usb4_rdma_pd *pd, u32 rkey)
+{
+	struct usb4_rdma_mr *mr;
+	unsigned long flags;
+
+	spin_lock_irqsave(&pd->mr_lock, flags);
+	list_for_each_entry(mr, &pd->mrs, pd_link) {
+		if (mr->base.rkey == rkey && !mr->dying) {
+			refcount_inc(&mr->refs);
+			spin_unlock_irqrestore(&pd->mr_lock, flags);
+			return mr;
+		}
+	}
+	spin_unlock_irqrestore(&pd->mr_lock, flags);
+	return NULL;
+}
+
+static void u4r_mr_put(struct usb4_rdma_mr *mr)
+{
+	if (refcount_dec_and_test(&mr->refs))
+		WARN_ON_ONCE(1);
+	if (refcount_read(&mr->refs) == 1)
+		wake_up(&mr->ref_wait);
+}
+
+static int u4r_mr_check_range(struct usb4_rdma_mr *mr, u64 vaddr, size_t len)
+{
+	if (vaddr < mr->user_va || len > mr->length ||
+	    vaddr - mr->user_va > mr->length - len)
+		return -ERANGE;
+	return 0;
 }
 
 /* Copy `len` bytes between `kbuf` and the user-pinned MR pages,
@@ -163,9 +204,11 @@ static int u4r_mr_xfer(struct usb4_rdma_mr *mr, u64 vaddr, void *kbuf,
 {
 	u64 offset, page_idx, page_off;
 	size_t copied = 0;
+	int ret;
 
-	if (vaddr < mr->user_va || vaddr + len > mr->user_va + mr->length)
-		return -ERANGE;
+	ret = u4r_mr_check_range(mr, vaddr, len);
+	if (ret)
+		return ret;
 	offset = vaddr - mr->user_va;
 
 	while (copied < len) {
@@ -270,6 +313,8 @@ static struct ib_mr *u4r_reg_user_mr(struct ib_pd *ibpd, u64 start, u64 length,
 	mr->length      = length;
 	mr->access_flags = access_flags;
 	mr->npages      = npages;
+	refcount_set(&mr->refs, 1);
+	init_waitqueue_head(&mr->ref_wait);
 	mr->pages = kvcalloc(npages, sizeof(*mr->pages), GFP_KERNEL);
 	if (!mr->pages) {
 		err = -ENOMEM;
@@ -316,8 +361,11 @@ static int u4r_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
 	unsigned long flags;
 
 	spin_lock_irqsave(&pd->mr_lock, flags);
+	mr->dying = true;
 	list_del(&mr->pd_link);
 	spin_unlock_irqrestore(&pd->mr_lock, flags);
+
+	wait_event(mr->ref_wait, refcount_read(&mr->refs) == 1);
 
 	if (mr->pages) {
 		unpin_user_pages(mr->pages, mr->npages);
@@ -496,35 +544,42 @@ static int u4r_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 		list_del(&r->list);
 		kfree(r);
 	}
+	kfree(qp->in_progress_recv);
+	qp->in_progress_recv = NULL;
+	qp->recv_byte_offset = 0;
+	qp->recv_truncated = false;
 	spin_unlock_irqrestore(&qp->recv_lock, flags);
 	return 0;
 }
 
 /* ----- post_send -------------------------------------------------- */
 
-/* Build wire frames from one WR's SGE list and send them. For
- * messages > U4_MAX_PAYLOAD we split into multiple frames; PSN
- * advances per fragment and U4_F_LAST is set only on the final one.
- * The receiver reassembles via the in_progress_recv state on its
- * QP. RC ordering guarantees fragments arrive in PSN order. */
-static int u4r_send_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
+struct u4r_sge_cursor {
+	struct usb4_rdma_pd *pd;
+	const struct ib_sge *sg_list;
+	int num_sge;
+	int idx;
+	u32 off;
+};
+
+static int u4r_wr_total_len(const struct ib_send_wr *wr, u32 *total_len)
 {
-	struct usb4_rdma_pd *pd =
-		container_of(qp->base.pd, struct usb4_rdma_pd, base);
-	u8 *buf;
-	u32 total_len = 0, off = 0, sent = 0;
-	int i, ret = 0;
+	u32 total = 0;
+	int i;
 
-	for (i = 0; i < wr->num_sge; i++)
-		total_len += wr->sg_list[i].length;
+	for (i = 0; i < wr->num_sge; i++) {
+		if (wr->sg_list[i].length > U32_MAX - total)
+			return -EMSGSIZE;
+		total += wr->sg_list[i].length;
+	}
+	*total_len = total;
+	return 0;
+}
 
-	/* Gather all SGEs into one contiguous staging buffer. We then
-	 * slice it into U4_MAX_PAYLOAD chunks. A future zero-copy path
-	 * would walk SGEs straight into the TX ring frame; for now the
-	 * gather + slice is fine and matches the pre-fragment logic. */
-	buf = kvmalloc(total_len ? total_len : 1, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
+static int u4r_validate_sges(struct usb4_rdma_pd *pd,
+			     const struct ib_send_wr *wr)
+{
+	int i;
 
 	for (i = 0; i < wr->num_sge; i++) {
 		const struct ib_sge *sge = &wr->sg_list[i];
@@ -532,39 +587,155 @@ static int u4r_send_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 
 		if (!sge->length)
 			continue;
-		mr = u4r_pd_find_mr_by_lkey(pd, sge->lkey);
-		if (!mr) { ret = -EINVAL; goto out; }
-		ret = u4r_mr_xfer(mr, sge->addr, buf + off, sge->length, true);
-		if (ret) goto out;
-		off += sge->length;
+		mr = u4r_pd_get_mr_by_lkey(pd, sge->lkey);
+		if (!mr)
+			return -EINVAL;
+		if (u4r_mr_check_range(mr, sge->addr, sge->length)) {
+			u4r_mr_put(mr);
+			return -ERANGE;
+		}
+		u4r_mr_put(mr);
 	}
+	return 0;
+}
+
+static int u4r_fill_from_sges(void *dst, u32 length, void *ctx)
+{
+	struct u4r_sge_cursor *c = ctx;
+	u32 copied = 0;
+
+	while (copied < length) {
+		const struct ib_sge *sge;
+		struct usb4_rdma_mr *mr;
+		u32 chunk;
+
+		while (c->idx < c->num_sge &&
+		       c->off == c->sg_list[c->idx].length) {
+			c->idx++;
+			c->off = 0;
+		}
+		if (c->idx >= c->num_sge)
+			return -EINVAL;
+
+		sge = &c->sg_list[c->idx];
+		if (!sge->length) {
+			c->idx++;
+			c->off = 0;
+			continue;
+		}
+
+		chunk = min_t(u32, sge->length - c->off, length - copied);
+		mr = u4r_pd_get_mr_by_lkey(c->pd, sge->lkey);
+		if (!mr)
+			return -EINVAL;
+		if (u4r_mr_xfer(mr, sge->addr + c->off, (u8 *)dst + copied,
+				chunk, true)) {
+			u4r_mr_put(mr);
+			return -EFAULT;
+		}
+		u4r_mr_put(mr);
+
+		copied += chunk;
+		c->off += chunk;
+	}
+	return 0;
+}
+
+/* Build wire frames directly from one WR's SGE list. For messages larger
+ * than one USB4 frame, each fragment is copied straight from the source MR
+ * pages into the claimed TX DMA buffer; no full-message gather buffer. */
+static int u4r_send_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
+{
+	struct usb4_rdma_pd *pd =
+		container_of(qp->base.pd, struct usb4_rdma_pd, base);
+	struct u4r_sge_cursor cursor = {
+		.pd = pd,
+		.sg_list = wr->sg_list,
+		.num_sge = wr->num_sge,
+	};
+	u32 total_len, sent = 0;
+	int ret;
+
+	ret = u4r_wr_total_len(wr, &total_len);
+	if (ret)
+		return ret;
+	ret = u4r_validate_sges(pd, wr);
+	if (ret)
+		return ret;
 
 	/* Zero-byte SEND is legal — emit one frame with U4_F_LAST. */
-	if (total_len == 0) {
-		ret = usb4_rdma_data_send(qp->base.qp_num,
-					  qp->attr.dest_qp_num,
-					  qp->send_psn++,
-					  U4_F_LAST | U4_F_SOLICITED,
-					  buf, 0);
-		goto out;
-	}
+	if (total_len == 0)
+		return usb4_rdma_data_send(U4_OP_SEND, qp->base.qp_num,
+					   qp->attr.dest_qp_num,
+					   qp->send_psn++,
+					   U4_F_LAST | U4_F_SOLICITED,
+					   0, 0, 0, NULL, NULL, 0);
 
 	while (sent < total_len) {
 		u32 chunk = min_t(u32, total_len - sent, U4_MAX_PAYLOAD);
 		bool last = (sent + chunk == total_len);
 		u8 flags = last ? (U4_F_LAST | U4_F_SOLICITED) : 0;
 
-		ret = usb4_rdma_data_send(qp->base.qp_num,
+		ret = usb4_rdma_data_send(U4_OP_SEND, qp->base.qp_num,
 					  qp->attr.dest_qp_num,
 					  qp->send_psn++, flags,
-					  buf + sent, chunk);
+					  0, 0, 0, u4r_fill_from_sges,
+					  &cursor, chunk);
 		if (ret)
-			goto out;
+			return ret;
 		sent += chunk;
 	}
-out:
-	kvfree(buf);
-	return ret;
+	return 0;
+}
+
+static int u4r_write_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
+{
+	const struct ib_rdma_wr *rwr = rdma_wr(wr);
+	struct usb4_rdma_pd *pd =
+		container_of(qp->base.pd, struct usb4_rdma_pd, base);
+	struct u4r_sge_cursor cursor = {
+		.pd = pd,
+		.sg_list = wr->sg_list,
+		.num_sge = wr->num_sge,
+	};
+	u8 opcode = wr->opcode == IB_WR_RDMA_WRITE_WITH_IMM ?
+		    U4_OP_RDMA_WRITE_WITH_IMM : U4_OP_RDMA_WRITE;
+	__be32 imm_data = wr->opcode == IB_WR_RDMA_WRITE_WITH_IMM ?
+			  wr->ex.imm_data : 0;
+	u32 total_len, sent = 0;
+	int ret;
+
+	ret = u4r_wr_total_len(wr, &total_len);
+	if (ret)
+		return ret;
+	ret = u4r_validate_sges(pd, wr);
+	if (ret)
+		return ret;
+	if (total_len && rwr->remote_addr > U64_MAX - total_len)
+		return -EINVAL;
+
+	if (total_len == 0)
+		return usb4_rdma_data_send(opcode, qp->base.qp_num,
+					   qp->attr.dest_qp_num,
+					   qp->send_psn++, U4_F_LAST,
+					   imm_data, rwr->remote_addr,
+					   rwr->rkey, NULL, NULL, 0);
+
+	while (sent < total_len) {
+		u32 chunk = min_t(u32, total_len - sent, U4_MAX_PAYLOAD);
+		bool last = sent + chunk == total_len;
+		u8 flags = last ? U4_F_LAST : 0;
+
+		ret = usb4_rdma_data_send(opcode, qp->base.qp_num,
+					  qp->attr.dest_qp_num,
+					  qp->send_psn++, flags, imm_data,
+					  rwr->remote_addr + sent, rwr->rkey,
+					  u4r_fill_from_sges, &cursor, chunk);
+		if (ret)
+			return ret;
+		sent += chunk;
+	}
+	return 0;
 }
 
 static int u4r_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
@@ -582,15 +753,30 @@ static int u4r_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
 
 	for (; wr; wr = wr->next) {
 		struct ib_wc wc = {};
+		enum ib_wc_opcode wc_opcode;
 		int ret;
 
-		if (wr->opcode != IB_WR_SEND) {
+		if (wr->num_sge > U4_MAX_SGE || (wr->num_sge && !wr->sg_list)) {
+			*bad_wr = wr;
+			return -EINVAL;
+		}
+
+		switch (wr->opcode) {
+		case IB_WR_SEND:
+			ret = u4r_send_one(qp, wr);
+			wc_opcode = IB_WC_SEND;
+			break;
+		case IB_WR_RDMA_WRITE:
+		case IB_WR_RDMA_WRITE_WITH_IMM:
+			ret = u4r_write_one(qp, wr);
+			wc_opcode = IB_WC_RDMA_WRITE;
+			break;
+		default:
 			pr_warn("post_send: opcode %d not implemented\n",
 				wr->opcode);
 			*bad_wr = wr;
 			return -EOPNOTSUPP;
 		}
-		ret = u4r_send_one(qp, wr);
 		if (ret) {
 			*bad_wr = wr;
 			return ret;
@@ -599,7 +785,7 @@ static int u4r_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
 		if (wr->send_flags & IB_SEND_SIGNALED) {
 			wc.wr_id        = wr->wr_id;
 			wc.status       = IB_WC_SUCCESS;
-			wc.opcode       = IB_WC_SEND;
+			wc.opcode       = wc_opcode;
 			wc.qp           = ibqp;
 			wc.byte_len     = 0;
 			u4r_cq_push_wc(send_cq, &wc);
@@ -664,22 +850,25 @@ static int u4r_recv_scatter(struct usb4_rdma_pd *pd,
 		}
 		in_sge_off = (dst_off + copied) - cur;
 		chunk = min(sge->length - in_sge_off, len - copied);
-		mr = u4r_pd_find_mr_by_lkey(pd, sge->lkey);
+		mr = u4r_pd_get_mr_by_lkey(pd, sge->lkey);
 		if (!mr)
 			return -EINVAL;
 		if (u4r_mr_xfer(mr, sge->addr + in_sge_off,
-				(void *)payload + copied, chunk, false))
+				(void *)payload + copied, chunk, false)) {
+			u4r_mr_put(mr);
 			return -EFAULT;
+		}
+		u4r_mr_put(mr);
 		copied += chunk;
 		cur += sge->length;
 	}
 	return copied < len ? -ERANGE : 0;
 }
 
-static void u4r_rx_handler(void *qp_opaque, const struct u4_wire_hdr *hdr,
-			   const void *payload, u32 length)
+static void u4r_rx_send_handler(struct usb4_rdma_qp *qp,
+				const struct u4_wire_hdr *hdr,
+				const void *payload, u32 length)
 {
-	struct usb4_rdma_qp *qp = qp_opaque;
 	struct usb4_rdma_pd *pd =
 		container_of(qp->base.pd, struct usb4_rdma_pd, base);
 	struct usb4_rdma_cq *recv_cq =
@@ -748,6 +937,90 @@ static void u4r_rx_handler(void *qp_opaque, const struct u4_wire_hdr *hdr,
 
 	u4r_cq_push_wc(recv_cq, &wc);
 	kfree(r);
+}
+
+static void u4r_rx_rdma_write_handler(struct usb4_rdma_qp *qp,
+				      const struct u4_wire_hdr *hdr,
+				      const void *payload, u32 length)
+{
+	struct usb4_rdma_pd *pd =
+		container_of(qp->base.pd, struct usb4_rdma_pd, base);
+	struct usb4_rdma_cq *recv_cq =
+		container_of(qp->base.recv_cq, struct usb4_rdma_cq, base);
+	struct usb4_rdma_mr *mr;
+	u64 remote_addr = le64_to_cpu(hdr->remote_addr);
+	u32 rkey = le32_to_cpu(hdr->rkey);
+	bool last = !!(hdr->flags & U4_F_LAST);
+	int ret = 0;
+
+	if (length) {
+		mr = u4r_pd_get_mr_by_rkey(pd, rkey);
+		if (!mr || !(mr->access_flags & IB_ACCESS_REMOTE_WRITE)) {
+			pr_warn_ratelimited("rdma_write[qp=%u]: bad rkey 0x%x\n",
+					    qp->base.qp_num, rkey);
+			if (mr)
+				u4r_mr_put(mr);
+			return;
+		}
+		ret = u4r_mr_xfer(mr, remote_addr, (void *)payload, length, false);
+		u4r_mr_put(mr);
+		if (ret) {
+			pr_warn_ratelimited("rdma_write[qp=%u]: xfer failed %d addr=0x%llx len=%u rkey=0x%x\n",
+					    qp->base.qp_num, ret, remote_addr,
+					    length, rkey);
+			return;
+		}
+	}
+
+	if (hdr->opcode == U4_OP_RDMA_WRITE_WITH_IMM && last) {
+		struct usb4_rdma_recv_wr *r;
+		struct ib_wc wc = {};
+		unsigned long flags;
+
+		spin_lock_irqsave(&qp->recv_lock, flags);
+		r = list_first_entry_or_null(&qp->recv_q,
+					     struct usb4_rdma_recv_wr, list);
+		if (r)
+			list_del(&r->list);
+		spin_unlock_irqrestore(&qp->recv_lock, flags);
+
+		if (!r) {
+			pr_warn_ratelimited("rdma_write_imm[qp=%u]: no pending recv WR\n",
+					    qp->base.qp_num);
+			return;
+		}
+
+		wc.wr_id = r->wr_id;
+		wc.status = IB_WC_SUCCESS;
+		wc.opcode = IB_WC_RECV_RDMA_WITH_IMM;
+		wc.qp = &qp->base;
+		wc.byte_len = 0;
+		wc.ex.imm_data = cpu_to_be32(le32_to_cpu(hdr->imm_data));
+		wc.wc_flags = IB_WC_WITH_IMM;
+		wc.src_qp = le32_to_cpu(hdr->src_qp);
+		u4r_cq_push_wc(recv_cq, &wc);
+		kfree(r);
+	}
+}
+
+static void u4r_rx_handler(void *qp_opaque, const struct u4_wire_hdr *hdr,
+			   const void *payload, u32 length)
+{
+	struct usb4_rdma_qp *qp = qp_opaque;
+
+	switch (hdr->opcode) {
+	case U4_OP_SEND:
+		u4r_rx_send_handler(qp, hdr, payload, length);
+		break;
+	case U4_OP_RDMA_WRITE:
+	case U4_OP_RDMA_WRITE_WITH_IMM:
+		u4r_rx_rdma_write_handler(qp, hdr, payload, length);
+		break;
+	default:
+		pr_warn_ratelimited("rx[qp=%u]: unsupported opcode %u\n",
+				    qp->base.qp_num, hdr->opcode);
+		break;
+	}
 }
 
 /* ----- query_* (unchanged from skeleton) -------------------------- */
@@ -909,10 +1182,24 @@ void usb4_rdma_ibdev_peer_event(bool joined)
 
 	if (!u4r_dev)
 		return;
-	if (joined)
+	if (joined) {
 		n = atomic_inc_return(&u4r_dev->active_peers);
-	else
-		n = atomic_dec_return(&u4r_dev->active_peers);
+	} else {
+		int old;
+
+		do {
+			old = atomic_read(&u4r_dev->active_peers);
+			if (old <= 0) {
+				atomic_set(&u4r_dev->active_peers, 0);
+				pr_warn("peer left while no peers were active; port count clamped at 0\n");
+				n = 0;
+				goto log;
+			}
+		} while (atomic_cmpxchg(&u4r_dev->active_peers, old, old - 1) != old);
+		n = old - 1;
+	}
+
+log:
 	pr_info("peer %s, %d active — port 1 %s\n",
 		joined ? "joined" : "left", n,
 		n > 0 ? "ACTIVE" : "DOWN");

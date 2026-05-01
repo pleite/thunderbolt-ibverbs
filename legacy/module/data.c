@@ -31,6 +31,8 @@
 #include <linux/spinlock.h>
 #include <linux/hashtable.h>
 #include <linux/rwlock_types.h>
+#include <linux/rcupdate.h>
+#include <linux/wait.h>
 
 #include "usb4_rdma.h"
 #include "wire.h"
@@ -83,6 +85,10 @@ struct u4_data_peer {
 	struct u4_data_frame *rx_frames;
 
 	atomic_t tx_inflight;
+	atomic_t refs;
+	bool closing;
+	wait_queue_head_t tx_wait;
+	wait_queue_head_t ref_wait;
 
 	/* Stats — exposed via debugfs */
 	atomic64_t tx_frames_sent;
@@ -100,6 +106,7 @@ struct u4_data_qp_entry {
 	u32 qp_num;
 	void *qp;	/* opaque ib_qp; ibdev.c interprets */
 	struct hlist_node node;
+	struct rcu_head rcu;
 };
 
 #define U4_DATA_QP_HASH_BITS  6
@@ -110,6 +117,39 @@ static DEFINE_SPINLOCK(u4_data_qp_lock);
 static void (*u4_data_rx_handler)(void *qp,
 				  const struct u4_wire_hdr *hdr,
 				  const void *payload, u32 length);
+
+static struct u4_data_peer *u4_data_peer_get(void)
+{
+	struct u4_data_peer *p;
+
+	read_lock(&the_peer_lock);
+	p = the_peer;
+	if (p && !READ_ONCE(p->closing))
+		atomic_inc(&p->refs);
+	else
+		p = NULL;
+	read_unlock(&the_peer_lock);
+	return p;
+}
+
+static void u4_data_peer_put(struct u4_data_peer *p)
+{
+	if (atomic_dec_return(&p->refs) == 1)
+		wake_up(&p->ref_wait);
+}
+
+static struct u4_data_frame *u4_data_claim_tx_frame(struct u4_data_peer *p)
+{
+	int i;
+
+	for (i = 0; i < U4_DATA_FRAMES_PER_DIR; i++) {
+		struct u4_data_frame *cand = &p->tx_frames[i];
+
+		if (atomic_cmpxchg(&cand->in_use, 0, 1) == 0)
+			return cand;
+	}
+	return NULL;
+}
 
 /* ----- frame pool helpers ----------------------------------------- */
 
@@ -181,9 +221,12 @@ static void u4_data_tx_complete(struct tb_ring *ring, struct ring_frame *frame,
 				bool canceled)
 {
 	struct u4_data_frame *f = container_of(frame, typeof(*f), frame);
+	struct device *dma_dev = tb_ring_dma_device(ring);
 
+	dma_sync_single_for_cpu(dma_dev, f->dma, U4_FRAME_SIZE, DMA_TO_DEVICE);
 	atomic_dec(&f->peer->tx_inflight);
 	atomic_set(&f->in_use, 0);
+	wake_up(&f->peer->tx_wait);
 	if (!canceled)
 		atomic64_inc(&f->peer->tx_frames_sent);
 }
@@ -195,18 +238,20 @@ static void u4_data_rx_complete(struct tb_ring *ring, struct ring_frame *frame,
 	struct u4_wire_hdr *hdr;
 	void *payload;
 	u32 length;
-	struct hlist_head *head;
 	struct u4_data_qp_entry *qe;
 	void *target_qp = NULL;
 	u32 dest_qp;
-	unsigned long flags;
+	struct device *dma_dev = tb_ring_dma_device(ring);
+	u32 frame_len;
 
 	if (canceled)
 		return;
 
+	dma_sync_single_for_cpu(dma_dev, f->dma, U4_FRAME_SIZE, DMA_FROM_DEVICE);
 	atomic64_inc(&f->peer->rx_frames_recv);
+	frame_len = frame->size ?: U4_FRAME_SIZE;
 
-	if (frame->size < U4_HDR_SIZE) {
+	if (frame_len < U4_HDR_SIZE) {
 		atomic64_inc(&f->peer->rx_invalid_hdr);
 		goto repost;
 	}
@@ -218,33 +263,32 @@ static void u4_data_rx_complete(struct tb_ring *ring, struct ring_frame *frame,
 	}
 
 	length = le32_to_cpu(hdr->length);
-	if (length > U4_MAX_PAYLOAD || U4_HDR_SIZE + length > frame->size) {
+	if (length > U4_MAX_PAYLOAD || U4_HDR_SIZE + length > frame_len) {
 		atomic64_inc(&f->peer->rx_invalid_hdr);
 		goto repost;
 	}
 
 	dest_qp = le32_to_cpu(hdr->dest_qp);
-	head = &u4_data_qp_table[hash_min(dest_qp, U4_DATA_QP_HASH_BITS)];
-	spin_lock_irqsave(&u4_data_qp_lock, flags);
-	hlist_for_each_entry(qe, head, node) {
+	payload = (u8 *)f->buf + U4_HDR_SIZE;
+
+	rcu_read_lock();
+	hash_for_each_possible_rcu(u4_data_qp_table, qe, node, dest_qp) {
 		if (qe->qp_num == dest_qp) {
 			target_qp = qe->qp;
 			break;
 		}
 	}
-	spin_unlock_irqrestore(&u4_data_qp_lock, flags);
-
-	if (!target_qp) {
-		atomic64_inc(&f->peer->rx_frames_dropped);
-		goto repost;
-	}
-
-	payload = (u8 *)f->buf + U4_HDR_SIZE;
-	if (u4_data_rx_handler)
+	if (target_qp && u4_data_rx_handler)
 		u4_data_rx_handler(target_qp, hdr, payload, length);
+	rcu_read_unlock();
+
+	if (!target_qp)
+		atomic64_inc(&f->peer->rx_frames_dropped);
 
 repost:
 	/* Re-queue this RX buffer for the next frame. */
+	dma_sync_single_for_device(dma_dev, f->dma, U4_FRAME_SIZE,
+				   DMA_FROM_DEVICE);
 	tb_ring_rx(ring, &f->frame);
 }
 
@@ -291,6 +335,9 @@ int usb4_rdma_data_attach_peer(struct tb_service *svc)
 		return -ENOMEM;
 	p->svc = svc;
 	p->xd = xd;
+	atomic_set(&p->refs, 1);
+	init_waitqueue_head(&p->tx_wait);
+	init_waitqueue_head(&p->ref_wait);
 
 	/* Both peers request the same rendezvous hopid — see U4_RDV_HOP comment. */
 	out_hop = tb_xdomain_alloc_out_hopid(xd, U4_RDV_HOP);
@@ -341,7 +388,7 @@ int usb4_rdma_data_attach_peer(struct tb_service *svc)
 	dev_info(&svc->dev,
 		 "data: peer attached, ring hops tx=%d rx=%d, xdomain hops out=%d in=%d\n",
 		 p->tx_ring->hop, p->rx_ring->hop, p->out_hop, p->in_hop);
-	return 0;
+	return 1;
 
 err_started:
 	tb_ring_stop(p->tx_ring);
@@ -362,7 +409,7 @@ err_free:
 	return ret;
 }
 
-void usb4_rdma_data_detach_peer(struct tb_service *svc)
+bool usb4_rdma_data_detach_peer(struct tb_service *svc)
 {
 	struct u4_data_peer *p;
 
@@ -370,12 +417,17 @@ void usb4_rdma_data_detach_peer(struct tb_service *svc)
 	p = the_peer;
 	if (p && p->svc != svc)
 		p = NULL;
-	if (p)
+	if (p) {
 		the_peer = NULL;
+		WRITE_ONCE(p->closing, true);
+	}
 	write_unlock(&the_peer_lock);
 
 	if (!p)
-		return;
+		return false;
+
+	wake_up_all(&p->tx_wait);
+	wait_event(p->ref_wait, atomic_read(&p->refs) == 1);
 
 	tb_xdomain_disable_paths(p->xd, p->out_hop, p->tx_ring->hop,
 				 p->in_hop, p->rx_ring->hop);
@@ -389,66 +441,82 @@ void usb4_rdma_data_detach_peer(struct tb_service *svc)
 	tb_xdomain_release_out_hopid(p->xd, p->out_hop);
 	kfree(p);
 	dev_info(&svc->dev, "data: peer detached\n");
+	return true;
 }
 
 /* ----- public: TX submit (called from post_send) ------------------ */
 
-int usb4_rdma_data_send(u32 src_qp, u32 dest_qp, u32 psn, u8 flags,
-			const void *payload, u32 length)
+int usb4_rdma_data_send(u8 opcode, u32 src_qp, u32 dest_qp, u32 psn,
+			u8 flags, __be32 imm_data, u64 remote_addr, u32 rkey,
+			usb4_rdma_data_fill_fn fill, void *fill_ctx,
+			u32 length)
 {
 	struct u4_data_peer *p;
 	struct u4_data_frame *f = NULL;
-	int i, ret;
+	int ret;
 
 	if (length > U4_MAX_PAYLOAD)
 		return -EMSGSIZE;
+	if (length && !fill)
+		return -EINVAL;
 
-	read_lock(&the_peer_lock);
-	p = the_peer;
-	if (!p) {
-		read_unlock(&the_peer_lock);
+	p = u4_data_peer_get();
+	if (!p)
+		return -ENOTCONN;
+
+	/* Fragmented WRs must not fail halfway through just because all TX
+	 * staging frames are temporarily busy. Wait for a completion to free
+	 * a slot, or for detach to mark the peer closing. */
+	wait_event(p->tx_wait,
+		   READ_ONCE(p->closing) ||
+		   (f = u4_data_claim_tx_frame(p)));
+	if (READ_ONCE(p->closing)) {
+		if (f) {
+			atomic_set(&f->in_use, 0);
+			wake_up(&p->tx_wait);
+		}
+		u4_data_peer_put(p);
 		return -ENOTCONN;
 	}
 
-	/* Find a free TX slot — atomically claim one whose in_use is 0.
-	 * The previous version checked tx_inflight against the pool size
-	 * and then always reused slot 0; under any concurrent / pipelined
-	 * post_send that trampled the ring_frame of an in-flight frame.
-	 *
-	 * Linear scan with cmpxchg-style atomic claim is fine for our
-	 * 96-slot pool; if every slot is busy we return -EBUSY and the
-	 * caller (verbs post_send) returns the WR to userspace as bad. */
-	for (i = 0; i < U4_DATA_FRAMES_PER_DIR; i++) {
-		struct u4_data_frame *cand = &p->tx_frames[i];
-		if (atomic_cmpxchg(&cand->in_use, 0, 1) == 0) {
-			f = cand;
-			break;
+	u4_wire_hdr_init((struct u4_wire_hdr *)f->buf, opcode, dest_qp, src_qp,
+			 psn, length, flags, imm_data, remote_addr, rkey);
+	if (length && fill) {
+		ret = fill((u8 *)f->buf + U4_HDR_SIZE, length, fill_ctx);
+		if (ret) {
+			atomic_set(&f->in_use, 0);
+			wake_up(&p->tx_wait);
+			u4_data_peer_put(p);
+			return ret;
 		}
 	}
-	if (!f) {
-		read_unlock(&the_peer_lock);
-		return -EBUSY;
-	}
-
-	u4_wire_hdr_init((struct u4_wire_hdr *)f->buf, U4_OP_SEND,
-			 dest_qp, src_qp, psn, length, flags);
-	if (length)
-		memcpy((u8 *)f->buf + U4_HDR_SIZE, payload, length);
 
 	f->frame.size = U4_HDR_SIZE + length;
 	f->frame.callback = u4_data_tx_complete;
 	f->frame.sof = U4_DATA_PDF_FRAME_START;
 	f->frame.eof = U4_DATA_PDF_FRAME_END;
 
+	if (READ_ONCE(p->closing)) {
+		atomic_set(&f->in_use, 0);
+		wake_up(&p->tx_wait);
+		u4_data_peer_put(p);
+		return -ENOTCONN;
+	}
+
+	dma_sync_single_for_device(tb_ring_dma_device(p->tx_ring), f->dma,
+				   U4_FRAME_SIZE, DMA_TO_DEVICE);
 	atomic_inc(&p->tx_inflight);
 	ret = tb_ring_tx(p->tx_ring, &f->frame);
 	if (ret) {
+		dma_sync_single_for_cpu(tb_ring_dma_device(p->tx_ring), f->dma,
+					U4_FRAME_SIZE, DMA_TO_DEVICE);
 		atomic_dec(&p->tx_inflight);
 		atomic_set(&f->in_use, 0);
-		read_unlock(&the_peer_lock);
+		wake_up(&p->tx_wait);
+		u4_data_peer_put(p);
 		return ret;
 	}
-	read_unlock(&the_peer_lock);
+	u4_data_peer_put(p);
 	return 0;
 }
 
@@ -466,7 +534,7 @@ int usb4_rdma_data_register_qp(u32 qp_num, void *qp)
 	qe->qp = qp;
 
 	spin_lock_irqsave(&u4_data_qp_lock, flags);
-	hash_add(u4_data_qp_table, &qe->node, qp_num);
+	hash_add_rcu(u4_data_qp_table, &qe->node, qp_num);
 	spin_unlock_irqrestore(&u4_data_qp_lock, flags);
 	return 0;
 }
@@ -474,6 +542,7 @@ int usb4_rdma_data_register_qp(u32 qp_num, void *qp)
 void usb4_rdma_data_unregister_qp(u32 qp_num)
 {
 	struct u4_data_qp_entry *qe;
+	struct u4_data_qp_entry *dead = NULL;
 	struct hlist_node *tmp;
 	struct hlist_head *head;
 	unsigned long flags;
@@ -482,12 +551,17 @@ void usb4_rdma_data_unregister_qp(u32 qp_num)
 	spin_lock_irqsave(&u4_data_qp_lock, flags);
 	hlist_for_each_entry_safe(qe, tmp, head, node) {
 		if (qe->qp_num == qp_num) {
-			hash_del(&qe->node);
-			kfree(qe);
+			hash_del_rcu(&qe->node);
+			dead = qe;
 			break;
 		}
 	}
 	spin_unlock_irqrestore(&u4_data_qp_lock, flags);
+
+	if (dead) {
+		synchronize_rcu();
+		kfree(dead);
+	}
 }
 
 void usb4_rdma_data_set_rx_handler(void (*h)(void *qp,

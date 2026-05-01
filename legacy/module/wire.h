@@ -22,15 +22,17 @@
 #include <linux/types.h>
 
 #define U4_WIRE_MAGIC    0x55344452U  /* 'U4DR' */
-#define U4_WIRE_VERSION  1
+#define U4_WIRE_VERSION  2
 
 #define U4_FRAME_SIZE    4096
 #define U4_MAX_PAYLOAD   (U4_FRAME_SIZE - sizeof(struct u4_wire_hdr))
 
 enum u4_wire_op {
-	U4_OP_SEND     = 1,  /* RC SEND (data delivered to peer's recv queue) */
-	U4_OP_SEND_ACK = 2,  /* ACK from receiver back to sender */
-	/* Future: U4_OP_RDMA_WRITE, U4_OP_RDMA_READ_REQ/RESP, U4_OP_NAK, ... */
+	U4_OP_SEND      = 1,  /* RC SEND (data delivered to peer's recv queue) */
+	U4_OP_SEND_ACK  = 2,  /* ACK from receiver back to sender */
+	U4_OP_RDMA_WRITE = 3, /* one-sided write into peer MR */
+	U4_OP_RDMA_WRITE_WITH_IMM = 4, /* write + receive completion */
+	/* Future: U4_OP_RDMA_READ_REQ/RESP, U4_OP_NAK, ... */
 };
 
 enum u4_wire_flag {
@@ -48,15 +50,18 @@ struct u4_wire_hdr {
 	__le32 src_qp;      /* sender's local QP num */
 	__le32 psn;         /* packet sequence number (per-QP) */
 	__le32 length;      /* payload length, bytes */
-	__le32 imm_data;    /* immediate data (unused for SEND) */
-	__le32 reserved32;  /* pad to 32-byte header */
+	__le32 imm_data;    /* immediate data as a host-order integer */
+	__le64 remote_addr; /* RDMA remote virtual address */
+	__le32 rkey;        /* RDMA remote key */
+	__le32 reserved32;  /* pad to 48-byte header */
 };
 
 #define U4_HDR_SIZE  ((u32)sizeof(struct u4_wire_hdr))
 
 static inline void u4_wire_hdr_init(struct u4_wire_hdr *h, u8 opcode,
 				    u32 dest_qp, u32 src_qp, u32 psn,
-				    u32 length, u8 flags)
+				    u32 length, u8 flags, __be32 imm_data,
+				    u64 remote_addr, u32 rkey)
 {
 	h->magic    = cpu_to_le32(U4_WIRE_MAGIC);
 	h->version  = U4_WIRE_VERSION;
@@ -67,7 +72,9 @@ static inline void u4_wire_hdr_init(struct u4_wire_hdr *h, u8 opcode,
 	h->src_qp   = cpu_to_le32(src_qp);
 	h->psn      = cpu_to_le32(psn);
 	h->length   = cpu_to_le32(length);
-	h->imm_data = 0;
+	h->imm_data = cpu_to_le32(be32_to_cpu(imm_data));
+	h->remote_addr = cpu_to_le64(remote_addr);
+	h->rkey = cpu_to_le32(rkey);
 	h->reserved32 = 0;
 }
 

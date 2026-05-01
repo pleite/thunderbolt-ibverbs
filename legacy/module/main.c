@@ -128,6 +128,7 @@ static int usb4_rdma_probe(struct tb_service *svc, const struct tb_service_id *i
 {
 	struct usb4_rdma_dev *dev;
 	struct tb_xdomain *xd = tb_service_parent(svc);
+	int ret;
 
 	dev_info(&svc->dev,
 		 "usb4_rdma: probe — service %s, route 0x%llx, link_speed=%u Gb/s%s\n",
@@ -153,9 +154,12 @@ static int usb4_rdma_probe(struct tb_service *svc, const struct tb_service_id *i
 	tb_service_set_drvdata(svc, dev);
 
 	/* Bring up the data path (rings + frame pool + RX dispatcher). */
-	if (usb4_rdma_data_attach_peer(svc))
-		dev_warn(&svc->dev, "data path attach failed; verbs will not see this peer\n");
-	else
+	ret = usb4_rdma_data_attach_peer(svc);
+	if (ret < 0)
+		dev_warn(&svc->dev,
+			 "data path attach failed (%d); verbs will not see this peer\n",
+			 ret);
+	else if (ret > 0)
 		usb4_rdma_ibdev_peer_event(true);
 
 	atomic_set(&dev->state, USB4_RDMA_STATE_RUNNING);
@@ -173,9 +177,8 @@ static void usb4_rdma_remove(struct tb_service *svc)
 
 	atomic_set(&dev->state, USB4_RDMA_STATE_REMOVED);
 
-	if (usb4_rdma_data_peer_attached())
+	if (usb4_rdma_data_detach_peer(svc))
 		usb4_rdma_ibdev_peer_event(false);
-	usb4_rdma_data_detach_peer(svc);
 
 	debugfs_remove_recursive(dev->debugfs_dir);
 	tb_service_set_drvdata(svc, NULL);
@@ -263,10 +266,15 @@ static int __init usb4_rdma_init(void)
 		goto err_debugfs;
 	}
 
+	/* Register the ib_device before binding existing tb_service devices so
+	 * probe-time peer joins can update the RDMA port state. */
+	if (usb4_rdma_ibdev_init())
+		pr_warn("ib_device init failed; continuing without it\n");
+
 	err = tb_register_service_driver(&usb4_rdma_driver);
 	if (err) {
 		pr_err("failed to register service driver: %d\n", err);
-		goto err_propdir;
+		goto err_ibdev;
 	}
 
 	/* PCI BAR explorer — best-effort, doesn't fail module load. */
@@ -277,15 +285,12 @@ static int __init usb4_rdma_init(void)
 	if (usb4_rdma_loadtest_init(usb4_rdma_debugfs_root))
 		pr_warn("loadtest init failed; continuing without it\n");
 
-	/* RDMA ib_device skeleton — best-effort. */
-	if (usb4_rdma_ibdev_init())
-		pr_warn("ib_device init failed; continuing without it\n");
-
 	pr_info("%s ready, advertising service uuid %pUb\n",
 		DRV_NAME, &usb4_rdma_uuid);
 	return 0;
 
-err_propdir:
+err_ibdev:
+	usb4_rdma_ibdev_exit();
 	usb4_rdma_destroy_property_dir();
 err_debugfs:
 	debugfs_remove_recursive(usb4_rdma_debugfs_root);
@@ -295,10 +300,10 @@ err_debugfs:
 static void __exit usb4_rdma_exit(void)
 {
 	pr_info("%s unloading\n", DRV_NAME);
-	usb4_rdma_ibdev_exit();
+	tb_unregister_service_driver(&usb4_rdma_driver);
 	usb4_rdma_loadtest_exit();
 	usb4_rdma_pci_exit();
-	tb_unregister_service_driver(&usb4_rdma_driver);
+	usb4_rdma_ibdev_exit();
 	usb4_rdma_destroy_property_dir();
 	debugfs_remove_recursive(usb4_rdma_debugfs_root);
 }

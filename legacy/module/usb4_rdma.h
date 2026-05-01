@@ -20,10 +20,15 @@ void usb4_rdma_ibdev_peer_event(bool joined);
 /* data.c — per-peer ring management + wire protocol. */
 struct tb_service;
 struct u4_wire_hdr;
+typedef int (*usb4_rdma_data_fill_fn)(void *dst, u32 length, void *ctx);
+/* Returns 1 if this service became the active data peer, 0 if skipped,
+ * or a negative errno on attach failure. */
 int  usb4_rdma_data_attach_peer(struct tb_service *svc);
-void usb4_rdma_data_detach_peer(struct tb_service *svc);
-int  usb4_rdma_data_send(u32 src_qp, u32 dest_qp, u32 psn, u8 flags,
-			 const void *payload, u32 length);
+bool usb4_rdma_data_detach_peer(struct tb_service *svc);
+int  usb4_rdma_data_send(u8 opcode, u32 src_qp, u32 dest_qp, u32 psn,
+			 u8 flags, __be32 imm_data, u64 remote_addr, u32 rkey,
+			 usb4_rdma_data_fill_fn fill, void *fill_ctx,
+			 u32 length);
 int  usb4_rdma_data_register_qp(u32 qp_num, void *qp);
 void usb4_rdma_data_unregister_qp(u32 qp_num);
 void usb4_rdma_data_set_rx_handler(void (*h)(void *qp,
