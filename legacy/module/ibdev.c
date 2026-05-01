@@ -118,6 +118,15 @@ struct usb4_rdma_qp {
 	u32 recv_psn;
 	spinlock_t recv_lock;
 	struct list_head recv_q;	/* of usb4_rdma_recv_wr */
+
+	/* Multi-frame RX reassembly. RC delivers in order; we hold the
+	 * head WR popped at first-fragment time and accumulate payload
+	 * across frames until U4_F_LAST. recv_byte_offset is the running
+	 * scatter offset across the WR's SGE list. recv_truncated is
+	 * sticky for the message duration if the WR is too small. */
+	struct usb4_rdma_recv_wr *in_progress_recv;
+	u32 recv_byte_offset;
+	bool recv_truncated;
 };
 
 struct usb4_rdma_ib_dev {
@@ -483,43 +492,68 @@ static int u4r_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 
 /* ----- post_send -------------------------------------------------- */
 
-/* Build a single wire frame from one WR's SGE list, send it. For now
- * we require the entire WR to fit in one frame (length <= U4_MAX_PAYLOAD).
- * Multi-frame fragmentation comes later. */
+/* Build wire frames from one WR's SGE list and send them. For
+ * messages > U4_MAX_PAYLOAD we split into multiple frames; PSN
+ * advances per fragment and U4_F_LAST is set only on the final one.
+ * The receiver reassembles via the in_progress_recv state on its
+ * QP. RC ordering guarantees fragments arrive in PSN order. */
 static int u4r_send_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 {
 	struct usb4_rdma_pd *pd =
 		container_of(qp->base.pd, struct usb4_rdma_pd, base);
 	u8 *buf;
-	u32 total_len = 0, off = 0;
-	int i, ret;
+	u32 total_len = 0, off = 0, sent = 0;
+	int i, ret = 0;
 
 	for (i = 0; i < wr->num_sge; i++)
 		total_len += wr->sg_list[i].length;
-	if (total_len > U4_MAX_PAYLOAD)
-		return -EMSGSIZE;
 
-	buf = kmalloc(U4_MAX_PAYLOAD, GFP_KERNEL);
+	/* Gather all SGEs into one contiguous staging buffer. We then
+	 * slice it into U4_MAX_PAYLOAD chunks. A future zero-copy path
+	 * would walk SGEs straight into the TX ring frame; for now the
+	 * gather + slice is fine and matches the pre-fragment logic. */
+	buf = kvmalloc(total_len ? total_len : 1, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
 
 	for (i = 0; i < wr->num_sge; i++) {
 		const struct ib_sge *sge = &wr->sg_list[i];
-		struct usb4_rdma_mr *mr =
-			u4r_pd_find_mr_by_lkey(pd, sge->lkey);
+		struct usb4_rdma_mr *mr;
+
+		if (!sge->length)
+			continue;
+		mr = u4r_pd_find_mr_by_lkey(pd, sge->lkey);
 		if (!mr) { ret = -EINVAL; goto out; }
 		ret = u4r_mr_xfer(mr, sge->addr, buf + off, sge->length, true);
 		if (ret) goto out;
 		off += sge->length;
 	}
 
-	ret = usb4_rdma_data_send(qp->base.qp_num,
-				  qp->attr.dest_qp_num,
-				  qp->send_psn++,
-				  U4_F_LAST | U4_F_SOLICITED,
-				  buf, total_len);
+	/* Zero-byte SEND is legal — emit one frame with U4_F_LAST. */
+	if (total_len == 0) {
+		ret = usb4_rdma_data_send(qp->base.qp_num,
+					  qp->attr.dest_qp_num,
+					  qp->send_psn++,
+					  U4_F_LAST | U4_F_SOLICITED,
+					  buf, 0);
+		goto out;
+	}
+
+	while (sent < total_len) {
+		u32 chunk = min_t(u32, total_len - sent, U4_MAX_PAYLOAD);
+		bool last = (sent + chunk == total_len);
+		u8 flags = last ? (U4_F_LAST | U4_F_SOLICITED) : 0;
+
+		ret = usb4_rdma_data_send(qp->base.qp_num,
+					  qp->attr.dest_qp_num,
+					  qp->send_psn++, flags,
+					  buf + sent, chunk);
+		if (ret)
+			goto out;
+		sent += chunk;
+	}
 out:
-	kfree(buf);
+	kvfree(buf);
 	return ret;
 }
 
@@ -598,6 +632,40 @@ static int u4r_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
 
 /* ----- RX dispatch (called from data.c softirq context) ----------- */
 
+/* Scatter `len` bytes from `payload` into a recv WR's SGE list,
+ * starting at byte offset `dst_off` from the start of the WR.
+ * Returns 0 on success, -ERANGE if the WR is full, or other negative
+ * on MR/lkey errors. */
+static int u4r_recv_scatter(struct usb4_rdma_pd *pd,
+			    struct usb4_rdma_recv_wr *r,
+			    u32 dst_off, const void *payload, u32 len)
+{
+	u32 cur = 0, copied = 0;
+	int i;
+
+	for (i = 0; i < r->num_sge && copied < len; i++) {
+		const struct ib_sge *sge = &r->sge[i];
+		struct usb4_rdma_mr *mr;
+		u32 in_sge_off, chunk;
+
+		if (cur + sge->length <= dst_off) {
+			cur += sge->length;
+			continue;
+		}
+		in_sge_off = (dst_off + copied) - cur;
+		chunk = min(sge->length - in_sge_off, len - copied);
+		mr = u4r_pd_find_mr_by_lkey(pd, sge->lkey);
+		if (!mr)
+			return -EINVAL;
+		if (u4r_mr_xfer(mr, sge->addr + in_sge_off,
+				(void *)payload + copied, chunk, false))
+			return -EFAULT;
+		copied += chunk;
+		cur += sge->length;
+	}
+	return copied < len ? -ERANGE : 0;
+}
+
 static void u4r_rx_handler(void *qp_opaque, const struct u4_wire_hdr *hdr,
 			   const void *payload, u32 length)
 {
@@ -609,47 +677,64 @@ static void u4r_rx_handler(void *qp_opaque, const struct u4_wire_hdr *hdr,
 	struct usb4_rdma_recv_wr *r;
 	unsigned long flags;
 	struct ib_wc wc = {};
-	u32 written = 0;
-	int i;
+	bool last = !!(hdr->flags & U4_F_LAST);
+	int sret = 0;
 
 	spin_lock_irqsave(&qp->recv_lock, flags);
-	r = list_first_entry_or_null(&qp->recv_q, struct usb4_rdma_recv_wr,
-				     list);
-	if (r)
-		list_del(&r->list);
+	if (!qp->in_progress_recv) {
+		r = list_first_entry_or_null(&qp->recv_q,
+					     struct usb4_rdma_recv_wr, list);
+		if (r) {
+			list_del(&r->list);
+			qp->in_progress_recv = r;
+			qp->recv_byte_offset = 0;
+			qp->recv_truncated = false;
+		}
+	}
+	r = qp->in_progress_recv;
 	spin_unlock_irqrestore(&qp->recv_lock, flags);
+
 	if (!r) {
 		pr_warn_ratelimited("rx[qp=%u]: no pending recv WR, dropping %u bytes\n",
 				    qp->base.qp_num, length);
 		return;
 	}
 
-	for (i = 0; i < r->num_sge && written < length; i++) {
-		struct ib_sge *sge = &r->sge[i];
-		struct usb4_rdma_mr *mr =
-			u4r_pd_find_mr_by_lkey(pd, sge->lkey);
-		u32 chunk;
-
-		if (!mr) {
-			wc.status = IB_WC_LOC_PROT_ERR;
-			goto done;
+	if (length && !qp->recv_truncated) {
+		sret = u4r_recv_scatter(pd, r, qp->recv_byte_offset,
+					payload, length);
+		if (sret == -ERANGE) {
+			qp->recv_truncated = true;
+		} else if (sret == 0) {
+			qp->recv_byte_offset += length;
 		}
-		chunk = min(sge->length, length - written);
-		if (u4r_mr_xfer(mr, sge->addr,
-				(void *)payload + written, chunk, false)) {
-			wc.status = IB_WC_LOC_PROT_ERR;
-			goto done;
-		}
-		written += chunk;
+		/* Other errors (lkey, MR-fault) are fatal for this WR;
+		 * we still drain remaining fragments via in_progress_recv
+		 * so the next WR isn't contaminated. */
 	}
 
-	wc.status   = IB_WC_SUCCESS;
-done:
+	if (!last)
+		return;
+
+	/* End of message — complete the WR. */
+	if (sret < 0 && sret != -ERANGE)
+		wc.status = IB_WC_LOC_PROT_ERR;
+	else if (qp->recv_truncated)
+		wc.status = IB_WC_LOC_LEN_ERR;
+	else
+		wc.status = IB_WC_SUCCESS;
+
 	wc.wr_id    = r->wr_id;
 	wc.opcode   = IB_WC_RECV;
 	wc.qp       = &qp->base;
-	wc.byte_len = written;
+	wc.byte_len = qp->recv_byte_offset;
 	wc.src_qp   = le32_to_cpu(hdr->src_qp);
+
+	spin_lock_irqsave(&qp->recv_lock, flags);
+	qp->in_progress_recv = NULL;
+	qp->recv_byte_offset = 0;
+	qp->recv_truncated = false;
+	spin_unlock_irqrestore(&qp->recv_lock, flags);
 
 	u4r_cq_push_wc(recv_cq, &wc);
 	kfree(r);
