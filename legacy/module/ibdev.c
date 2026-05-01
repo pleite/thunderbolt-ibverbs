@@ -49,6 +49,10 @@ struct usb4_rdma_ucontext {
 	struct ib_ucontext base;
 };
 
+struct usb4_rdma_pd {
+	struct ib_pd base;
+};
+
 struct usb4_rdma_ib_dev {
 	struct ib_device base;
 	atomic_t active_peers;	/* # of bound xdomain services */
@@ -211,12 +215,16 @@ static enum rdma_link_layer u4r_get_link_layer(struct ib_device *ibdev,
 
 static int u4r_alloc_pd(struct ib_pd *ibpd, struct ib_udata *udata)
 {
-	U4R_STUB(alloc_pd);
-	return -ENOSYS;
+	/* No driver state yet — the ib_pd object IB core allocated for
+	 * us is enough. Real implementation will track per-PD state
+	 * (registered MRs, associated QPs) here. */
+	pr_info("alloc_pd ok\n");
+	return 0;
 }
 
 static int u4r_dealloc_pd(struct ib_pd *ibpd, struct ib_udata *udata)
 {
+	pr_info("dealloc_pd\n");
 	return 0;
 }
 
@@ -330,6 +338,7 @@ static const struct ib_device_ops u4r_dev_ops = {
 	.get_dma_mr        = u4r_get_dma_mr,
 
 	INIT_RDMA_OBJ_SIZE(ib_ucontext, usb4_rdma_ucontext, base),
+	INIT_RDMA_OBJ_SIZE(ib_pd, usb4_rdma_pd, base),
 };
 
 /* ----- peer-tracking hook called from loadtest probe/remove ------- */
