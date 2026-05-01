@@ -78,6 +78,23 @@
 #define U4_MAX_SGE             4
 #define U4_IB_GRH_NEXT_HDR     0x1b
 #define U4_MAX_READ_CTX        128
+
+/* Which netdev to bind for the RDMA-CM control plane. The data path
+ * always rides usb4_rdma's tb_ring; this just decides which
+ * IP-routable interface RDMA-CM uses for handshake / GID resolution.
+ *
+ * Default `thunderbolt0` works as long as `thunderbolt_net` is loaded.
+ * For exclusive-mode RDMA (where you `rmmod thunderbolt_net` to free
+ * the second hop per controller and double the verbs bandwidth), pass
+ * e.g. `cm_netdev=br0.lan` so CM can fall back to the LAN. Bootstrap
+ * traffic is small (KBs per connection); the bandwidth and latency
+ * the project cares about live entirely on the data path.
+ */
+static char *cm_netdev = "thunderbolt0";
+module_param(cm_netdev, charp, 0444);
+MODULE_PARM_DESC(cm_netdev,
+		 "netdev for RDMA-CM control plane (default: thunderbolt0; "
+		 "use e.g. br0.lan/eno1 when running without thunderbolt_net)");
 #define U4_QPN_MIN             2
 #define U4_QPN_MAX             0x00ffffff
 #define U4_MAX_MSG_SIZE        SZ_1G
@@ -2396,13 +2413,14 @@ int usb4_rdma_ibdev_init(void)
 	eth_random_addr(mac);
 	addrconf_addr_eui48((u8 *)&u4r->base.node_guid, mac);
 
-	u4r->netdev = dev_get_by_name(&init_net, "thunderbolt0");
+	u4r->netdev = dev_get_by_name(&init_net, cm_netdev);
 	if (!u4r->netdev) {
-		pr_err("thunderbolt0 netdev not found — bring up "
-		       "thunderbolt-net before loading usb4_rdma\n");
+		pr_err("CM netdev '%s' not found — bring it up first, or set "
+		       "cm_netdev=<iface> at module load\n", cm_netdev);
 		ib_dealloc_device(&u4r->base);
 		return -ENODEV;
 	}
+	pr_info("CM control plane via netdev %s\n", cm_netdev);
 
 	ib_set_device_ops(&u4r->base, &u4r_dev_ops);
 
