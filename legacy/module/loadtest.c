@@ -77,8 +77,8 @@
 #define LOADTEST_PDF_FRAME_END    2
 
 #define LOADTEST_FRAME_SIZE       SZ_4K
-#define LOADTEST_RING_DEPTH       64
-#define LOADTEST_FRAMES_PER_RING  32   /* outstanding frames */
+#define LOADTEST_RING_DEPTH       128
+#define LOADTEST_FRAMES_PER_RING  96   /* outstanding frames */
 
 static int nr_rings = 4;
 module_param(nr_rings, int, 0644);
@@ -332,15 +332,23 @@ static int loadtest_ring_setup(struct loadtest_dev *dev, int idx)
 	pr_info("ring %d: allocated out_hop=%d in_hop=%d\n",
 		idx, out_hop, in_hop);
 
+	/* RING_FLAG_E2E enables hardware end-to-end flow control: when our
+	 * RX ring fills, the controller signals the matching TX ring on
+	 * the *peer* controller to slow down. Without it, sustained TX
+	 * outruns RX and the controller drops frames (we observed 1-3%
+	 * loss in the no-E2E baseline). thunderbolt_net always sets E2E
+	 * on its data ring; we mirror it. The RX ring's e2e_tx_hop arg
+	 * is paired with the local TX ring's hop. */
 	lr->tx_ring = tb_ring_alloc_tx(xd->tb->nhi, -1, LOADTEST_RING_DEPTH,
-				       RING_FLAG_FRAME);
+				       RING_FLAG_FRAME | RING_FLAG_E2E);
 	if (!lr->tx_ring) {
 		ret = -ENOMEM;
 		goto err_hopid;
 	}
 
 	lr->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, -1, LOADTEST_RING_DEPTH,
-				       RING_FLAG_FRAME, 0,
+				       RING_FLAG_FRAME | RING_FLAG_E2E,
+				       lr->tx_ring->hop,
 				       sof_mask, eof_mask, NULL, NULL);
 	if (!lr->rx_ring) {
 		ret = -ENOMEM;
