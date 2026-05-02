@@ -60,6 +60,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/idr.h>
 #include <linux/uaccess.h>
+#include <linux/vmalloc.h>
 #include <net/addrconf.h>
 #include <net/net_namespace.h>
 
@@ -78,6 +79,13 @@
 #define U4_MAX_SGE             4
 #define U4_IB_GRH_NEXT_HDR     0x1b
 #define U4_MAX_READ_CTX        128
+#define U4_SEND_CREDIT_TIMEOUT_MS 5000
+
+enum {
+	U4_RECV_CREDIT_NONE = 0,
+	U4_RECV_CREDIT_PROBE_USED = 1,
+	U4_RECV_CREDIT_SEEN = 2,
+};
 
 /* Which netdev to bind for the RDMA-CM control plane. The data path
  * always rides usb4_rdma's tb_ring; this just decides which
@@ -95,6 +103,23 @@ module_param(cm_netdev, charp, 0444);
 MODULE_PARM_DESC(cm_netdev,
 		 "netdev for RDMA-CM control plane (default: thunderbolt0; "
 		 "use e.g. br0.lan/eno1 when running without thunderbolt_net)");
+
+/*
+ * The current TX zero-copy path submits a metadata frame followed by one or
+ * more raw payload frames. That saves a memcpy for large transfers, but it is
+ * strictly worse for latency-sized WRs because it adds an extra tb_ring
+ * descriptor and per-page DMA map/free work. Keep small messages on the
+ * single-frame staging path and reserve zero-copy for bandwidth-sized payloads.
+ */
+static uint zcopy_min_bytes = SZ_16K;
+module_param(zcopy_min_bytes, uint, 0644);
+MODULE_PARM_DESC(zcopy_min_bytes,
+		 "minimum non-inline payload size to use TX zero-copy; smaller WRs use staging frames (default: 16384, 0 = always)");
+
+static bool send_ack_debug;
+module_param(send_ack_debug, bool, 0644);
+MODULE_PARM_DESC(send_ack_debug,
+		 "log RC SEND credit ACK state transitions for debugging");
 #define U4_QPN_MIN             2
 #define U4_QPN_MAX             0x00ffffff
 #define U4_MAX_MSG_SIZE        SZ_1G
@@ -143,7 +168,10 @@ struct usb4_rdma_cq {
 	int cqe_capacity;
 	spinlock_t lock;
 	struct list_head wc_list;	/* of usb4_rdma_wc_entry */
+	struct list_head free_list;	/* preallocated usb4_rdma_wc_entry pool */
+	struct usb4_rdma_wc_entry *wc_pool;
 	int wc_count;
+	int free_count;
 	enum ib_cq_notify_flags notify;
 };
 
@@ -170,6 +198,14 @@ struct usb4_rdma_read_ctx {
 	enum ib_wc_status status;
 };
 
+struct usb4_rdma_send_ctx {
+	struct list_head list;
+	u64 wr_id;
+	struct ib_cqe *wr_cqe;
+	u32 ack_psn;
+	enum ib_wc_opcode opcode;
+};
+
 struct usb4_rdma_qp {
 	struct ib_qp base;
 	enum ib_qp_type qp_type;
@@ -183,9 +219,16 @@ struct usb4_rdma_qp {
 	bool sq_sig_all;
 	struct mutex send_lock;
 	u32 send_psn;
+	spinlock_t send_comp_lock;
+	struct list_head send_ctxs;	/* of usb4_rdma_send_ctx */
+	atomic_t remote_recv_credits;
+	atomic_t remote_recv_credit_state;
+	wait_queue_head_t send_credit_wait;
 	u32 recv_psn;
 	spinlock_t recv_lock;
 	struct list_head recv_q;	/* of usb4_rdma_recv_wr */
+	u32 recv_posted_count;
+	u32 recv_credits_advertised;
 	spinlock_t read_lock;
 	struct list_head read_ctxs;	/* of usb4_rdma_read_ctx */
 	u32 read_depth;
@@ -429,6 +472,141 @@ u4r_find_read_ctx_locked(struct usb4_rdma_qp *qp, u32 psn)
 	return NULL;
 }
 
+static struct usb4_rdma_send_ctx *
+u4r_find_send_ctx_locked(struct usb4_rdma_qp *qp, u32 psn)
+{
+	struct usb4_rdma_send_ctx *ctx;
+
+	list_for_each_entry(ctx, &qp->send_ctxs, list) {
+		if (ctx->ack_psn == psn)
+			return ctx;
+	}
+	return NULL;
+}
+
+static bool u4r_qp_can_advertise_recv_credits(const struct usb4_rdma_qp *qp)
+{
+	if (qp->qp_type != IB_QPT_RC || !qp->registered ||
+	    !qp->attr.dest_qp_num)
+		return false;
+
+	return qp->state == IB_QPS_RTS || qp->state == IB_QPS_SQD ||
+	       qp->state == IB_QPS_SQE;
+}
+
+static struct usb4_rdma_recv_wr *
+u4r_pop_recv_wr_locked(struct usb4_rdma_qp *qp)
+{
+	struct usb4_rdma_recv_wr *r;
+
+	r = list_first_entry_or_null(&qp->recv_q, struct usb4_rdma_recv_wr,
+				     list);
+	if (!r)
+		return NULL;
+
+	list_del(&r->list);
+	if (qp->qp_type == IB_QPT_RC) {
+		if (qp->recv_posted_count)
+			qp->recv_posted_count--;
+		if (qp->recv_credits_advertised)
+			qp->recv_credits_advertised--;
+	}
+	return r;
+}
+
+static void u4r_advertise_recv_credits(struct usb4_rdma_qp *qp)
+{
+	unsigned long flags;
+	u32 credits = 0;
+	u32 dest_qp = 0;
+	int ret;
+
+	spin_lock_irqsave(&qp->recv_lock, flags);
+	if (u4r_qp_can_advertise_recv_credits(qp) &&
+	    qp->recv_posted_count > qp->recv_credits_advertised) {
+		credits = qp->recv_posted_count -
+			  qp->recv_credits_advertised;
+		qp->recv_credits_advertised += credits;
+		dest_qp = qp->attr.dest_qp_num;
+	}
+	spin_unlock_irqrestore(&qp->recv_lock, flags);
+
+	if (!credits)
+		return;
+
+	ret = usb4_rdma_data_send(U4_OP_RECV_CREDIT, qp->base.qp_num,
+				  dest_qp, 0, U4_F_LAST,
+				  cpu_to_be32(credits), 0, 0,
+				  NULL, NULL, 0);
+	if (ret) {
+		spin_lock_irqsave(&qp->recv_lock, flags);
+		if (qp->recv_credits_advertised >= credits)
+			qp->recv_credits_advertised -= credits;
+		else
+			qp->recv_credits_advertised = 0;
+		spin_unlock_irqrestore(&qp->recv_lock, flags);
+	}
+	if (READ_ONCE(send_ack_debug))
+		pr_info("recv_credit tx: qp=%u dest=%u credits=%u ret=%d\n",
+			qp->base.qp_num, dest_qp, credits, ret);
+}
+
+static int u4r_reserve_remote_recv_credit(struct usb4_rdma_qp *qp)
+{
+	long wait;
+
+	for (;;) {
+		int credits = atomic_read(&qp->remote_recv_credits);
+
+		while (credits > 0) {
+			if (atomic_cmpxchg(&qp->remote_recv_credits, credits,
+					   credits - 1) == credits) {
+				atomic_set(&qp->remote_recv_credit_state,
+					   U4_RECV_CREDIT_SEEN);
+				return 1;
+			}
+			credits = atomic_read(&qp->remote_recv_credits);
+		}
+
+		if (atomic_cmpxchg(&qp->remote_recv_credit_state,
+				   U4_RECV_CREDIT_NONE,
+				   U4_RECV_CREDIT_PROBE_USED) ==
+		    U4_RECV_CREDIT_NONE) {
+			if (READ_ONCE(send_ack_debug))
+				pr_info("recv_credit bootstrap probe: qp=%u dest=%u\n",
+					qp->base.qp_num,
+					qp->attr.dest_qp_num);
+			return 0;
+		}
+
+		wait = wait_event_interruptible_timeout(
+			qp->send_credit_wait,
+			atomic_read(&qp->remote_recv_credits) > 0 ||
+			(qp->state != IB_QPS_RTS && qp->state != IB_QPS_SQD &&
+			 qp->state != IB_QPS_SQE),
+			msecs_to_jiffies(U4_SEND_CREDIT_TIMEOUT_MS));
+		if (wait < 0)
+			return wait;
+		if (!wait) {
+			if (READ_ONCE(send_ack_debug))
+				pr_info("recv_credit wait timeout: qp=%u dest=%u\n",
+					qp->base.qp_num,
+					qp->attr.dest_qp_num);
+			return -ETIMEDOUT;
+		}
+		if (qp->state != IB_QPS_RTS && qp->state != IB_QPS_SQD &&
+		    qp->state != IB_QPS_SQE)
+			return -EINVAL;
+	}
+}
+
+static void u4r_refund_remote_recv_credit(struct usb4_rdma_qp *qp)
+{
+	atomic_inc(&qp->remote_recv_credits);
+	atomic_set(&qp->remote_recv_credit_state, U4_RECV_CREDIT_SEEN);
+	wake_up(&qp->send_credit_wait);
+}
+
 /* ----- helpers: CQ enqueue ---------------------------------------- */
 
 static int u4r_cq_push_wc(struct usb4_rdma_cq *cq, const struct ib_wc *wc)
@@ -436,12 +614,15 @@ static int u4r_cq_push_wc(struct usb4_rdma_cq *cq, const struct ib_wc *wc)
 	struct usb4_rdma_wc_entry *e;
 	unsigned long flags;
 
-	e = kmalloc(sizeof(*e), GFP_ATOMIC);
-	if (!e)
-		return -ENOMEM;
-	e->wc = *wc;
-
 	spin_lock_irqsave(&cq->lock, flags);
+	if (list_empty(&cq->free_list)) {
+		spin_unlock_irqrestore(&cq->lock, flags);
+		return -ENOMEM;
+	}
+	e = list_first_entry(&cq->free_list, struct usb4_rdma_wc_entry, list);
+	list_del(&e->list);
+	cq->free_count--;
+	e->wc = *wc;
 	list_add_tail(&e->list, &cq->wc_list);
 	cq->wc_count++;
 	if (cq->notify) {
@@ -465,9 +646,28 @@ static void u4r_flush_qp(struct usb4_rdma_qp *qp)
 		container_of(qp->base.send_cq, struct usb4_rdma_cq, base);
 	LIST_HEAD(recv_flush);
 	LIST_HEAD(read_flush);
+	LIST_HEAD(send_flush);
 	struct usb4_rdma_recv_wr *r, *rtmp, *in_progress;
 	struct usb4_rdma_read_ctx *read_ctx, *read_tmp;
+	struct usb4_rdma_send_ctx *send_ctx, *send_tmp;
 	unsigned long flags;
+
+	spin_lock_irqsave(&qp->send_comp_lock, flags);
+	list_splice_init(&qp->send_ctxs, &send_flush);
+	spin_unlock_irqrestore(&qp->send_comp_lock, flags);
+
+	list_for_each_entry_safe(send_ctx, send_tmp, &send_flush, list) {
+		struct ib_wc wc = {};
+
+		list_del(&send_ctx->list);
+		wc.wr_id = send_ctx->wr_id;
+		wc.wr_cqe = send_ctx->wr_cqe;
+		wc.status = IB_WC_WR_FLUSH_ERR;
+		wc.opcode = send_ctx->opcode;
+		wc.qp = &qp->base;
+		u4r_cq_push_wc(send_cq, &wc);
+		kfree(send_ctx);
+	}
 
 	spin_lock_irqsave(&qp->recv_lock, flags);
 	list_splice_init(&qp->recv_q, &recv_flush);
@@ -475,7 +675,12 @@ static void u4r_flush_qp(struct usb4_rdma_qp *qp)
 	qp->in_progress_recv = NULL;
 	qp->recv_byte_offset = 0;
 	qp->recv_truncated = false;
+	qp->recv_posted_count = 0;
+	qp->recv_credits_advertised = 0;
 	spin_unlock_irqrestore(&qp->recv_lock, flags);
+	atomic_set(&qp->remote_recv_credits, 0);
+	atomic_set(&qp->remote_recv_credit_state, U4_RECV_CREDIT_NONE);
+	wake_up(&qp->send_credit_wait);
 
 	list_for_each_entry_safe(r, rtmp, &recv_flush, list) {
 		struct ib_wc wc = {};
@@ -679,11 +884,21 @@ static int u4r_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 			 struct uverbs_attr_bundle *attrs)
 {
 	struct usb4_rdma_cq *cq = container_of(ibcq, struct usb4_rdma_cq, base);
+	int i;
 
+	if (attr->cqe <= 0)
+		return -EINVAL;
 	cq->cqe_capacity = attr->cqe;
 	spin_lock_init(&cq->lock);
 	INIT_LIST_HEAD(&cq->wc_list);
+	INIT_LIST_HEAD(&cq->free_list);
+	cq->wc_pool = kvcalloc(attr->cqe, sizeof(*cq->wc_pool), GFP_KERNEL);
+	if (!cq->wc_pool)
+		return -ENOMEM;
+	for (i = 0; i < attr->cqe; i++)
+		list_add_tail(&cq->wc_pool[i].list, &cq->free_list);
 	cq->wc_count = 0;
+	cq->free_count = attr->cqe;
 	cq->notify = 0;
 	pr_info("create_cq ok (cqe=%u, comp_vector=%u)\n",
 		attr->cqe, attr->comp_vector);
@@ -697,12 +912,15 @@ static int u4r_destroy_cq(struct ib_cq *ibcq, struct ib_udata *udata)
 	unsigned long flags;
 
 	spin_lock_irqsave(&cq->lock, flags);
-	list_for_each_entry_safe(e, tmp, &cq->wc_list, list) {
+	list_for_each_entry_safe(e, tmp, &cq->wc_list, list)
 		list_del(&e->list);
-		kfree(e);
-	}
+	list_for_each_entry_safe(e, tmp, &cq->free_list, list)
+		list_del(&e->list);
 	cq->wc_count = 0;
+	cq->free_count = 0;
 	spin_unlock_irqrestore(&cq->lock, flags);
+	kvfree(cq->wc_pool);
+	cq->wc_pool = NULL;
 	return 0;
 }
 
@@ -713,6 +931,8 @@ static int u4r_poll_cq(struct ib_cq *ibcq, int num_entries, struct ib_wc *wc)
 	int n = 0;
 	unsigned long flags;
 
+	usb4_rdma_data_poll_rx();
+
 	spin_lock_irqsave(&cq->lock, flags);
 	list_for_each_entry_safe(e, tmp, &cq->wc_list, list) {
 		if (n >= num_entries)
@@ -720,7 +940,8 @@ static int u4r_poll_cq(struct ib_cq *ibcq, int num_entries, struct ib_wc *wc)
 		wc[n++] = e->wc;
 		list_del(&e->list);
 		cq->wc_count--;
-		kfree(e);
+		list_add_tail(&e->list, &cq->free_list);
+		cq->free_count++;
 	}
 	spin_unlock_irqrestore(&cq->lock, flags);
 	return n;
@@ -761,9 +982,16 @@ static int u4r_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 	qp->sq_sig_all = attr->sq_sig_type == IB_SIGNAL_ALL_WR;
 	mutex_init(&qp->send_lock);
 	qp->send_psn = 0;
+	spin_lock_init(&qp->send_comp_lock);
+	INIT_LIST_HEAD(&qp->send_ctxs);
+	atomic_set(&qp->remote_recv_credits, 0);
+	atomic_set(&qp->remote_recv_credit_state, U4_RECV_CREDIT_NONE);
+	init_waitqueue_head(&qp->send_credit_wait);
 	qp->recv_psn = 0;
 	spin_lock_init(&qp->recv_lock);
 	INIT_LIST_HEAD(&qp->recv_q);
+	qp->recv_posted_count = 0;
+	qp->recv_credits_advertised = 0;
 	spin_lock_init(&qp->read_lock);
 	INIT_LIST_HEAD(&qp->read_ctxs);
 	qp->read_depth = 0;
@@ -840,10 +1068,15 @@ static int u4r_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 	}
 	if (qp->qp_type == IB_QPT_RC && flush)
 		u4r_flush_qp(qp);
+	if (qp->qp_type == IB_QPT_RC)
+		u4r_advertise_recv_credits(qp);
 	if (qp->qp_type == IB_QPT_RC && qp->registered &&
 	    (qp->state == IB_QPS_RESET || qp->state == IB_QPS_ERR)) {
 		usb4_rdma_data_unregister_qp(ibqp->qp_num);
 		qp->registered = false;
+		atomic_set(&qp->remote_recv_credits, 0);
+		atomic_set(&qp->remote_recv_credit_state, U4_RECV_CREDIT_NONE);
+		wake_up(&qp->send_credit_wait);
 	}
 	return 0;
 }
@@ -875,6 +1108,7 @@ static int u4r_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 	struct usb4_rdma_qp *qp = container_of(ibqp, struct usb4_rdma_qp, base);
 	struct usb4_rdma_recv_wr *r, *tmp;
 	struct usb4_rdma_read_ctx *read_ctx, *tmp_read_ctx;
+	struct usb4_rdma_send_ctx *send_ctx, *tmp_send_ctx;
 	unsigned long flags;
 
 	if (qp->registered) {
@@ -882,6 +1116,13 @@ static int u4r_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 		qp->registered = false;
 	}
 	wait_event(qp->ref_wait, refcount_read(&qp->refs) == 1);
+
+	spin_lock_irqsave(&qp->send_comp_lock, flags);
+	list_for_each_entry_safe(send_ctx, tmp_send_ctx, &qp->send_ctxs, list) {
+		list_del(&send_ctx->list);
+		kfree(send_ctx);
+	}
+	spin_unlock_irqrestore(&qp->send_comp_lock, flags);
 
 	spin_lock_irqsave(&qp->recv_lock, flags);
 	list_for_each_entry_safe(r, tmp, &qp->recv_q, list) {
@@ -892,7 +1133,12 @@ static int u4r_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 	qp->in_progress_recv = NULL;
 	qp->recv_byte_offset = 0;
 	qp->recv_truncated = false;
+	qp->recv_posted_count = 0;
+	qp->recv_credits_advertised = 0;
 	spin_unlock_irqrestore(&qp->recv_lock, flags);
+	atomic_set(&qp->remote_recv_credits, 0);
+	atomic_set(&qp->remote_recv_credit_state, U4_RECV_CREDIT_NONE);
+	wake_up(&qp->send_credit_wait);
 
 	spin_lock_irqsave(&qp->read_lock, flags);
 	list_for_each_entry_safe(read_ctx, tmp_read_ctx, &qp->read_ctxs, list) {
@@ -901,8 +1147,11 @@ static int u4r_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 	}
 	qp->read_depth = 0;
 	spin_unlock_irqrestore(&qp->read_lock, flags);
-	if (qp->qpn_allocated)
-		ida_free(&u4r_qpn_ida, ibqp->qp_num);
+	/* Do not recycle RC QPNs during the module lifetime. The USB4 data
+	 * rings can still deliver late control frames after a QP is destroyed;
+	 * immediate QPN reuse lets those stale frames mutate a new QP's credit
+	 * state. The 24-bit QPN space is large enough for debug/runtime use,
+	 * and ida_destroy() releases the bitmap when the module unloads. */
 	return 0;
 }
 
@@ -938,6 +1187,11 @@ static int u4r_wr_total_len(const struct ib_send_wr *wr, u32 *total_len)
 	}
 	*total_len = total;
 	return 0;
+}
+
+static bool u4r_use_tx_zcopy(u32 total_len)
+{
+	return total_len >= READ_ONCE(zcopy_min_bytes);
 }
 
 static int u4r_fill_from_dma_sges(void *dst, u32 length,
@@ -1251,6 +1505,10 @@ static int u4r_send_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 		.num_sge = wr->num_sge,
 		.inline_data = !!(wr->send_flags & IB_SEND_INLINE),
 	};
+	struct usb4_rdma_send_ctx *sctx = NULL;
+	bool ack_req = qp->sq_sig_all || (wr->send_flags & IB_SEND_SIGNALED);
+	bool credit_reserved = false;
+	bool data_started = false;
 	u32 total_len, sent = 0;
 	int ret;
 
@@ -1261,14 +1519,57 @@ static int u4r_send_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 	if (ret)
 		return ret;
 
+	ret = u4r_reserve_remote_recv_credit(qp);
+	if (ret) {
+		if (ret < 0)
+			return ret;
+		credit_reserved = true;
+		ret = 0;
+	}
+
+	if (ack_req) {
+		sctx = kzalloc(sizeof(*sctx), GFP_KERNEL);
+		if (!sctx) {
+			ret = -ENOMEM;
+			goto refund_credit;
+		}
+		INIT_LIST_HEAD(&sctx->list);
+		sctx->wr_id = wr->wr_id;
+		sctx->wr_cqe = wr->wr_cqe;
+		sctx->opcode = IB_WC_SEND;
+	}
+
 	mutex_lock(&qp->send_lock);
 	/* Zero-byte SEND is legal — emit one frame with U4_F_LAST. */
 	if (total_len == 0) {
+		u32 psn = qp->send_psn++;
+
+		if (sctx) {
+			unsigned long flags;
+
+			sctx->ack_psn = psn;
+			spin_lock_irqsave(&qp->send_comp_lock, flags);
+			list_add_tail(&sctx->list, &qp->send_ctxs);
+			spin_unlock_irqrestore(&qp->send_comp_lock, flags);
+			if (READ_ONCE(send_ack_debug))
+				pr_info("send_ack wait: qp=%u dest=%u psn=%u len=0\n",
+					qp->base.qp_num, qp->attr.dest_qp_num,
+					psn);
+		}
 		ret = usb4_rdma_data_send(U4_OP_SEND, qp->base.qp_num,
-					  qp->attr.dest_qp_num,
-					  qp->send_psn++,
-					  U4_F_LAST | U4_F_SOLICITED,
+					  qp->attr.dest_qp_num, psn,
+					  U4_F_LAST |
+					  (ack_req ? U4_F_SOLICITED : 0),
 					  0, 0, 0, NULL, NULL, 0);
+		if (!ret)
+			data_started = true;
+		if (ret && sctx) {
+			unsigned long flags;
+
+			spin_lock_irqsave(&qp->send_comp_lock, flags);
+			list_del_init(&sctx->list);
+			spin_unlock_irqrestore(&qp->send_comp_lock, flags);
+		}
 		goto out;
 	}
 
@@ -1289,38 +1590,94 @@ static int u4r_send_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 	 * single-lane. Multi-lane SENDs fall back to the staging-frame path
 	 * which serializes through one peer and preserves PSN order.
 	 */
-	if (!cursor.inline_data && usb4_rdma_data_active_lane_count() == 1) {
+	if (!cursor.inline_data && u4r_use_tx_zcopy(total_len) &&
+	    usb4_rdma_data_active_lane_count() == 1) {
 		struct u4r_zc_send_cursor zc;
+		u32 psn = qp->send_psn++;
 
+		if (sctx) {
+			unsigned long flags;
+
+			sctx->ack_psn = psn;
+			spin_lock_irqsave(&qp->send_comp_lock, flags);
+			list_add_tail(&sctx->list, &qp->send_ctxs);
+			spin_unlock_irqrestore(&qp->send_comp_lock, flags);
+			if (READ_ONCE(send_ack_debug))
+				pr_info("send_ack wait: qp=%u dest=%u psn=%u len=%u zcopy=1\n",
+					qp->base.qp_num, qp->attr.dest_qp_num,
+					psn, total_len);
+		}
 		u4r_zc_send_cursor_init(&zc, pd, wr->sg_list, wr->num_sge);
 		ret = usb4_rdma_data_send_page_stream(U4_OP_SEND,
 						      qp->base.qp_num,
 						      qp->attr.dest_qp_num,
-						      qp->send_psn++,
-						      U4_F_LAST | U4_F_SOLICITED,
+						      psn,
+						      U4_F_LAST |
+						      (ack_req ? U4_F_SOLICITED : 0),
 						      0, 0, 0, total_len,
 						      u4r_zc_next_send_page,
 						      &zc);
 		u4r_zc_send_cursor_fini(&zc);
+		if (!ret)
+			data_started = true;
+		if (ret && sctx) {
+			unsigned long flags;
+
+			spin_lock_irqsave(&qp->send_comp_lock, flags);
+			list_del_init(&sctx->list);
+			spin_unlock_irqrestore(&qp->send_comp_lock, flags);
+		}
 		goto out;
 	}
 
 	while (sent < total_len) {
 		u32 chunk = min_t(u32, total_len - sent, U4_MAX_PAYLOAD);
 		bool last = (sent + chunk == total_len);
-		u8 flags = last ? (U4_F_LAST | U4_F_SOLICITED) : 0;
+		u8 wire_flags = last ? U4_F_LAST : 0;
+		u32 psn = qp->send_psn++;
+
+		if (last && ack_req) {
+			unsigned long flags;
+
+			wire_flags |= U4_F_SOLICITED;
+			sctx->ack_psn = psn;
+			spin_lock_irqsave(&qp->send_comp_lock, flags);
+			list_add_tail(&sctx->list, &qp->send_ctxs);
+			spin_unlock_irqrestore(&qp->send_comp_lock, flags);
+			if (READ_ONCE(send_ack_debug))
+				pr_info("send_ack wait: qp=%u dest=%u psn=%u len=%u zcopy=0\n",
+					qp->base.qp_num, qp->attr.dest_qp_num,
+					psn, total_len);
+		}
 
 		ret = usb4_rdma_data_send(U4_OP_SEND, qp->base.qp_num,
 					  qp->attr.dest_qp_num,
-					  qp->send_psn++, flags,
+					  psn, wire_flags,
 					  0, 0, 0, u4r_fill_from_sges,
 					  &cursor, chunk);
-		if (ret)
+		if (ret) {
+			if (last && ack_req) {
+				unsigned long flags;
+
+				spin_lock_irqsave(&qp->send_comp_lock, flags);
+				list_del_init(&sctx->list);
+				spin_unlock_irqrestore(&qp->send_comp_lock, flags);
+			}
 			goto out;
+		}
+		data_started = true;
 		sent += chunk;
 	}
 out:
 	mutex_unlock(&qp->send_lock);
+	if (ret && credit_reserved && !data_started)
+		u4r_refund_remote_recv_credit(qp);
+	if (ret || !ack_req)
+		kfree(sctx);
+	return ret;
+
+refund_credit:
+	u4r_refund_remote_recv_credit(qp);
 	return ret;
 }
 
@@ -1361,7 +1718,7 @@ static int u4r_write_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 		goto out;
 	}
 
-	if (!cursor.inline_data) {
+	if (!cursor.inline_data && u4r_use_tx_zcopy(total_len)) {
 		struct u4r_zc_send_cursor zc;
 
 		u4r_zc_send_cursor_init(&zc, pd, wr->sg_list, wr->num_sge);
@@ -1506,6 +1863,8 @@ static int u4r_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
 		case IB_WR_SEND:
 			ret = u4r_send_one(qp, wr);
 			wc_opcode = IB_WC_SEND;
+			defer_wc = qp->sq_sig_all ||
+				   (wr->send_flags & IB_SEND_SIGNALED);
 			break;
 		case IB_WR_RDMA_WRITE:
 		case IB_WR_RDMA_WRITE_WITH_IMM:
@@ -1576,8 +1935,11 @@ static int u4r_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
 			r->sge[i] = wr->sg_list[i];
 		spin_lock_irqsave(&qp->recv_lock, flags);
 		list_add_tail(&r->list, &qp->recv_q);
+		if (qp->qp_type == IB_QPT_RC)
+			qp->recv_posted_count++;
 		spin_unlock_irqrestore(&qp->recv_lock, flags);
 	}
+	u4r_advertise_recv_credits(qp);
 	return 0;
 }
 
@@ -1662,10 +2024,7 @@ static void u4r_rx_gsi_handler(struct usb4_rdma_qp *qp,
 	int ret;
 
 	spin_lock_irqsave(&qp->recv_lock, flags);
-	r = list_first_entry_or_null(&qp->recv_q,
-				     struct usb4_rdma_recv_wr, list);
-	if (r)
-		list_del(&r->list);
+	r = u4r_pop_recv_wr_locked(qp);
 	spin_unlock_irqrestore(&qp->recv_lock, flags);
 
 	if (!r) {
@@ -1696,6 +2055,22 @@ static void u4r_rx_gsi_handler(struct usb4_rdma_qp *qp,
 	kfree(r);
 }
 
+static void u4r_send_send_ack(struct usb4_rdma_qp *qp,
+			      const struct u4_wire_hdr *hdr,
+			      enum ib_wc_status status)
+{
+	int ret;
+
+	ret = usb4_rdma_data_send(U4_OP_SEND_ACK, qp->base.qp_num,
+				  le32_to_cpu(hdr->src_qp),
+				  le32_to_cpu(hdr->psn), U4_F_LAST,
+				  cpu_to_be32(status), 0, 0, NULL, NULL, 0);
+	if (READ_ONCE(send_ack_debug))
+		pr_info("send_ack tx: qp=%u dest=%u psn=%u status=%u ret=%d\n",
+			qp->base.qp_num, le32_to_cpu(hdr->src_qp),
+			le32_to_cpu(hdr->psn), status, ret);
+}
+
 static void u4r_rx_send_handler(struct usb4_rdma_qp *qp,
 				const struct u4_wire_hdr *hdr,
 				const void *payload, u32 length)
@@ -1708,14 +2083,13 @@ static void u4r_rx_send_handler(struct usb4_rdma_qp *qp,
 	unsigned long flags;
 	struct ib_wc wc = {};
 	bool last = !!(hdr->flags & U4_F_LAST);
+	bool send_ack = false;
 	int sret = 0;
 
 	spin_lock_irqsave(&qp->recv_lock, flags);
 	if (!qp->in_progress_recv) {
-		r = list_first_entry_or_null(&qp->recv_q,
-					     struct usb4_rdma_recv_wr, list);
+		r = u4r_pop_recv_wr_locked(qp);
 		if (r) {
-			list_del(&r->list);
 			qp->in_progress_recv = r;
 			qp->recv_byte_offset = 0;
 			qp->recv_truncated = false;
@@ -1727,6 +2101,8 @@ static void u4r_rx_send_handler(struct usb4_rdma_qp *qp,
 	if (!r) {
 		pr_warn_ratelimited("rx[qp=%u]: no pending recv WR, dropping %u bytes\n",
 				    qp->base.qp_num, length);
+		if (last && (hdr->flags & U4_F_SOLICITED))
+			u4r_send_send_ack(qp, hdr, IB_WC_RNR_RETRY_EXC_ERR);
 		return;
 	}
 
@@ -1765,9 +2141,18 @@ static void u4r_rx_send_handler(struct usb4_rdma_qp *qp,
 	qp->in_progress_recv = NULL;
 	qp->recv_byte_offset = 0;
 	qp->recv_truncated = false;
+	send_ack = !!(hdr->flags & U4_F_SOLICITED);
+	if (READ_ONCE(send_ack_debug) && (hdr->flags & U4_F_SOLICITED))
+		pr_info("send_ack rx: qp=%u src=%u psn=%u status=%u recv_q_empty=%d posted=%u advertised=%u\n",
+			qp->base.qp_num, le32_to_cpu(hdr->src_qp),
+			le32_to_cpu(hdr->psn), wc.status,
+			list_empty(&qp->recv_q), qp->recv_posted_count,
+			qp->recv_credits_advertised);
 	spin_unlock_irqrestore(&qp->recv_lock, flags);
 
 	u4r_cq_push_wc(recv_cq, &wc);
+	if (send_ack)
+		u4r_send_send_ack(qp, hdr, wc.status);
 	kfree(r);
 }
 
@@ -1810,10 +2195,7 @@ static void u4r_rx_rdma_write_handler(struct usb4_rdma_qp *qp,
 		unsigned long flags;
 
 		spin_lock_irqsave(&qp->recv_lock, flags);
-		r = list_first_entry_or_null(&qp->recv_q,
-					     struct usb4_rdma_recv_wr, list);
-		if (r)
-			list_del(&r->list);
+		r = u4r_pop_recv_wr_locked(qp);
 		spin_unlock_irqrestore(&qp->recv_lock, flags);
 
 		if (!r) {
@@ -1834,6 +2216,87 @@ static void u4r_rx_rdma_write_handler(struct usb4_rdma_qp *qp,
 		u4r_cq_push_wc(recv_cq, &wc);
 		kfree(r);
 	}
+}
+
+struct u4r_zc_recv_ctx {
+	struct usb4_rdma_mr *mr;
+	u64 addr;
+	u32 remaining;
+};
+
+static int u4r_zc_next_recv_page(void *opaque, struct page **page,
+				 u32 *page_off, u32 *length,
+				 usb4_rdma_data_done_fn *done,
+				 void **done_ctx)
+{
+	struct u4r_zc_recv_ctx *ctx = opaque;
+	u32 page_idx;
+	int ret;
+
+	ret = u4r_mr_page_chunk(ctx->mr, ctx->addr, ctx->remaining, page,
+				&page_idx, page_off, length);
+	if (ret)
+		return ret;
+
+	ctx->addr += *length;
+	ctx->remaining -= *length;
+	refcount_inc(&ctx->mr->refs);
+	*done = u4r_mr_put_done;
+	*done_ctx = ctx->mr;
+	return 0;
+}
+
+static void u4r_zc_recv_finish(void *opaque)
+{
+	struct u4r_zc_recv_ctx *ctx = opaque;
+
+	u4r_mr_put(ctx->mr);
+	kfree(ctx);
+}
+
+static int u4r_rx_zcopy_prepare(void *qp_opaque, const struct u4_wire_hdr *hdr,
+				u32 total_length,
+				usb4_rdma_data_rx_next_page_fn *next,
+				void **next_ctx,
+				usb4_rdma_data_rx_finish_fn *finish)
+{
+	struct usb4_rdma_qp *qp = qp_opaque;
+	struct usb4_rdma_pd *pd =
+		container_of(qp->base.pd, struct usb4_rdma_pd, base);
+	struct u4r_zc_recv_ctx *ctx;
+	struct usb4_rdma_mr *mr;
+	u64 remote_addr = le64_to_cpu(hdr->remote_addr);
+	u32 rkey = le32_to_cpu(hdr->rkey);
+	int ret;
+
+	if (hdr->opcode != U4_OP_RDMA_WRITE || !total_length)
+		return -EOPNOTSUPP;
+
+	mr = u4r_pd_get_mr_by_rkey(pd, rkey);
+	if (!mr || !(mr->access_flags & IB_ACCESS_REMOTE_WRITE)) {
+		if (mr)
+			u4r_mr_put(mr);
+		return -EACCES;
+	}
+
+	ret = u4r_mr_check_range(mr, remote_addr, total_length);
+	if (ret) {
+		u4r_mr_put(mr);
+		return ret;
+	}
+
+	ctx = kzalloc(sizeof(*ctx), GFP_ATOMIC);
+	if (!ctx) {
+		u4r_mr_put(mr);
+		return -ENOMEM;
+	}
+	ctx->mr = mr;
+	ctx->addr = remote_addr;
+	ctx->remaining = total_length;
+	*next = u4r_zc_next_recv_page;
+	*next_ctx = ctx;
+	*finish = u4r_zc_recv_finish;
+	return 0;
 }
 
 struct u4r_read_req_work {
@@ -2006,6 +2469,8 @@ static enum ib_wc_status u4r_read_wire_status(u32 status)
 {
 	switch (status) {
 	case IB_WC_SUCCESS:
+	case IB_WC_LOC_LEN_ERR:
+	case IB_WC_RNR_RETRY_EXC_ERR:
 	case IB_WC_REM_INV_REQ_ERR:
 	case IB_WC_REM_ACCESS_ERR:
 	case IB_WC_REM_OP_ERR:
@@ -2013,6 +2478,58 @@ static enum ib_wc_status u4r_read_wire_status(u32 status)
 	default:
 		return IB_WC_GENERAL_ERR;
 	}
+}
+
+static void u4r_rx_send_ack_handler(struct usb4_rdma_qp *qp,
+				    const struct u4_wire_hdr *hdr)
+{
+	struct usb4_rdma_cq *send_cq =
+		container_of(qp->base.send_cq, struct usb4_rdma_cq, base);
+	struct usb4_rdma_send_ctx *ctx;
+	unsigned long flags;
+	struct ib_wc wc = {};
+	u32 ack_psn = le32_to_cpu(hdr->psn);
+	enum ib_wc_status status =
+		u4r_read_wire_status(le32_to_cpu(hdr->imm_data));
+
+	spin_lock_irqsave(&qp->send_comp_lock, flags);
+	ctx = u4r_find_send_ctx_locked(qp, ack_psn);
+	if (!ctx) {
+		spin_unlock_irqrestore(&qp->send_comp_lock, flags);
+		pr_warn_ratelimited("send_ack[qp=%u]: no pending send psn=%u\n",
+				    qp->base.qp_num, ack_psn);
+		return;
+	}
+	if (READ_ONCE(send_ack_debug))
+		pr_info("send_ack rx_ack: qp=%u src=%u psn=%u status=%u\n",
+			qp->base.qp_num, le32_to_cpu(hdr->src_qp), ack_psn,
+			status);
+	list_del_init(&ctx->list);
+	wc.wr_id = ctx->wr_id;
+	wc.wr_cqe = ctx->wr_cqe;
+	wc.status = status;
+	wc.opcode = ctx->opcode;
+	wc.qp = &qp->base;
+	spin_unlock_irqrestore(&qp->send_comp_lock, flags);
+
+	u4r_cq_push_wc(send_cq, &wc);
+	kfree(ctx);
+}
+
+static void u4r_rx_recv_credit_handler(struct usb4_rdma_qp *qp,
+				       const struct u4_wire_hdr *hdr)
+{
+	u32 credits = le32_to_cpu(hdr->imm_data);
+
+	if (!credits)
+		return;
+	atomic_add(credits, &qp->remote_recv_credits);
+	atomic_set(&qp->remote_recv_credit_state, U4_RECV_CREDIT_SEEN);
+	wake_up(&qp->send_credit_wait);
+	if (READ_ONCE(send_ack_debug))
+		pr_info("recv_credit rx: qp=%u src=%u credits=%u total=%d\n",
+			qp->base.qp_num, le32_to_cpu(hdr->src_qp), credits,
+			atomic_read(&qp->remote_recv_credits));
 }
 
 static void u4r_rx_rdma_read_resp_handler(struct usb4_rdma_qp *qp,
@@ -2117,6 +2634,12 @@ static void u4r_rx_handler(void *qp_opaque, const struct u4_wire_hdr *hdr,
 			u4r_rx_gsi_handler(qp, hdr, payload, length);
 		else
 			u4r_rx_send_handler(qp, hdr, payload, length);
+		break;
+	case U4_OP_SEND_ACK:
+		u4r_rx_send_ack_handler(qp, hdr);
+		break;
+	case U4_OP_RECV_CREDIT:
+		u4r_rx_recv_credit_handler(qp, hdr);
 		break;
 	case U4_OP_RDMA_WRITE:
 	case U4_OP_RDMA_WRITE_WITH_IMM:
@@ -2442,6 +2965,7 @@ int usb4_rdma_ibdev_init(void)
 
 	u4r_dev = u4r;
 	usb4_rdma_data_set_rx_handler(u4r_rx_handler);
+	usb4_rdma_data_set_rx_zcopy_prepare(u4r_rx_zcopy_prepare);
 	pr_info("registered ib_device %s (1 port)\n",
 		dev_name(&u4r->base.dev));
 	return 0;
@@ -2455,6 +2979,7 @@ void usb4_rdma_ibdev_exit(void)
 		return;
 	ndev = u4r_dev->netdev;
 	u4r_dev->netdev = NULL;
+	usb4_rdma_data_set_rx_zcopy_prepare(NULL);
 	usb4_rdma_data_set_rx_handler(NULL);
 	ib_unregister_device(&u4r_dev->base);
 	ib_dealloc_device(&u4r_dev->base);

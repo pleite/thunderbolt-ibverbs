@@ -85,6 +85,11 @@ enum {
 
 static struct dentry *usb4_rdma_debugfs_root;
 
+static bool enable_data_path = true;
+module_param(enable_data_path, bool, 0444);
+MODULE_PARM_DESC(enable_data_path,
+	"Attach the normal RDMA data path on peer probe (default true; set false for isolated loadtest probes)");
+
 /* ----- debugfs ---------------------------------------------------- */
 
 static int usb4_rdma_state_show(struct seq_file *m, void *v)
@@ -153,14 +158,19 @@ static int usb4_rdma_probe(struct tb_service *svc, const struct tb_service_id *i
 
 	tb_service_set_drvdata(svc, dev);
 
-	/* Bring up the data path (rings + frame pool + RX dispatcher). */
-	ret = usb4_rdma_data_attach_peer(svc);
-	if (ret < 0)
-		dev_warn(&svc->dev,
-			 "data path attach failed (%d); verbs will not see this peer\n",
-			 ret);
-	else if (ret > 0)
-		usb4_rdma_ibdev_peer_event(true);
+	if (enable_data_path) {
+		/* Bring up the data path (rings + frame pool + RX dispatcher). */
+		ret = usb4_rdma_data_attach_peer(svc);
+		if (ret < 0)
+			dev_warn(&svc->dev,
+				 "data path attach failed (%d); verbs will not see this peer\n",
+				 ret);
+		else if (ret > 0)
+			usb4_rdma_ibdev_peer_event(true);
+	} else {
+		dev_info(&svc->dev,
+			 "data path attach skipped by enable_data_path=0\n");
+	}
 
 	atomic_set(&dev->state, USB4_RDMA_STATE_RUNNING);
 	return 0;
@@ -177,7 +187,7 @@ static void usb4_rdma_remove(struct tb_service *svc)
 
 	atomic_set(&dev->state, USB4_RDMA_STATE_REMOVED);
 
-	if (usb4_rdma_data_detach_peer(svc))
+	if (enable_data_path && usb4_rdma_data_detach_peer(svc))
 		usb4_rdma_ibdev_peer_event(false);
 
 	debugfs_remove_recursive(dev->debugfs_dir);

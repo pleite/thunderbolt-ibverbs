@@ -80,6 +80,13 @@
 #define LOADTEST_RING_DEPTH       128
 #define LOADTEST_FRAMES_PER_RING  96   /* outstanding frames */
 
+static bool enable;
+module_param(enable, bool, 0444);
+MODULE_PARM_DESC(enable,
+	"Register the loadtest tb_service and claim hops on probe (default 0). "
+	"Off by default so the experimental driver doesn't compete with usb4_rdma "
+	"data-path rings for the controller's narrow hop budget.");
+
 static int nr_rings = 4;
 module_param(nr_rings, int, 0644);
 MODULE_PARM_DESC(nr_rings, "Number of ring pairs to open (1..5; default 4)");
@@ -282,6 +289,7 @@ static int tx_thread_fn(void *data)
 			lf->frame.callback = tx_callback;
 			lf->frame.sof = LOADTEST_PDF_FRAME_START;
 			lf->frame.eof = LOADTEST_PDF_FRAME_END;
+			lf->frame.flags = 0;
 			lf->frame.size = frame_size;
 
 			atomic_inc(&lr->tx_inflight);
@@ -463,6 +471,7 @@ static int loadtest_start(struct loadtest_dev *dev)
 
 	for (i = 0; i < dev->nr_rings; i++) {
 		struct loadtest_ring *lr = &dev->rings[i];
+
 		atomic64_set(&lr->tx_bytes, 0);
 		atomic64_set(&lr->rx_bytes, 0);
 		atomic64_set(&lr->tx_packets, 0);
@@ -722,6 +731,11 @@ int usb4_rdma_loadtest_init(struct dentry *parent_dir)
 	struct tb_property_dir *dir;
 	int err;
 
+	if (!enable) {
+		pr_info("disabled (load with enable=1 to register tb_service)\n");
+		return 0;
+	}
+
 	pr_info("init: sizeof(loadtest_dev)=%zu, sizeof(loadtest_ring)=%zu, "
 		"offsetof svc=%zu xd=%zu nr_rings=%zu rings=%zu rings_setup=%zu running=%zu\n",
 		sizeof(struct loadtest_dev),
@@ -775,6 +789,9 @@ err_root:
 
 void usb4_rdma_loadtest_exit(void)
 {
+	if (!enable)
+		return;
+
 	tb_unregister_service_driver(&loadtest_driver);
 	if (loadtest_property_dir) {
 		tb_unregister_property_dir(LOADTEST_PROTO_KEY,

@@ -31,6 +31,15 @@ typedef int (*usb4_rdma_data_next_page_fn)(void *ctx, struct page **page,
 					   bool *dma_mapped,
 					   usb4_rdma_data_done_fn *done,
 					   void **done_ctx);
+typedef int (*usb4_rdma_data_rx_next_page_fn)(void *ctx, struct page **page,
+					      u32 *page_off, u32 *length,
+					      usb4_rdma_data_done_fn *done,
+					      void **done_ctx);
+typedef void (*usb4_rdma_data_rx_finish_fn)(void *ctx);
+typedef int (*usb4_rdma_data_rx_zcopy_prepare_fn)(
+	void *qp, const struct u4_wire_hdr *hdr, u32 total_length,
+	usb4_rdma_data_rx_next_page_fn *next, void **next_ctx,
+	usb4_rdma_data_rx_finish_fn *finish);
 int  usb4_rdma_data_init(struct dentry *parent_dir);
 void usb4_rdma_data_exit(void);
 /* Returns 0 once peer login has been queued, or a negative errno on
@@ -57,7 +66,10 @@ void usb4_rdma_data_unregister_qp(u32 qp_num);
 void usb4_rdma_data_set_rx_handler(void (*h)(void *qp,
 					     const struct u4_wire_hdr *hdr,
 					     const void *payload, u32 length));
+void usb4_rdma_data_set_rx_zcopy_prepare(
+	usb4_rdma_data_rx_zcopy_prepare_fn prepare);
 bool usb4_rdma_data_peer_attached(void);
+int usb4_rdma_data_poll_rx(void);
 int usb4_rdma_data_active_lane_count(void);
 struct device *usb4_rdma_data_dma_dev_get(void);
 void usb4_rdma_data_dma_dev_put(struct device *dev);

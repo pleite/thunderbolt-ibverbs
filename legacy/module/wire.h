@@ -34,6 +34,7 @@ enum u4_wire_op {
 	U4_OP_RDMA_WRITE_WITH_IMM = 4, /* write + receive completion */
 	U4_OP_RDMA_READ_REQ = 5, /* request remote MR bytes; imm_data=len */
 	U4_OP_RDMA_READ_RESP = 6, /* response payload for one read request */
+	U4_OP_RECV_CREDIT = 7, /* receiver advertises posted RC SEND WRs */
 	/* Future: U4_OP_NAK, ... */
 };
 
