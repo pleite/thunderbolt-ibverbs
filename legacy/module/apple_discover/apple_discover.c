@@ -54,14 +54,16 @@ static const char apple_rdma_key[9] = {
 	(char)0xff, (char)0xff, 'A', 'D', '\0',
 };
 
-/*
- * We do not know Apple's own service UUID yet; Linux must still publish a
- * directory UUID if it advertises an xdomain service. Keep this stable so
- * captures are reproducible.
- */
+/* Apple's RDMA service directory UUID, observed from a macOS 26.3.1 peer. */
 static const uuid_t apple_disc_service_uuid =
-	UUID_INIT(0xfa57ad00, 0x6c69, 0x4e75,
-		  0x8a, 0x44, 0x6c, 0x69, 0x6e, 0x75, 0x78, 0x00);
+	UUID_INIT(0x49bf223e, 0xd4aa, 0x44d7,
+		  0x87, 0x91, 0x50, 0x44, 0x5a, 0xc5, 0x2d, 0x5e);
+
+/* Apple also publishes a binary property key (six 0xff) + "CA" = 1. */
+static const char apple_rdma_ca_key[9] = {
+	(char)0xff, (char)0xff, (char)0xff, (char)0xff,
+	(char)0xff, (char)0xff, 'C', 'A', '\0',
+};
 
 /* Capture limits — we only care about the FIRST few frames / messages
  * to dissect the format. After we have N captures we stop logging to
@@ -173,6 +175,7 @@ static int apple_disc_register_property_dir(void)
 	ret = ret ?: tb_property_add_immediate(dir, "prtcrevs",
 					       APPLE_RDMA_PRTCREVS);
 	ret = ret ?: tb_property_add_immediate(dir, "prtcstns", 0);
+	ret = ret ?: tb_property_add_immediate(dir, apple_rdma_ca_key, 1);
 	if (ret) {
 		tb_property_free_dir(dir);
 		return ret;
@@ -204,6 +207,8 @@ static void apple_disc_unregister_property_dir(void)
 
 static void apple_disc_dump_peer(struct tb_service *svc, struct tb_xdomain *xd)
 {
+	struct tb_property *p;
+
 	pr_info("======== PEER DETECTED (svc=%s) ========\n",
 		dev_name(&svc->dev));
 	pr_info("  route=0x%llx  link_speed=%u Gb/s\n", xd->route, xd->link_speed);
@@ -216,15 +221,32 @@ static void apple_disc_dump_peer(struct tb_service *svc, struct tb_xdomain *xd)
 	pr_info("  device_name='%s'  vendor_name='%s'\n",
 		xd->device_name ? xd->device_name : "(null)",
 		xd->vendor_name ? xd->vendor_name : "(null)");
-	/*
-	 * NOTE: we also want the peer's full tb_property_dir contents (every
-	 * key the peer publishes under prtcid=0xFA57). The kernel doesn't
-	 * expose this via tb_xdomain in a stable accessor, but we can pull
-	 * it indirectly with a tb_xdomain_request to the peer's "property
-	 * dir read" message — that's what tb_xdomain login does. Skipping
-	 * here for simplicity; user can read it via:
-	 *   ls /sys/bus/thunderbolt/devices/<svc>/
-	 */
+
+	mutex_lock(&xd->lock);
+	p = tb_property_find(xd->remote_properties, svc->key,
+			     TB_PROPERTY_TYPE_DIRECTORY);
+	if (p && p->value.dir) {
+		struct tb_property_dir *dir = p->value.dir;
+		struct tb_property *child;
+
+		if (dir->uuid)
+			pr_info("  service dir uuid=%pUb\n", dir->uuid);
+		else
+			pr_info("  service dir uuid=(null)\n");
+
+		tb_property_for_each(dir, child) {
+			if (child->type == TB_PROPERTY_TYPE_VALUE) {
+				pr_info("  prop %-8s = 0x%x\n", child->key,
+					child->value.immediate);
+			} else {
+				pr_info("  prop %-8s type=0x%x len=%zu\n",
+					child->key, child->type, child->length);
+			}
+		}
+	} else {
+		pr_info("  service property directory not found\n");
+	}
+	mutex_unlock(&xd->lock);
 }
 
 /* ----- RX log readers ------------------------------------------- */
