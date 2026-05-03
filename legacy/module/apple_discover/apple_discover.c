@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * apple_discover.c — passive observer for Apple's RDMA-over-Thunderbolt
+ * apple_discover.c — discovery helper for Apple's RDMA-over-Thunderbolt
  *                    xdomain service.
  *
  * Goal: when a macOS 26.2+ Mac connects via USB4/Thunderbolt, capture
@@ -13,9 +13,8 @@
  *      to Apple's RDMA service UUID
  *
  * What the module does NOT do:
- *   - Speak Apple's wire protocol back. We're a passive observer.
- *     Apple's stack may decline to send us much beyond initial
- *     advertisement / login if we never play along.
+ *   - Provide a real verbs device or complete Apple's wire protocol.
+ *     Apart from the explicit debugfs tx_test hook, this is an observer.
  *
  * Apple's RDMA service identity (observed from /sys/bus/thunderbolt
  * on a Mac peer):
@@ -41,6 +40,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
+#include <linux/uaccess.h>
 
 #define APPLE_RDMA_PRTCID	0xFA57
 #define APPLE_RDMA_PRTCVERS	1
@@ -72,10 +72,10 @@ static const char apple_rdma_ca_key[9] = {
  * to dissect the format. After we have N captures we stop logging to
  * avoid drowning dmesg in steady-state traffic. */
 #define APPLE_DISC_FRAME_SIZE		SZ_4K
-#define APPLE_DISC_RING_DEPTH		32
-#define APPLE_DISC_FRAMES_TO_POST	16
-#define APPLE_DISC_MAX_LOG_FRAMES	32
-#define APPLE_DISC_MAX_LOG_BYTES	256	/* per frame, hex dump */
+#define APPLE_DISC_RING_DEPTH		256
+#define APPLE_DISC_FRAMES_TO_POST	128
+#define APPLE_DISC_MAX_LOG_FRAMES	128
+#define APPLE_DISC_MAX_LOG_BYTES	64	/* per frame, hex dump */
 #define APPLE_DISC_MAX_CTRL_MSGS	32
 #define APPLE_DISC_MAX_CTRL_BYTES	256
 
@@ -98,7 +98,7 @@ MODULE_PARM_DESC(enable_paths,
 static bool enable_e2e;
 module_param(enable_e2e, bool, 0444);
 MODULE_PARM_DESC(enable_e2e,
-		 "Allocate a paired TX ring and enable hardware E2E flow control on the capture RX ring (requires enable_rx=1; default: off)");
+		 "Allocate a paired TX ring/outgoing HopID and enable hardware E2E flow control on the capture RX ring (requires enable_rx=1; default: off)");
 
 static bool advertise_service;
 module_param(advertise_service, bool, 0444);
@@ -127,6 +127,13 @@ struct apple_disc_frame {
 	dma_addr_t dma;
 };
 
+struct apple_disc_tx_frame {
+	struct ring_frame frame;
+	struct apple_disc_dev *dev;
+	void *data;
+	dma_addr_t dma;
+};
+
 struct apple_disc_dev {
 	struct tb_service *svc;
 	struct tb_xdomain *xd;
@@ -142,6 +149,10 @@ struct apple_disc_dev {
 
 	atomic_t frames_logged;
 	atomic_t frames_received;
+	atomic_t tx_test_posted;
+	atomic_t tx_test_completed;
+	atomic_t tx_test_canceled;
+	atomic_t tx_test_failed;
 
 	struct dentry *dir;
 
@@ -298,6 +309,11 @@ static int apple_disc_log_show(struct seq_file *m, void *unused)
 	seq_printf(m, "captures: %d (received total: %d)\n",
 		   atomic_read(&dev->frames_logged),
 		   atomic_read(&dev->frames_received));
+	seq_printf(m, "tx_test: posted=%d completed=%d canceled=%d failed=%d\n",
+		   atomic_read(&dev->tx_test_posted),
+		   atomic_read(&dev->tx_test_completed),
+		   atomic_read(&dev->tx_test_canceled),
+		   atomic_read(&dev->tx_test_failed));
 	seq_puts(m, "\n");
 
 	spin_lock_irqsave(&dev->log_lock, flags);
@@ -426,6 +442,164 @@ static void apple_disc_rx_callback(struct tb_ring *ring,
 		pr_warn_ratelimited("tb_ring_rx repost failed: %d\n", ret);
 }
 
+/* ----- bounded TX probe ------------------------------------------ */
+
+static void apple_disc_tx_callback(struct tb_ring *ring,
+				   struct ring_frame *frame, bool canceled)
+{
+	struct apple_disc_tx_frame *tf =
+		container_of(frame, typeof(*tf), frame);
+	struct device *dma_dev = tb_ring_dma_device(ring);
+
+	dma_unmap_single(dma_dev, tf->dma, APPLE_DISC_FRAME_SIZE,
+			 DMA_TO_DEVICE);
+	if (canceled)
+		atomic_inc(&tf->dev->tx_test_canceled);
+	else
+		atomic_inc(&tf->dev->tx_test_completed);
+	kfree(tf->data);
+	kfree(tf);
+}
+
+static void apple_disc_fill_off32(void *dst, u32 app_offset, u32 len)
+{
+	u8 *bytes = dst;
+	u32 i;
+
+	for (i = 0; i < len; i += 4) {
+		u32 offset = app_offset + i;
+		u32 j;
+
+		for (j = 0; j < 4 && i + j < len; j++)
+			bytes[i + j] = (u8)(offset >> (j * 8));
+	}
+}
+
+static int apple_disc_submit_tx_frame(struct apple_disc_dev *dev,
+				      u32 app_offset, u32 len,
+				      u8 sof, u8 eof)
+{
+	struct device *dma_dev = tb_ring_dma_device(dev->tx_ring);
+	struct apple_disc_tx_frame *tf;
+	int ret;
+
+	tf = kzalloc(sizeof(*tf), GFP_KERNEL);
+	if (!tf)
+		return -ENOMEM;
+	tf->data = kzalloc(APPLE_DISC_FRAME_SIZE, GFP_KERNEL);
+	if (!tf->data) {
+		kfree(tf);
+		return -ENOMEM;
+	}
+
+	tf->dev = dev;
+	apple_disc_fill_off32(tf->data, app_offset, len);
+	tf->dma = dma_map_single(dma_dev, tf->data, APPLE_DISC_FRAME_SIZE,
+				 DMA_TO_DEVICE);
+	if (dma_mapping_error(dma_dev, tf->dma)) {
+		kfree(tf->data);
+		kfree(tf);
+		return -EIO;
+	}
+
+	tf->frame.buffer_phy = tf->dma;
+	tf->frame.callback = apple_disc_tx_callback;
+	tf->frame.size = len;
+	tf->frame.sof = sof;
+	tf->frame.eof = eof;
+	INIT_LIST_HEAD(&tf->frame.list);
+
+	ret = tb_ring_tx(dev->tx_ring, &tf->frame);
+	if (ret) {
+		dma_unmap_single(dma_dev, tf->dma, APPLE_DISC_FRAME_SIZE,
+				 DMA_TO_DEVICE);
+		kfree(tf->data);
+		kfree(tf);
+		atomic_inc(&dev->tx_test_failed);
+		return ret;
+	}
+
+	atomic_inc(&dev->tx_test_posted);
+	return 0;
+}
+
+static int apple_disc_tx_test_send(struct apple_disc_dev *dev, u32 length)
+{
+	u32 blocks = length / SZ_4K;
+	u32 block;
+	int ret;
+
+	if (!dev->tx_ring || !dev->paths_enabled)
+		return -ENODEV;
+	if (!length || length % SZ_4K || length > SZ_16K)
+		return -EINVAL;
+
+	for (block = 0; block < blocks; block++) {
+		u32 base = block * SZ_4K;
+		u32 chunk;
+
+		for (chunk = 0; chunk < 15; chunk++) {
+			ret = apple_disc_submit_tx_frame(dev,
+							base + chunk * 0x100,
+							252, 0,
+							chunk ? 0 : 1);
+			if (ret)
+				return ret;
+		}
+
+		ret = apple_disc_submit_tx_frame(dev, base + 0x0f00, 12,
+						 0, 0);
+		if (ret)
+			return ret;
+		ret = apple_disc_submit_tx_frame(dev, base + 0x0f10, 240,
+						 0,
+						 block + 1 == blocks ? 3 : 2);
+		if (ret)
+			return ret;
+	}
+
+	pr_info("tx_test: posted Apple-shaped %u-byte off32 stream (%u descriptors)\n",
+		length, atomic_read(&dev->tx_test_posted));
+	return 0;
+}
+
+static ssize_t apple_disc_tx_test_write(struct file *file,
+					const char __user *ubuf,
+					size_t count, loff_t *ppos)
+{
+	struct apple_disc_dev *dev = file->private_data;
+	char buf[32];
+	u32 length = SZ_16K;
+	size_t n;
+	int ret;
+
+	if (!dev)
+		return -ENODEV;
+
+	n = min(count, sizeof(buf) - 1);
+	if (copy_from_user(buf, ubuf, n))
+		return -EFAULT;
+	buf[n] = '\0';
+	strim(buf);
+	if (buf[0]) {
+		ret = kstrtou32(buf, 0, &length);
+		if (ret)
+			return ret;
+	}
+
+	ret = apple_disc_tx_test_send(dev, length);
+	if (ret)
+		return ret;
+	return count;
+}
+
+static const struct file_operations apple_disc_tx_test_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = apple_disc_tx_test_write,
+	.llseek = noop_llseek,
+};
+
 /* ----- ring lifecycle ------------------------------------------- */
 
 static int apple_disc_alloc_rx_frames(struct apple_disc_dev *dev)
@@ -533,6 +707,13 @@ static int apple_disc_setup_ring(struct apple_disc_dev *dev)
 		e2e_tx_hop = dev->tx_ring->hop;
 		pr_info("enable_e2e=1: tx_ring->hop=%d\n",
 			dev->tx_ring->hop);
+
+		ret = tb_xdomain_alloc_out_hopid(xd, -1);
+		if (ret < 0)
+			goto err_tx_ring;
+		dev->local_out_hop = ret;
+		pr_info("enable_e2e=1: allocated transmit_path=%d\n",
+			dev->local_out_hop);
 	}
 
 	dev->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, -1, APPLE_DISC_RING_DEPTH,
@@ -570,7 +751,9 @@ static int apple_disc_setup_ring(struct apple_disc_dev *dev)
 		 * addressed to our in_hop. This is experimental because the
 		 * Apple peer has not told us which TX path it will use.
 		 */
-		ret = tb_xdomain_enable_paths(xd, -1, -1,
+		ret = tb_xdomain_enable_paths(xd, dev->local_out_hop,
+					      dev->tx_ring ?
+						      dev->tx_ring->hop : -1,
 					      dev->local_in_hop,
 					      dev->rx_ring->hop);
 		if (ret) {
@@ -598,6 +781,10 @@ err_ring:
 	tb_ring_free(dev->rx_ring);
 	dev->rx_ring = NULL;
 err_tx_ring:
+	if (dev->local_out_hop >= 0) {
+		tb_xdomain_release_out_hopid(xd, dev->local_out_hop);
+		dev->local_out_hop = -1;
+	}
 	if (dev->tx_ring) {
 		tb_ring_free(dev->tx_ring);
 		dev->tx_ring = NULL;
@@ -612,7 +799,10 @@ static void apple_disc_teardown_ring(struct apple_disc_dev *dev)
 {
 	if (dev->rx_ring) {
 		if (dev->paths_enabled)
-			tb_xdomain_disable_paths(dev->xd, -1, -1,
+			tb_xdomain_disable_paths(dev->xd,
+						 dev->local_out_hop,
+						 dev->tx_ring ?
+							 dev->tx_ring->hop : -1,
 						 dev->local_in_hop,
 						 dev->rx_ring->hop);
 		dev->paths_enabled = false;
@@ -628,9 +818,12 @@ static void apple_disc_teardown_ring(struct apple_disc_dev *dev)
 	}
 	if (dev->hops_allocated) {
 		tb_xdomain_release_in_hopid(dev->xd, dev->local_in_hop);
-		if (dev->local_out_hop >= 0)
+		dev->local_in_hop = -1;
+		if (dev->local_out_hop >= 0) {
 			tb_xdomain_release_out_hopid(dev->xd,
 						     dev->local_out_hop);
+			dev->local_out_hop = -1;
+		}
 		dev->hops_allocated = false;
 	}
 }
@@ -666,6 +859,10 @@ static int apple_disc_probe(struct tb_service *svc,
 	dev->local_out_hop = -1;
 	atomic_set(&dev->frames_logged, 0);
 	atomic_set(&dev->frames_received, 0);
+	atomic_set(&dev->tx_test_posted, 0);
+	atomic_set(&dev->tx_test_completed, 0);
+	atomic_set(&dev->tx_test_canceled, 0);
+	atomic_set(&dev->tx_test_failed, 0);
 	spin_lock_init(&dev->log_lock);
 	INIT_LIST_HEAD(&dev->log_list);
 
@@ -687,6 +884,9 @@ static int apple_disc_probe(struct tb_service *svc,
 	if (!IS_ERR_OR_NULL(dev->dir))
 		debugfs_create_file("rx_log", 0444, dev->dir, dev,
 				    &apple_disc_log_fops);
+	if (!IS_ERR_OR_NULL(dev->dir))
+		debugfs_create_file("tx_test", 0200, dev->dir, dev,
+				    &apple_disc_tx_test_fops);
 
 	tb_service_set_drvdata(svc, dev);
 	dev_info(&svc->dev,
