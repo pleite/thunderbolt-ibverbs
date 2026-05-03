@@ -134,6 +134,11 @@ module_param(tx_raw_mode, bool, 0444);
 MODULE_PARM_DESC(tx_raw_mode,
 		 "Use raw NHI TX rings and append Apple's 4-byte end-of-group trailer (default: false)");
 
+static bool tx_e2e = true;
+module_param(tx_e2e, bool, 0444);
+MODULE_PARM_DESC(tx_e2e,
+		 "Enable E2E flow control on TX rings (default: true)");
+
 static bool rx_raw_mode = true;
 module_param(rx_raw_mode, bool, 0444);
 MODULE_PARM_DESC(rx_raw_mode,
@@ -1693,7 +1698,7 @@ static void ardma_free_rx_frames(struct ardma_peer *peer)
 static int ardma_setup_rings(struct ardma_peer *peer)
 {
 	struct tb_xdomain *xd = peer->xd;
-	unsigned int tx_ring_flags = RING_FLAG_E2E;
+	unsigned int tx_ring_flags = READ_ONCE(tx_e2e) ? RING_FLAG_E2E : 0;
 	unsigned int rx_ring_flags = RING_FLAG_E2E;
 	int e2e_tx_hop;
 	int ret, i;
