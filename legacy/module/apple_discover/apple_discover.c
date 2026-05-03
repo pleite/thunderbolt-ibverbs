@@ -105,6 +105,11 @@ module_param(service_uuid, charp, 0444);
 MODULE_PARM_DESC(service_uuid,
 		 "Override advertised AD/FA57 service UUID, e.g. the Mac local port UUID");
 
+static int receive_path = -1;
+module_param(receive_path, int, 0444);
+MODULE_PARM_DESC(receive_path,
+		 "Preferred incoming HopID to route to the capture RX ring, or -1 for next available");
+
 static bool apple_vendor_only = true;
 module_param(apple_vendor_only, bool, 0444);
 MODULE_PARM_DESC(apple_vendor_only,
@@ -372,12 +377,12 @@ static void apple_disc_rx_callback(struct tb_ring *ring,
 	int logged;
 	int ret;
 
-	atomic_inc(&dev->frames_received);
-
 	if (canceled) {
 		pr_info_ratelimited("RX canceled\n");
 		return;
 	}
+
+	atomic_inc(&dev->frames_received);
 
 	logged = atomic_read(&dev->frames_logged);
 	if (logged < APPLE_DISC_MAX_LOG_FRAMES) {
@@ -492,24 +497,19 @@ static void apple_disc_free_rx_frames(struct apple_disc_dev *dev)
 static int apple_disc_setup_ring(struct apple_disc_dev *dev)
 {
 	struct tb_xdomain *xd = dev->xd;
-	int in_hop, out_hop;
+	int in_hop;
 	int ret, i;
 
-	in_hop = tb_xdomain_alloc_in_hopid(xd, -1);
+	in_hop = tb_xdomain_alloc_in_hopid(xd, receive_path);
 	if (in_hop < 0) {
-		pr_warn("alloc_in_hopid failed: %d\n", in_hop);
+		pr_warn("alloc_in_hopid(%d) failed: %d\n",
+			receive_path, in_hop);
 		return in_hop;
 	}
-	out_hop = tb_xdomain_alloc_out_hopid(xd, -1);
-	if (out_hop < 0) {
-		tb_xdomain_release_in_hopid(xd, in_hop);
-		pr_warn("alloc_out_hopid failed: %d\n", out_hop);
-		return out_hop;
-	}
 	dev->local_in_hop = in_hop;
-	dev->local_out_hop = out_hop;
+	dev->local_out_hop = -1;
 	dev->hops_allocated = true;
-	pr_info("allocated hops: in=%d out=%d\n", in_hop, out_hop);
+	pr_info("allocated receive_path=%d\n", in_hop);
 
 	dev->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, -1, APPLE_DISC_RING_DEPTH,
 					RING_FLAG_FRAME,
@@ -541,11 +541,10 @@ static int apple_disc_setup_ring(struct apple_disc_dev *dev)
 
 	if (enable_paths) {
 		/* Enable paths so the controller starts forwarding frames
-		 * addressed to our in_hop. This is experimental because we do
-		 * not know Apple's TX hop yet.
+		 * addressed to our in_hop. This is experimental because the
+		 * Apple peer has not told us which TX path it will use.
 		 */
-		ret = tb_xdomain_enable_paths(xd, dev->local_out_hop,
-					      dev->rx_ring->hop,
+		ret = tb_xdomain_enable_paths(xd, -1, -1,
 					      dev->local_in_hop,
 					      dev->rx_ring->hop);
 		if (ret) {
@@ -569,7 +568,6 @@ err_ring:
 	tb_ring_free(dev->rx_ring);
 	dev->rx_ring = NULL;
 err_hopid:
-	tb_xdomain_release_out_hopid(xd, out_hop);
 	tb_xdomain_release_in_hopid(xd, in_hop);
 	dev->hops_allocated = false;
 	return ret;
@@ -579,8 +577,7 @@ static void apple_disc_teardown_ring(struct apple_disc_dev *dev)
 {
 	if (dev->rx_ring) {
 		if (enable_paths)
-			tb_xdomain_disable_paths(dev->xd, dev->local_out_hop,
-						 dev->rx_ring->hop,
+			tb_xdomain_disable_paths(dev->xd, -1, -1,
 						 dev->local_in_hop,
 						 dev->rx_ring->hop);
 		tb_ring_stop(dev->rx_ring);
@@ -590,7 +587,9 @@ static void apple_disc_teardown_ring(struct apple_disc_dev *dev)
 	}
 	if (dev->hops_allocated) {
 		tb_xdomain_release_in_hopid(dev->xd, dev->local_in_hop);
-		tb_xdomain_release_out_hopid(dev->xd, dev->local_out_hop);
+		if (dev->local_out_hop >= 0)
+			tb_xdomain_release_out_hopid(dev->xd,
+						     dev->local_out_hop);
 		dev->hops_allocated = false;
 	}
 }
@@ -622,6 +621,8 @@ static int apple_disc_probe(struct tb_service *svc,
 
 	dev->svc = svc;
 	dev->xd = xd;
+	dev->local_in_hop = -1;
+	dev->local_out_hop = -1;
 	atomic_set(&dev->frames_logged, 0);
 	atomic_set(&dev->frames_received, 0);
 	spin_lock_init(&dev->log_lock);
