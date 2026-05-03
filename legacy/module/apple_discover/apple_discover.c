@@ -40,6 +40,7 @@
 #include <linux/slab.h>
 #include <linux/dma-mapping.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
 
 #define APPLE_RDMA_PRTCID	0xFA57
 #define APPLE_RDMA_PRTCVERS	1
@@ -93,6 +94,11 @@ static bool advertise_service;
 module_param(advertise_service, bool, 0444);
 MODULE_PARM_DESC(advertise_service,
 		 "Advertise a local Apple-compatible AD/FA57 service to the peer (default: off)");
+
+static bool apple_vendor_only = true;
+module_param(apple_vendor_only, bool, 0444);
+MODULE_PARM_DESC(apple_vendor_only,
+		 "Bind only peers whose xdomain vendor_name is Apple Inc. (default: on)");
 
 struct apple_disc_frame {
 	struct ring_frame frame;
@@ -553,6 +559,15 @@ static int apple_disc_probe(struct tb_service *svc,
 
 	if (!xd)
 		return -ENODEV;
+
+	if (apple_vendor_only &&
+	    (!xd->vendor_name || strcmp(xd->vendor_name, "Apple Inc."))) {
+		dev_info(&svc->dev,
+			 "skipping non-Apple AD/FA57 peer: device_name='%s' vendor_name='%s'\n",
+			 xd->device_name ? xd->device_name : "(null)",
+			 xd->vendor_name ? xd->vendor_name : "(null)");
+		return -ENODEV;
+	}
 
 	dev = devm_kzalloc(&svc->dev, sizeof(*dev), GFP_KERNEL);
 	if (!dev)
