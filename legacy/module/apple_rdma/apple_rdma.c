@@ -110,6 +110,11 @@ module_param(tx_enabled, bool, 0644);
 MODULE_PARM_DESC(tx_enabled,
 		 "Allow experimental Linux -> Mac Apple-shaped SEND descriptors (default: false)");
 
+static bool rx_raw_mode = true;
+module_param(rx_raw_mode, bool, 0444);
+MODULE_PARM_DESC(rx_raw_mode,
+		 "Use raw NHI RX rings and trim Apple's 4-byte end-of-group trailer (default: true)");
+
 struct ardma_peer;
 struct ardma_qp;
 
@@ -564,6 +569,7 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 	struct ardma_recv_wr *r;
 	unsigned long flags;
 	u32 dst_off, rel_off;
+	u32 copy_len = len;
 	bool group_done;
 	enum ib_wc_status complete_status = IB_WC_SUCCESS;
 	int ret;
@@ -598,7 +604,18 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 		qp->rx_tail_pending = false;
 	}
 
-	if (ardma_known_piece(qp, len, &rel_off, &group_done)) {
+	if (READ_ONCE(rx_raw_mode)) {
+		dst_off = qp->rx_byte_len;
+		if (eof == 2 || eof == 3) {
+			if (len < 4) {
+				copy_len = 0;
+				atomic64_inc(&peer->rx_bad_shape);
+				qp->rx_truncated = true;
+			} else {
+				copy_len = len - 4;
+			}
+		}
+	} else if (ardma_known_piece(qp, len, &rel_off, &group_done)) {
 		dst_off = qp->rx_group_base + rel_off;
 		if (group_done && eof == 2)
 			qp->rx_group_base += SZ_4K;
@@ -610,14 +627,14 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 	r = qp->rx_wr;
 	spin_unlock_irqrestore(&qp->recv_lock, flags);
 
-	ret = ardma_recv_scatter(pd, r, dst_off, payload, len);
+	ret = ardma_recv_scatter(pd, r, dst_off, payload, copy_len);
 
 	spin_lock_irqsave(&qp->recv_lock, flags);
 	if (ret == -ERANGE)
 		qp->rx_truncated = true;
 	else if (ret)
 		qp->rx_truncated = true;
-	qp->rx_byte_len = max(qp->rx_byte_len, dst_off + len);
+	qp->rx_byte_len = max(qp->rx_byte_len, dst_off + copy_len);
 	if (eof != 3) {
 		spin_unlock_irqrestore(&qp->recv_lock, flags);
 		ardma_qp_put(qp);
@@ -647,7 +664,8 @@ static void ardma_rx_callback(struct tb_ring *ring, struct ring_frame *frame,
 
 	dma_sync_single_for_cpu(dma_dev, rf->dma, ARDMA_FRAME_SIZE,
 				DMA_FROM_DEVICE);
-	len = frame->size ?: ARDMA_FRAME_SIZE;
+	len = frame->size ?: (READ_ONCE(rx_raw_mode) ? TB_FRAME_SIZE :
+			      ARDMA_FRAME_SIZE);
 	atomic64_inc(&peer->rx_frame_count);
 
 	/* The incoming path is the destination HopID. Apple's visible QPN is
@@ -1563,9 +1581,13 @@ static void ardma_free_rx_frames(struct ardma_peer *peer)
 static int ardma_setup_rings(struct ardma_peer *peer)
 {
 	struct tb_xdomain *xd = peer->xd;
-	unsigned int ring_flags = RING_FLAG_FRAME | RING_FLAG_E2E;
+	unsigned int tx_ring_flags = RING_FLAG_FRAME | RING_FLAG_E2E;
+	unsigned int rx_ring_flags = RING_FLAG_E2E;
 	int e2e_tx_hop;
 	int ret, i;
+
+	if (!READ_ONCE(rx_raw_mode))
+		rx_ring_flags |= RING_FLAG_FRAME;
 
 	peer->local_in_hop = -1;
 	peer->local_out_hop = -1;
@@ -1582,7 +1604,7 @@ static int ardma_setup_rings(struct ardma_peer *peer)
 	peer->local_in_hop = ret;
 
 	peer->tx_ring = tb_ring_alloc_tx(xd->tb->nhi, -1, ARDMA_RING_DEPTH,
-					 ring_flags);
+					 tx_ring_flags);
 	if (!peer->tx_ring) {
 		ret = -ENOMEM;
 		goto err_in_hop;
@@ -1595,7 +1617,7 @@ static int ardma_setup_rings(struct ardma_peer *peer)
 	peer->local_out_hop = ret;
 
 	peer->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, -1, ARDMA_RING_DEPTH,
-					 ring_flags, e2e_tx_hop,
+					 rx_ring_flags, e2e_tx_hop,
 					 ARDMA_RX_SOF_MASK,
 					 ARDMA_RX_EOF_MASK, NULL, NULL);
 	if (!peer->rx_ring) {
