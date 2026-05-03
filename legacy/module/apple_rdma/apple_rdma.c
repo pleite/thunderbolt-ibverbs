@@ -53,12 +53,13 @@
 #define APPLE_RDMA_PRTCREVS	0
 
 #define ARDMA_FRAME_SIZE	SZ_4K
-#define ARDMA_RING_DEPTH	512
-#define ARDMA_RX_FRAMES		(ARDMA_RING_DEPTH - 32)
+#define ARDMA_RING_DEPTH	8192
+#define ARDMA_RX_FRAMES		(ARDMA_RING_DEPTH - 64)
 #define ARDMA_MAX_SGE		4
 #define ARDMA_MAX_CQE		4096
 #define ARDMA_MAX_MSG_SIZE	SZ_16M
-#define ARDMA_PENDING_RX_BYTES	SZ_64K
+#define ARDMA_PENDING_RX_BYTES	SZ_512K
+#define ARDMA_PENDING_RX_SLOTS	16
 #define ARDMA_UVERBS_ABI	1
 #define ARDMA_QPN_MIN		0x900
 #define ARDMA_QPN_MAX		0x00ffffff
@@ -200,6 +201,14 @@ struct ardma_recv_wr {
 	struct ib_sge sge[ARDMA_MAX_SGE];
 };
 
+struct ardma_pending_rx {
+	u8 *buf;
+	u32 len;
+	bool active;
+	bool ready;
+	bool truncated;
+};
+
 struct ardma_qp {
 	struct ib_qp base;
 	struct ardma_peer *peer;
@@ -222,11 +231,11 @@ struct ardma_qp {
 	u32 rx_byte_len;
 	bool rx_tail_pending;
 	bool rx_truncated;
-	u8 *rx_pending_buf;
-	u32 rx_pending_len;
-	bool rx_pending_active;
-	bool rx_pending_ready;
-	bool rx_pending_truncated;
+	struct ardma_pending_rx rx_pending[ARDMA_PENDING_RX_SLOTS];
+	u8 rx_pending_head;
+	u8 rx_pending_tail;
+	u8 rx_pending_ready_count;
+	int rx_pending_active;
 
 	spinlock_t list_lock;
 	struct list_head qps_link;
@@ -280,6 +289,8 @@ struct ardma_peer {
 
 	struct dentry *debugfs_dir;
 	atomic64_t rx_frame_count;
+	atomic64_t rx_eof[4];
+	atomic64_t rx_eof_other;
 	atomic64_t rx_messages;
 	atomic64_t rx_drops;
 	atomic64_t rx_bad_shape;
@@ -562,6 +573,54 @@ static struct ardma_recv_wr *ardma_pop_recv_locked(struct ardma_qp *qp)
 	return r;
 }
 
+static int ardma_recv_wr_total_len(const struct ardma_recv_wr *r, u32 *total)
+{
+	u32 n = 0;
+	int i;
+
+	for (i = 0; i < r->num_sge; i++) {
+		if (r->sge[i].length > U32_MAX - n)
+			return -EMSGSIZE;
+		n += r->sge[i].length;
+	}
+	*total = n;
+	return 0;
+}
+
+static struct ardma_pending_rx *ardma_pending_active_locked(struct ardma_qp *qp)
+{
+	struct ardma_pending_rx *p;
+
+	if (qp->rx_pending_active >= 0)
+		return &qp->rx_pending[qp->rx_pending_active];
+	if (qp->rx_pending_ready_count >= ARDMA_PENDING_RX_SLOTS)
+		return NULL;
+
+	p = &qp->rx_pending[qp->rx_pending_tail];
+	p->len = 0;
+	p->truncated = false;
+	p->active = true;
+	p->ready = false;
+	qp->rx_pending_active = qp->rx_pending_tail;
+	return p;
+}
+
+static void ardma_pending_finish_locked(struct ardma_qp *qp)
+{
+	struct ardma_pending_rx *p;
+
+	if (qp->rx_pending_active < 0)
+		return;
+
+	p = &qp->rx_pending[qp->rx_pending_active];
+	p->active = false;
+	p->ready = true;
+	qp->rx_pending_active = -1;
+	qp->rx_pending_ready_count++;
+	qp->rx_pending_tail = (qp->rx_pending_tail + 1) %
+			      ARDMA_PENDING_RX_SLOTS;
+}
+
 static void ardma_push_rx_wc(struct ardma_qp *qp, struct ardma_recv_wr *r,
 			     u32 byte_len, enum ib_wc_status status)
 {
@@ -586,30 +645,36 @@ ardma_flush_pending_locked(struct ardma_qp *qp, u32 *byte_len,
 			   enum ib_wc_status *status)
 {
 	struct ardma_pd *pd = container_of(qp->base.pd, struct ardma_pd, base);
+	struct ardma_pending_rx *p;
 	struct ardma_recv_wr *r;
+	u32 expected_len;
 	int ret;
 
-	if (!qp->rx_pending_ready)
+	if (!qp->rx_pending_ready_count)
 		return NULL;
 
 	r = ardma_pop_recv_locked(qp);
 	if (!r)
 		return NULL;
 
-	*byte_len = qp->rx_pending_len;
-	*status = qp->rx_pending_truncated ? IB_WC_LOC_LEN_ERR :
-					     IB_WC_SUCCESS;
-	ret = ardma_recv_scatter(pd, r, 0, qp->rx_pending_buf,
-				 qp->rx_pending_len);
+	p = &qp->rx_pending[qp->rx_pending_head];
+	*byte_len = p->len;
+	*status = p->truncated ? IB_WC_LOC_LEN_ERR : IB_WC_SUCCESS;
+	if (!ardma_recv_wr_total_len(r, &expected_len) &&
+	    p->len != expected_len)
+		*status = IB_WC_LOC_LEN_ERR;
+	ret = ardma_recv_scatter(pd, r, 0, p->buf, p->len);
 	if (ret == -ERANGE)
 		*status = IB_WC_LOC_LEN_ERR;
 	else if (ret)
 		*status = IB_WC_LOC_PROT_ERR;
 
-	qp->rx_pending_active = false;
-	qp->rx_pending_ready = false;
-	qp->rx_pending_len = 0;
-	qp->rx_pending_truncated = false;
+	p->ready = false;
+	p->len = 0;
+	p->truncated = false;
+	qp->rx_pending_head = (qp->rx_pending_head + 1) %
+			      ARDMA_PENDING_RX_SLOTS;
+	qp->rx_pending_ready_count--;
 	return r;
 }
 
@@ -689,52 +754,62 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 
 	spin_lock_irqsave(&qp->recv_lock, flags);
 	if (!qp->rx_wr) {
-		r = ardma_pop_recv_locked(qp);
-		if (!r) {
-			if (READ_ONCE(rx_raw_mode) && qp->rx_pending_buf &&
-			    !qp->rx_pending_ready) {
-				if (!qp->rx_pending_active || eof == 1) {
-					qp->rx_pending_active = true;
-					qp->rx_pending_len = 0;
-					qp->rx_pending_truncated = false;
+		bool buffer_pending = false;
+
+		if (READ_ONCE(rx_raw_mode) && qp->rx_pending_active >= 0) {
+			buffer_pending = true;
+		} else {
+			r = ardma_pop_recv_locked(qp);
+			if (!r) {
+				if (READ_ONCE(rx_raw_mode))
+					buffer_pending = true;
+				else {
+					spin_unlock_irqrestore(&qp->recv_lock,
+							       flags);
+					atomic64_inc(&peer->rx_drops);
+					ardma_qp_put(qp);
+					return;
 				}
-				copy_len = len;
-				if (eof == 2 || eof == 3) {
-					if (len < 4) {
-						copy_len = 0;
-						qp->rx_pending_truncated = true;
-						atomic64_inc(&peer->rx_bad_shape);
-					} else {
-						copy_len = len - 4;
-					}
-				}
-				if (qp->rx_pending_len + copy_len >
-				    ARDMA_PENDING_RX_BYTES) {
-					copy_len = ARDMA_PENDING_RX_BYTES -
-						   qp->rx_pending_len;
-					qp->rx_pending_truncated = true;
-				}
-				memcpy(qp->rx_pending_buf + qp->rx_pending_len,
-				       payload, copy_len);
-				qp->rx_pending_len += copy_len;
-				if (eof == 3) {
-					qp->rx_pending_active = false;
-					qp->rx_pending_ready = true;
-					atomic64_inc(&peer->rx_messages);
-					pending_r = ardma_flush_pending_locked(qp,
-						&pending_byte_len,
-						&pending_status);
-				}
+			}
+		}
+
+		if (buffer_pending) {
+			struct ardma_pending_rx *p;
+
+			p = ardma_pending_active_locked(qp);
+			if (!p) {
 				spin_unlock_irqrestore(&qp->recv_lock, flags);
-				if (pending_r)
-					ardma_push_rx_wc(qp, pending_r,
-							 pending_byte_len,
-							 pending_status);
+				atomic64_inc(&peer->rx_drops);
 				ardma_qp_put(qp);
 				return;
 			}
+			copy_len = len;
+			if (eof == 2 || eof == 3) {
+				if (len < 4) {
+					copy_len = 0;
+					p->truncated = true;
+					atomic64_inc(&peer->rx_bad_shape);
+				} else {
+					copy_len = len - 4;
+				}
+			}
+			if (p->len + copy_len > ARDMA_PENDING_RX_BYTES) {
+				copy_len = ARDMA_PENDING_RX_BYTES - p->len;
+				p->truncated = true;
+			}
+			memcpy(p->buf + p->len, payload, copy_len);
+			p->len += copy_len;
+			if (eof == 3) {
+				ardma_pending_finish_locked(qp);
+				atomic64_inc(&peer->rx_messages);
+				pending_r = ardma_flush_pending_locked(qp,
+					&pending_byte_len, &pending_status);
+			}
 			spin_unlock_irqrestore(&qp->recv_lock, flags);
-			atomic64_inc(&peer->rx_drops);
+			if (pending_r)
+				ardma_push_rx_wc(qp, pending_r,
+						 pending_byte_len,
+						 pending_status);
 			ardma_qp_put(qp);
 			return;
 		}
@@ -787,6 +862,15 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 		ardma_qp_put(qp);
 		return;
 	}
+	if (!ardma_recv_wr_total_len(r, &dst_off)) {
+		if (qp->rx_byte_len != dst_off) {
+			qp->rx_truncated = true;
+			atomic64_inc(&peer->rx_bad_shape);
+		}
+	} else {
+		qp->rx_truncated = true;
+		atomic64_inc(&peer->rx_bad_shape);
+	}
 	if (qp->rx_truncated)
 		complete_status = ret && ret != -ERANGE ?
 			IB_WC_LOC_PROT_ERR : IB_WC_LOC_LEN_ERR;
@@ -814,6 +898,10 @@ static void ardma_rx_callback(struct tb_ring *ring, struct ring_frame *frame,
 	len = frame->size ?: (READ_ONCE(rx_raw_mode) ? TB_FRAME_SIZE :
 			      ARDMA_FRAME_SIZE);
 	atomic64_inc(&peer->rx_frame_count);
+	if (frame->eof < 4)
+		atomic64_inc(&peer->rx_eof[frame->eof]);
+	else
+		atomic64_inc(&peer->rx_eof_other);
 
 	/* The incoming path is the destination HopID. Apple's visible QPN is
 	 * HopID << 8 for the first QP shape we have observed. */
@@ -1281,12 +1369,19 @@ static int ardma_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 	spin_lock_init(&qp->recv_lock);
 	INIT_LIST_HEAD(&qp->recv_q);
 	INIT_LIST_HEAD(&qp->qps_link);
+	qp->rx_pending_active = -1;
 	if (attr->qp_type == IB_QPT_UC) {
-		qp->rx_pending_buf = kzalloc(ARDMA_PENDING_RX_BYTES,
-					     GFP_KERNEL);
-		if (!qp->rx_pending_buf) {
-			ardma_peer_put(peer);
-			return -ENOMEM;
+		int i;
+
+		for (i = 0; i < ARDMA_PENDING_RX_SLOTS; i++) {
+			qp->rx_pending[i].buf = kzalloc(ARDMA_PENDING_RX_BYTES,
+							GFP_KERNEL);
+			if (!qp->rx_pending[i].buf) {
+				while (i--)
+					kfree(qp->rx_pending[i].buf);
+				ardma_peer_put(peer);
+				return -ENOMEM;
+			}
 		}
 	}
 
@@ -1296,8 +1391,12 @@ static int ardma_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 		qpn = ida_alloc_range(&ardma_qpn_ida, ARDMA_QPN_MIN,
 				      ARDMA_QPN_MAX, GFP_KERNEL);
 		if (qpn < 0) {
-			kfree(qp->rx_pending_buf);
-			qp->rx_pending_buf = NULL;
+			int i;
+
+			for (i = 0; i < ARDMA_PENDING_RX_SLOTS; i++) {
+				kfree(qp->rx_pending[i].buf);
+				qp->rx_pending[i].buf = NULL;
+			}
 			ardma_peer_put(peer);
 			return qpn;
 		}
@@ -1370,6 +1469,7 @@ static int ardma_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 	struct ardma_qp *qp = container_of(ibqp, struct ardma_qp, base);
 	struct ardma_recv_wr *r, *tmp;
 	unsigned long flags;
+	int i;
 
 	if (qp->registered) {
 		spin_lock_irqsave(&ardma_qp_lock, flags);
@@ -1400,8 +1500,10 @@ static int ardma_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 	kfree(qp->rx_wr);
 	qp->rx_wr = NULL;
 	spin_unlock_irqrestore(&qp->recv_lock, flags);
-	kfree(qp->rx_pending_buf);
-	qp->rx_pending_buf = NULL;
+	for (i = 0; i < ARDMA_PENDING_RX_SLOTS; i++) {
+		kfree(qp->rx_pending[i].buf);
+		qp->rx_pending[i].buf = NULL;
+	}
 
 	if (qp->qpn_allocated)
 		ida_free(&ardma_qpn_ida, ibqp->qp_num);
@@ -1954,6 +2056,16 @@ static int ardma_stats_show(struct seq_file *m, void *unused)
 	seq_printf(m, "tx_hop: %d\n", peer->tx_ring ? peer->tx_ring->hop : -1);
 	seq_printf(m, "rx_frames: %lld\n",
 		   (long long)atomic64_read(&peer->rx_frame_count));
+	seq_printf(m, "rx_eof0: %lld\n",
+		   (long long)atomic64_read(&peer->rx_eof[0]));
+	seq_printf(m, "rx_eof1: %lld\n",
+		   (long long)atomic64_read(&peer->rx_eof[1]));
+	seq_printf(m, "rx_eof2: %lld\n",
+		   (long long)atomic64_read(&peer->rx_eof[2]));
+	seq_printf(m, "rx_eof3: %lld\n",
+		   (long long)atomic64_read(&peer->rx_eof[3]));
+	seq_printf(m, "rx_eof_other: %lld\n",
+		   (long long)atomic64_read(&peer->rx_eof_other));
 	seq_printf(m, "rx_messages: %lld\n",
 		   (long long)atomic64_read(&peer->rx_messages));
 	seq_printf(m, "rx_drops: %lld\n",
@@ -2105,6 +2217,16 @@ static int ardma_nhi_stall_dump_show(struct seq_file *m, void *unused)
 	seq_printf(m, "local_out_hop: %d\n", peer->local_out_hop);
 	seq_printf(m, "rx_frames: %lld\n",
 		   (long long)atomic64_read(&peer->rx_frame_count));
+	seq_printf(m, "rx_eof0: %lld\n",
+		   (long long)atomic64_read(&peer->rx_eof[0]));
+	seq_printf(m, "rx_eof1: %lld\n",
+		   (long long)atomic64_read(&peer->rx_eof[1]));
+	seq_printf(m, "rx_eof2: %lld\n",
+		   (long long)atomic64_read(&peer->rx_eof[2]));
+	seq_printf(m, "rx_eof3: %lld\n",
+		   (long long)atomic64_read(&peer->rx_eof[3]));
+	seq_printf(m, "rx_eof_other: %lld\n",
+		   (long long)atomic64_read(&peer->rx_eof_other));
 	seq_printf(m, "rx_messages: %lld\n",
 		   (long long)atomic64_read(&peer->rx_messages));
 	seq_printf(m, "tx_frames: %lld\n",
