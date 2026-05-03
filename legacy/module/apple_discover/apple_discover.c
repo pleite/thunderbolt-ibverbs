@@ -95,6 +95,11 @@ module_param(enable_paths, bool, 0444);
 MODULE_PARM_DESC(enable_paths,
 		 "Call tb_xdomain_enable_paths() for RX capture (requires enable_rx=1; default: off)");
 
+static bool enable_e2e;
+module_param(enable_e2e, bool, 0444);
+MODULE_PARM_DESC(enable_e2e,
+		 "Allocate a paired TX ring and enable hardware E2E flow control on the capture RX ring (requires enable_rx=1; default: off)");
+
 static bool advertise_service;
 module_param(advertise_service, bool, 0444);
 MODULE_PARM_DESC(advertise_service,
@@ -127,8 +132,10 @@ struct apple_disc_dev {
 	struct tb_xdomain *xd;
 
 	bool hops_allocated;
+	bool paths_enabled;
 	int local_in_hop;
 	int local_out_hop;
+	struct tb_ring *tx_ring;
 	struct tb_ring *rx_ring;
 	struct apple_disc_frame *rx_frames;
 	int rx_frames_count;
@@ -497,6 +504,8 @@ static void apple_disc_free_rx_frames(struct apple_disc_dev *dev)
 static int apple_disc_setup_ring(struct apple_disc_dev *dev)
 {
 	struct tb_xdomain *xd = dev->xd;
+	unsigned int ring_flags = RING_FLAG_FRAME;
+	int e2e_tx_hop = 0;
 	int in_hop;
 	int ret, i;
 
@@ -511,22 +520,39 @@ static int apple_disc_setup_ring(struct apple_disc_dev *dev)
 	dev->hops_allocated = true;
 	pr_info("allocated receive_path=%d\n", in_hop);
 
+	if (enable_e2e) {
+		ring_flags |= RING_FLAG_E2E;
+
+		dev->tx_ring = tb_ring_alloc_tx(xd->tb->nhi, -1,
+						APPLE_DISC_RING_DEPTH,
+						ring_flags);
+		if (!dev->tx_ring) {
+			ret = -ENOMEM;
+			goto err_hopid;
+		}
+		e2e_tx_hop = dev->tx_ring->hop;
+		pr_info("enable_e2e=1: tx_ring->hop=%d\n",
+			dev->tx_ring->hop);
+	}
+
 	dev->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, -1, APPLE_DISC_RING_DEPTH,
-					RING_FLAG_FRAME,
-					0,	/* no e2e tx hop */
+					ring_flags, e2e_tx_hop,
 					APPLE_DISC_RX_SOF_MASK,
 					APPLE_DISC_RX_EOF_MASK,
 					NULL, NULL);
 	if (!dev->rx_ring) {
 		ret = -ENOMEM;
-		goto err_hopid;
+		goto err_tx_ring;
 	}
-	pr_info("rx_ring->hop=%d\n", dev->rx_ring->hop);
+	pr_info("rx_ring->hop=%d%s\n", dev->rx_ring->hop,
+		enable_e2e ? " (E2E enabled)" : "");
 
 	ret = apple_disc_alloc_rx_frames(dev);
 	if (ret)
 		goto err_ring;
 
+	if (dev->tx_ring)
+		tb_ring_start(dev->tx_ring);
 	tb_ring_start(dev->rx_ring);
 
 	for (i = 0; i < dev->rx_frames_count; i++) {
@@ -554,6 +580,8 @@ static int apple_disc_setup_ring(struct apple_disc_dev *dev)
 			 * ARRIVES. Without enable_paths the controller may not
 			 * route to us, but this is the safer first capture mode.
 			 */
+		} else {
+			dev->paths_enabled = true;
 		}
 	} else {
 		pr_info("enable_paths=0: RX ring posted, but no xdomain paths were programmed\n");
@@ -563,10 +591,17 @@ static int apple_disc_setup_ring(struct apple_disc_dev *dev)
 
 err_started:
 	tb_ring_stop(dev->rx_ring);
+	if (dev->tx_ring)
+		tb_ring_stop(dev->tx_ring);
 	apple_disc_free_rx_frames(dev);
 err_ring:
 	tb_ring_free(dev->rx_ring);
 	dev->rx_ring = NULL;
+err_tx_ring:
+	if (dev->tx_ring) {
+		tb_ring_free(dev->tx_ring);
+		dev->tx_ring = NULL;
+	}
 err_hopid:
 	tb_xdomain_release_in_hopid(xd, in_hop);
 	dev->hops_allocated = false;
@@ -576,14 +611,20 @@ err_hopid:
 static void apple_disc_teardown_ring(struct apple_disc_dev *dev)
 {
 	if (dev->rx_ring) {
-		if (enable_paths)
+		if (dev->paths_enabled)
 			tb_xdomain_disable_paths(dev->xd, -1, -1,
 						 dev->local_in_hop,
 						 dev->rx_ring->hop);
+		dev->paths_enabled = false;
 		tb_ring_stop(dev->rx_ring);
 		apple_disc_free_rx_frames(dev);
 		tb_ring_free(dev->rx_ring);
 		dev->rx_ring = NULL;
+	}
+	if (dev->tx_ring) {
+		tb_ring_stop(dev->tx_ring);
+		tb_ring_free(dev->tx_ring);
+		dev->tx_ring = NULL;
 	}
 	if (dev->hops_allocated) {
 		tb_xdomain_release_in_hopid(dev->xd, dev->local_in_hop);
