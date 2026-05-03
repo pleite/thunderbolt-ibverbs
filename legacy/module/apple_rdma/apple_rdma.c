@@ -33,6 +33,7 @@
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 #include <linux/dma-mapping.h>
+#include <linux/io.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/string.h>
@@ -62,6 +63,23 @@
 
 #define ARDMA_RX_SOF_MASK	0xffff
 #define ARDMA_RX_EOF_MASK	0xffff
+#define ARDMA_MAX_CTRL_MSGS	32
+#define ARDMA_MAX_CTRL_BYTES	256
+#define ARDMA_NHI_REG_TX_RING_BASE	0x00000
+#define ARDMA_NHI_REG_RX_RING_BASE	0x08000
+#define ARDMA_NHI_REG_TX_OPTIONS_BASE	0x19800
+#define ARDMA_NHI_REG_RX_OPTIONS_BASE	0x29800
+#define ARDMA_NHI_RING_SLOT_SIZE	16
+#define ARDMA_NHI_OPTIONS_SLOT_SIZE	32
+#define ARDMA_DESC_FLAGS_SHIFT	20
+
+struct ardma_ring_desc {
+	u64 phys;
+	u32 meta;
+	u32 time;
+} __packed;
+
+static_assert(sizeof(struct ardma_ring_desc) == 16);
 
 static const char apple_rdma_key[9] = {
 	(char)0xff, (char)0xff, (char)0xff, (char)0xff,
@@ -240,6 +258,8 @@ struct ardma_peer {
 	struct tb_ring *tx_ring;
 	struct tb_ring *rx_ring;
 	struct ardma_rx_frame *rx_frames;
+	struct mutex tx_lock;
+	bool tx_ring_running;
 
 	struct dentry *debugfs_dir;
 	atomic64_t rx_frame_count;
@@ -250,6 +270,13 @@ struct ardma_peer {
 	atomic64_t tx_frames;
 	atomic64_t tx_completions;
 	atomic64_t tx_errors;
+};
+
+struct ardma_ctrl_log_entry {
+	struct list_head list;
+	u32 size;
+	u32 dump_len;
+	u8 dump[ARDMA_MAX_CTRL_BYTES];
 };
 
 static struct tb_property_dir *ardma_property_dir;
@@ -263,6 +290,10 @@ static struct ardma_ibdev *ardma_ibdev;
 static DEFINE_IDA(ardma_qpn_ida);
 static LIST_HEAD(ardma_qp_list);
 static DEFINE_SPINLOCK(ardma_qp_lock);
+static atomic_t ardma_ctrl_logged;
+static atomic_t ardma_ctrl_received;
+static DEFINE_SPINLOCK(ardma_ctrl_lock);
+static LIST_HEAD(ardma_ctrl_list);
 
 /* ----- MR helpers ------------------------------------------------ */
 
@@ -440,6 +471,19 @@ static void ardma_qp_put(struct ardma_qp *qp)
 		WARN_ON_ONCE(1);
 	if (refcount_read(&qp->refs) == 1)
 		wake_up(&qp->ref_wait);
+}
+
+static void ardma_stop_tx_ring(struct ardma_peer *peer)
+{
+	if (!peer || !peer->tx_ring)
+		return;
+
+	mutex_lock(&peer->tx_lock);
+	if (peer->tx_ring_running) {
+		tb_ring_stop(peer->tx_ring);
+		peer->tx_ring_running = false;
+	}
+	mutex_unlock(&peer->tx_lock);
 }
 
 static struct ardma_qp *ardma_lookup_qp(u32 qpn)
@@ -806,6 +850,8 @@ static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
 		return -EOPNOTSUPP;
 	if (!peer || !peer->tx_ring || !peer->paths_enabled)
 		return -ENOTCONN;
+	if (!READ_ONCE(peer->tx_ring_running))
+		return -ESHUTDOWN;
 	if (wr->num_sge > ARDMA_MAX_SGE || (wr->num_sge && !wr->sg_list))
 		return -EINVAL;
 	if (wr->send_flags & IB_SEND_INLINE)
@@ -1171,7 +1217,18 @@ static int ardma_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 		qp->registered = false;
 	}
 
-	wait_event(qp->ref_wait, refcount_read(&qp->refs) == 1);
+	if (refcount_read(&qp->refs) > 1 && qp->peer) {
+		pr_warn("destroy_qp[0x%x]: canceling stuck TX ring refs=%u\n",
+			ibqp->qp_num, refcount_read(&qp->refs));
+		ardma_stop_tx_ring(qp->peer);
+	}
+	if (!wait_event_timeout(qp->ref_wait,
+				refcount_read(&qp->refs) == 1,
+				msecs_to_jiffies(5000))) {
+		pr_warn("destroy_qp[0x%x]: timed out waiting for refs=%u\n",
+			ibqp->qp_num, refcount_read(&qp->refs));
+		return -ETIMEDOUT;
+	}
 
 	spin_lock_irqsave(&qp->recv_lock, flags);
 	list_for_each_entry_safe(r, tmp, &qp->recv_q, list) {
@@ -1630,6 +1687,7 @@ static int ardma_setup_rings(struct ardma_peer *peer)
 		goto err_rx_ring;
 
 	tb_ring_start(peer->tx_ring);
+	peer->tx_ring_running = true;
 	tb_ring_start(peer->rx_ring);
 
 	for (i = 0; i < ARDMA_RX_FRAMES; i++) {
@@ -1657,7 +1715,7 @@ static int ardma_setup_rings(struct ardma_peer *peer)
 
 err_started:
 	tb_ring_stop(peer->rx_ring);
-	tb_ring_stop(peer->tx_ring);
+	ardma_stop_tx_ring(peer);
 	ardma_free_rx_frames(peer);
 err_rx_ring:
 	tb_ring_free(peer->rx_ring);
@@ -1692,7 +1750,7 @@ static void ardma_teardown_rings(struct ardma_peer *peer)
 		peer->rx_ring = NULL;
 	}
 	if (peer->tx_ring) {
-		tb_ring_stop(peer->tx_ring);
+		ardma_stop_tx_ring(peer);
 		tb_ring_free(peer->tx_ring);
 		peer->tx_ring = NULL;
 	}
@@ -1736,6 +1794,178 @@ static int ardma_stats_show(struct seq_file *m, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(ardma_stats);
 
+static u32 ardma_ring_reg_base(const struct tb_ring *ring)
+{
+	return ring->is_tx ? ARDMA_NHI_REG_TX_RING_BASE :
+			     ARDMA_NHI_REG_RX_RING_BASE;
+}
+
+static u32 ardma_options_reg_base(const struct tb_ring *ring)
+{
+	return ring->is_tx ? ARDMA_NHI_REG_TX_OPTIONS_BASE :
+			     ARDMA_NHI_REG_RX_OPTIONS_BASE;
+}
+
+static void __iomem *ardma_ring_mmio(struct tb_ring *ring)
+{
+	if (!ring || !ring->nhi || !ring->nhi->iobase)
+		return NULL;
+	return ring->nhi->iobase + ardma_ring_reg_base(ring) +
+	       ring->hop * ARDMA_NHI_RING_SLOT_SIZE;
+}
+
+static void __iomem *ardma_options_mmio(struct tb_ring *ring)
+{
+	if (!ring || !ring->nhi || !ring->nhi->iobase)
+		return NULL;
+	return ring->nhi->iobase + ardma_options_reg_base(ring) +
+	       ring->hop * ARDMA_NHI_OPTIONS_SLOT_SIZE;
+}
+
+static void ardma_count_ring_lists(struct tb_ring *ring,
+				   unsigned int *queued,
+				   unsigned int *inflight)
+{
+	struct ring_frame *frame;
+
+	*queued = 0;
+	*inflight = 0;
+	list_for_each_entry(frame, &ring->queue, list)
+		(*queued)++;
+	list_for_each_entry(frame, &ring->in_flight, list)
+		(*inflight)++;
+}
+
+static void ardma_dump_ring_state(struct seq_file *m, const char *name,
+				  struct tb_ring *ring)
+{
+	struct ardma_ring_desc *descs;
+	unsigned int queued, inflight;
+	void __iomem *ring_mmio;
+	void __iomem *opt_mmio;
+	unsigned long flags;
+	int head, tail, size;
+	int i;
+
+	if (!ring) {
+		seq_printf(m, "%s: none\n\n", name);
+		return;
+	}
+
+	descs = (struct ardma_ring_desc *)ring->descriptors;
+	ring_mmio = ardma_ring_mmio(ring);
+	opt_mmio = ardma_options_mmio(ring);
+
+	spin_lock_irqsave(&ring->lock, flags);
+	head = ring->head;
+	tail = ring->tail;
+	size = ring->size;
+	ardma_count_ring_lists(ring, &queued, &inflight);
+
+	seq_printf(m,
+		   "%s: hop=%d is_tx=%u running=%u flags=0x%x e2e_tx_hop=%d size=%d head=%d tail=%d queued=%u inflight=%u\n",
+		   name, ring->hop, ring->is_tx, ring->running, ring->flags,
+		   ring->e2e_tx_hop, size, head, tail, queued, inflight);
+	seq_printf(m, "%s: descriptors=%px descriptors_dma=%pad\n",
+		   name, ring->descriptors, &ring->descriptors_dma);
+
+	if (ring_mmio) {
+		seq_printf(m,
+			   "%s: ring_regs[0..15]=0x%08x 0x%08x 0x%08x 0x%08x\n",
+			   name, ioread32(ring_mmio + 0),
+			   ioread32(ring_mmio + 4), ioread32(ring_mmio + 8),
+			   ioread32(ring_mmio + 12));
+	} else {
+		seq_printf(m, "%s: ring_regs unavailable\n", name);
+	}
+
+	if (opt_mmio) {
+		seq_printf(m,
+			   "%s: options[0..31]=0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x\n",
+			   name, ioread32(opt_mmio + 0), ioread32(opt_mmio + 4),
+			   ioread32(opt_mmio + 8), ioread32(opt_mmio + 12),
+			   ioread32(opt_mmio + 16), ioread32(opt_mmio + 20),
+			   ioread32(opt_mmio + 24), ioread32(opt_mmio + 28));
+	} else {
+		seq_printf(m, "%s: options unavailable\n", name);
+	}
+
+	if (!descs || size <= 0) {
+		seq_puts(m, "\n");
+		spin_unlock_irqrestore(&ring->lock, flags);
+		return;
+	}
+
+	seq_printf(m, "%s: next descriptors from tail\n", name);
+	for (i = 0; i < min(size, 8); i++) {
+		int idx = (tail + i) % size;
+		u32 meta = READ_ONCE(descs[idx].meta);
+		u32 time = READ_ONCE(descs[idx].time);
+
+		seq_printf(m,
+			   "  desc[%03d]: phys=0x%016llx len=%u eof=%u sof=%u flags=0x%03x meta=0x%08x time=0x%08x%s%s\n",
+			   idx, (unsigned long long)READ_ONCE(descs[idx].phys),
+			   meta & 0xfff, (meta >> 12) & 0xf,
+			   (meta >> 16) & 0xf, meta >> ARDMA_DESC_FLAGS_SHIFT,
+			   meta, time, idx == tail ? " <tail>" : "",
+			   idx == head ? " <head>" : "");
+	}
+	seq_puts(m, "\n");
+	spin_unlock_irqrestore(&ring->lock, flags);
+}
+
+static int ardma_nhi_stall_dump_show(struct seq_file *m, void *unused)
+{
+	struct ardma_peer *peer = m->private;
+
+	if (!peer)
+		return -ENODEV;
+
+	seq_printf(m, "receive_path: %d\n", receive_path);
+	seq_printf(m, "paths_enabled: %u\n", peer->paths_enabled);
+	seq_printf(m, "local_in_hop: %d\n", peer->local_in_hop);
+	seq_printf(m, "local_out_hop: %d\n", peer->local_out_hop);
+	seq_printf(m, "rx_frames: %lld\n",
+		   (long long)atomic64_read(&peer->rx_frame_count));
+	seq_printf(m, "rx_messages: %lld\n",
+		   (long long)atomic64_read(&peer->rx_messages));
+	seq_printf(m, "tx_frames: %lld\n",
+		   (long long)atomic64_read(&peer->tx_frames));
+	seq_printf(m, "tx_completions: %lld\n",
+		   (long long)atomic64_read(&peer->tx_completions));
+	seq_printf(m, "tx_errors: %lld\n\n",
+		   (long long)atomic64_read(&peer->tx_errors));
+
+	ardma_dump_ring_state(m, "tx_ring", peer->tx_ring);
+	ardma_dump_ring_state(m, "rx_ring", peer->rx_ring);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(ardma_nhi_stall_dump);
+
+static int ardma_ctrl_log_show(struct seq_file *m, void *unused)
+{
+	struct ardma_ctrl_log_entry *e;
+	unsigned long flags;
+	int i = 0;
+
+	seq_printf(m, "control messages logged: %d (received total: %d)\n\n",
+		   atomic_read(&ardma_ctrl_logged),
+		   atomic_read(&ardma_ctrl_received));
+
+	spin_lock_irqsave(&ardma_ctrl_lock, flags);
+	list_for_each_entry(e, &ardma_ctrl_list, list) {
+		seq_printf(m, "==== ctrl[%d] size=%u (showing first %u bytes) ====\n",
+			   i++, e->size, e->dump_len);
+		seq_hex_dump(m, "  ", DUMP_PREFIX_OFFSET, 16, 1,
+			     e->dump, e->dump_len, true);
+		seq_puts(m, "\n");
+	}
+	spin_unlock_irqrestore(&ardma_ctrl_lock, flags);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(ardma_ctrl_log);
+
 static int ardma_probe(struct tb_service *svc, const struct tb_service_id *id)
 {
 	struct tb_xdomain *xd = tb_service_parent(svc);
@@ -1767,6 +1997,7 @@ static int ardma_probe(struct tb_service *svc, const struct tb_service_id *id)
 	peer->xd = xd;
 	refcount_set(&peer->refs, 1);
 	init_waitqueue_head(&peer->ref_wait);
+	mutex_init(&peer->tx_lock);
 	peer->local_in_hop = -1;
 	peer->local_out_hop = -1;
 
@@ -1783,6 +2014,9 @@ static int ardma_probe(struct tb_service *svc, const struct tb_service_id *id)
 	if (!IS_ERR_OR_NULL(peer->debugfs_dir))
 		debugfs_create_file("stats", 0444, peer->debugfs_dir, peer,
 				    &ardma_stats_fops);
+	if (!IS_ERR_OR_NULL(peer->debugfs_dir))
+		debugfs_create_file("nhi_stall_dump", 0444, peer->debugfs_dir,
+				    peer, &ardma_nhi_stall_dump_fops);
 
 	tb_service_set_drvdata(svc, peer);
 	mutex_lock(&ardma_peer_lock);
@@ -1896,8 +2130,49 @@ static void ardma_unregister_property_dir(void)
 
 static int ardma_ctrl_callback(const void *buf, size_t size, void *data)
 {
-	pr_info_ratelimited("control message size=%zu for AD/FA57 uuid\n", size);
+	int logged;
+
+	atomic_inc(&ardma_ctrl_received);
+
+	logged = atomic_read(&ardma_ctrl_logged);
+	if (logged < ARDMA_MAX_CTRL_MSGS) {
+		struct ardma_ctrl_log_entry *e;
+
+		e = kmalloc(sizeof(*e), GFP_ATOMIC);
+		if (e) {
+			unsigned long flags;
+
+			e->size = size;
+			e->dump_len = min_t(u32, size, ARDMA_MAX_CTRL_BYTES);
+			memcpy(e->dump, buf, e->dump_len);
+
+			spin_lock_irqsave(&ardma_ctrl_lock, flags);
+			list_add_tail(&e->list, &ardma_ctrl_list);
+			spin_unlock_irqrestore(&ardma_ctrl_lock, flags);
+
+			atomic_inc(&ardma_ctrl_logged);
+			pr_info("ctrl[%d]: size=%zu for AD/FA57 uuid\n",
+				logged, size);
+		}
+	}
+
 	return 1;
+}
+
+static void ardma_free_ctrl_log(void)
+{
+	struct ardma_ctrl_log_entry *e, *tmp;
+	unsigned long flags;
+	LIST_HEAD(free_list);
+
+	spin_lock_irqsave(&ardma_ctrl_lock, flags);
+	list_splice_init(&ardma_ctrl_list, &free_list);
+	spin_unlock_irqrestore(&ardma_ctrl_lock, flags);
+
+	list_for_each_entry_safe(e, tmp, &free_list, list) {
+		list_del(&e->list);
+		kfree(e);
+	}
 }
 
 /* ----- module init/exit ------------------------------------------ */
@@ -1915,6 +2190,9 @@ static int __init ardma_init(void)
 	ardma_debugfs_root = debugfs_create_dir(ARDMA_DRV_NAME, NULL);
 	if (IS_ERR(ardma_debugfs_root))
 		ardma_debugfs_root = NULL;
+	if (ardma_debugfs_root)
+		debugfs_create_file("ctrl_log", 0444, ardma_debugfs_root, NULL,
+				    &ardma_ctrl_log_fops);
 
 	ret = ardma_register_property_dir();
 	if (ret)
@@ -1956,6 +2234,7 @@ static void __exit ardma_exit(void)
 	ardma_unregister_ibdev();
 	tb_unregister_protocol_handler(&ardma_protocol_handler);
 	ardma_unregister_property_dir();
+	ardma_free_ctrl_log();
 	debugfs_remove_recursive(ardma_debugfs_root);
 	ida_destroy(&ardma_qpn_ida);
 	pr_info("unloaded\n");
