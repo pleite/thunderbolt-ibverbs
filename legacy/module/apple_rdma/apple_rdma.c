@@ -154,6 +154,19 @@ module_param(receive_path, int, 0444);
 MODULE_PARM_DESC(receive_path,
 		 "Incoming Apple transmit HopID to bind as our RX path (default: 9)");
 
+static int local_tx_hop = -1;
+module_param(local_tx_hop, int, 0444);
+MODULE_PARM_DESC(local_tx_hop,
+		 "Local NHI TX ring hop ID to allocate (default: -1 = auto). "
+		 "AMD Strix Halo silicon supports hops 1..6 with the kernel "
+		 "patch enabled; use 3+ to avoid colliding with tbnet's E2E "
+		 "credit pool on hops 1-2.");
+
+static int local_rx_hop = -1;
+module_param(local_rx_hop, int, 0444);
+MODULE_PARM_DESC(local_rx_hop,
+		 "Local NHI RX ring hop ID to allocate (default: -1 = auto)");
+
 static bool apple_vendor_only = true;
 module_param(apple_vendor_only, bool, 0444);
 MODULE_PARM_DESC(apple_vendor_only,
@@ -3094,9 +3107,10 @@ static int ardma_setup_rings(struct ardma_peer *peer)
 	}
 	peer->local_in_hop = ret;
 
-	peer->tx_ring = tb_ring_alloc_tx(xd->tb->nhi, -1, ARDMA_RING_DEPTH,
-					 tx_ring_flags);
+	peer->tx_ring = tb_ring_alloc_tx(xd->tb->nhi, local_tx_hop,
+					 ARDMA_RING_DEPTH, tx_ring_flags);
 	if (!peer->tx_ring) {
+		pr_warn("tb_ring_alloc_tx(hop=%d) failed\n", local_tx_hop);
 		ret = -ENOMEM;
 		goto err_in_hop;
 	}
@@ -3110,14 +3124,14 @@ static int ardma_setup_rings(struct ardma_peer *peer)
 	if (READ_ONCE(rx_poll_mode)) {
 		init_completion(&peer->rx_poll_kick);
 		atomic_set(&peer->rx_poll_stop, 0);
-		peer->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, -1,
+		peer->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, local_rx_hop,
 						 ARDMA_RING_DEPTH,
 						 rx_ring_flags, e2e_tx_hop,
 						 ARDMA_RX_SOF_MASK,
 						 ARDMA_RX_EOF_MASK,
 						 ardma_rx_start_poll, peer);
 	} else {
-		peer->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, -1,
+		peer->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, local_rx_hop,
 						 ARDMA_RING_DEPTH,
 						 rx_ring_flags, e2e_tx_hop,
 						 ARDMA_RX_SOF_MASK,
