@@ -43,6 +43,7 @@
 #include <linux/crc32.h>
 #include <linux/delay.h>
 #include <linux/io.h>
+#include <linux/pci.h>
 #include <linux/ktime.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
@@ -242,7 +243,7 @@ MODULE_PARM_DESC(rx_poll_mode,
 static unsigned int rx_post_frames;
 module_param(rx_post_frames, uint, 0444);
 MODULE_PARM_DESC(rx_post_frames,
-		 "Number of RX descriptors to post initially and recycle (default: 0 = ARDMA_RX_FRAMES)");
+		 "Number of RX descriptors to post initially and recycle (0 = ARDMA_RX_FRAMES; FRAME+E2E Strix known-good: 64)");
 
 enum {
 	ARDMA_TX_MARKER_APPLE_EOF = 0,
@@ -958,6 +959,62 @@ static int ardma_recv_scatter_frame(struct ardma_pd *pd,
 	return 0;
 }
 
+static int ardma_copy_frame_to_buf(void *dst, u32 dst_size, u32 dst_off,
+				   const void *payload, u32 len,
+				   u32 *out_user_len)
+{
+	u32 num_slots = len / ARDMA_SLOT_WIRE_SIZE;
+	u32 tail = len - num_slots * ARDMA_SLOT_WIRE_SIZE;
+	u32 written = 0;
+	u32 normal_slots = num_slots;
+	const u8 *p = payload;
+	u32 i;
+
+#define ARDMA_COPY_FRAME_CHUNK(_src, _len) do {				\
+		u32 __len = (_len);					\
+		if (dst_off > dst_size ||				\
+		    written > dst_size - dst_off ||			\
+		    __len > dst_size - dst_off - written)		\
+			return -ERANGE;					\
+		memcpy((u8 *)dst + dst_off + written, (_src), __len);	\
+		written += __len;					\
+	} while (0)
+
+	if (!tail && num_slots)
+		normal_slots--;
+
+	for (i = 0; i < normal_slots; i++)
+		ARDMA_COPY_FRAME_CHUNK(p + i * ARDMA_SLOT_WIRE_SIZE,
+				       ARDMA_FRAME_SLOT_USER_SIZE);
+
+	if (!tail && num_slots) {
+		const u8 *slot = p + normal_slots * ARDMA_SLOT_WIRE_SIZE;
+
+		ARDMA_COPY_FRAME_CHUNK(slot, ARDMA_FRAME_SPLIT_USER_SIZE);
+		ARDMA_COPY_FRAME_CHUNK(slot + ARDMA_FRAME_SPLIT_USER_SIZE + 4,
+				       ARDMA_TAIL_USER_SIZE);
+	} else if (tail > ARDMA_TAIL_USER_SIZE) {
+		const u8 *frag = p + normal_slots * ARDMA_SLOT_WIRE_SIZE;
+		u32 split = tail - ARDMA_TAIL_USER_SIZE - 4;
+
+		if (!split || split > ARDMA_FRAME_SPLIT_USER_SIZE)
+			return -EINVAL;
+
+		ARDMA_COPY_FRAME_CHUNK(frag, split);
+		ARDMA_COPY_FRAME_CHUNK(frag + split + 4,
+				       ARDMA_TAIL_USER_SIZE);
+	} else if (tail) {
+		ARDMA_COPY_FRAME_CHUNK(p + normal_slots * ARDMA_SLOT_WIRE_SIZE,
+				       tail);
+	}
+
+#undef ARDMA_COPY_FRAME_CHUNK
+
+	if (out_user_len)
+		*out_user_len = written;
+	return 0;
+}
+
 static int ardma_copy_sges_to_buf(struct ardma_pd *pd,
 				  const struct ib_sge *sg_list, int num_sge,
 				  u32 src_off, void *dst, u32 len)
@@ -1311,25 +1368,18 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 	if (!qp->rx_wr) {
 		bool buffer_pending = false;
 
-		if (READ_ONCE(rx_raw_mode) && qp->rx_pending_active >= 0) {
+		if (qp->rx_pending_active >= 0) {
 			buffer_pending = true;
 		} else {
 			r = ardma_pop_recv_locked(qp);
 			if (!r) {
-				if (READ_ONCE(rx_raw_mode))
-					buffer_pending = true;
-				else {
-					spin_unlock_irqrestore(&qp->recv_lock,
-							       flags);
-					atomic64_inc(&peer->rx_drops);
-					ardma_qp_put(qp);
-					return;
-				}
+				buffer_pending = true;
 			}
 		}
 
 		if (buffer_pending) {
 			struct ardma_pending_rx *p;
+			int pending_ret = 0;
 
 			p = ardma_pending_active_locked(qp);
 			if (!p) {
@@ -1348,12 +1398,27 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 					copy_len = len - 4;
 				}
 			}
-			if (p->len + copy_len > ARDMA_PENDING_RX_BYTES) {
-				copy_len = ARDMA_PENDING_RX_BYTES - p->len;
-				p->truncated = true;
+			if (READ_ONCE(rx_raw_mode)) {
+				if (p->len + copy_len > ARDMA_PENDING_RX_BYTES) {
+					copy_len = ARDMA_PENDING_RX_BYTES -
+						   p->len;
+					p->truncated = true;
+				}
+				memcpy(p->buf + p->len, payload, copy_len);
+				p->len += copy_len;
+			} else {
+				u32 user_len = 0;
+
+				pending_ret = ardma_copy_frame_to_buf(p->buf,
+					ARDMA_PENDING_RX_BYTES, p->len,
+					payload, len, &user_len);
+				if (pending_ret) {
+					p->truncated = true;
+					atomic64_inc(&peer->rx_bad_shape);
+				} else {
+					p->len += user_len;
+				}
 			}
-			memcpy(p->buf + p->len, payload, copy_len);
-			p->len += copy_len;
 			ardma_log_rx_event(peer, ARDMA_RX_EVT_PENDING_FRAME,
 					   qpn, qp->attr.dest_qp_num, 0, len,
 					   p->len, 0, 0, eof,
@@ -1362,7 +1427,7 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 					   qp->registered, qp->recv_q_depth,
 					   qp->rx_pending_ready_count,
 					   qp->rx_pending_active,
-					   qp->rx_piece, 0);
+					   qp->rx_piece, pending_ret);
 			if (eof == 3) {
 				ardma_log_rx_event(peer,
 						   ARDMA_RX_EVT_PENDING_DONE,
@@ -3963,6 +4028,7 @@ DEFINE_SHOW_ATTRIBUTE(ardma_nhi_regs);
  *   "throttle_all <hex32>"   write same value to all 16 INT_THROTTLING slots
  *   "throttle_one <slot> <hex32>"  write one slot
  *   "reset_hrr"              pulse REG_RESET bit 0 (HRR). DANGEROUS.
+ *   "pci_reset"              reset the backing NHI PCI function. DANGEROUS.
  *   "ring_int_clear <hex32>" write to REG_RING_INT_CLEAR (clears NOTIFY bits)
  *
  * No safety net beyond peer/iobase null checks. For experiments only.
@@ -3974,6 +4040,7 @@ static int ardma_nhi_poke_show(struct seq_file *m, void *unused)
 		 "  throttle_all <hex32>          write same value to all 16 throttle slots\n"
 		 "  throttle_one <slot> <hex32>   write one slot (0..15)\n"
 		 "  reset_hrr                     pulse REG_RESET bit 0 (DANGEROUS)\n"
+		 "  pci_reset                     call pci_reset_function() on the NHI (DANGEROUS)\n"
 		 "  ring_int_clear <hex32>        write REG_RING_INT_CLEAR\n");
 	return 0;
 }
@@ -3996,9 +4063,6 @@ static ssize_t ardma_nhi_poke_write(struct file *file, const char __user *ubuf,
 	if (!peer || !peer->xd || !peer->xd->tb || !peer->xd->tb->nhi)
 		return -ENODEV;
 	nhi = peer->xd->tb->nhi;
-	iobase = nhi->iobase;
-	if (!iobase)
-		return -EIO;
 
 	if (len >= sizeof(buf))
 		return -EINVAL;
@@ -4011,6 +4075,23 @@ static ssize_t ardma_nhi_poke_write(struct file *file, const char __user *ubuf,
 		/* For throttle_one, slot was meant to be decimal — re-parse */
 		if (strcmp(cmd, "throttle_one") == 0)
 			sscanf(buf, "%31s %u %x", cmd, &v0, &v1);
+		if (strcmp(cmd, "pci_reset") == 0) {
+			int ret;
+
+			if (!nhi->pdev)
+				return -ENODEV;
+			pr_warn("apple_rdma: resetting NHI PCI function %s; active rings/module state are invalid after this\n",
+				pci_name(nhi->pdev));
+			ret = pci_reset_function(nhi->pdev);
+			pr_warn("apple_rdma: pci_reset_function(%s) returned %d\n",
+				pci_name(nhi->pdev), ret);
+			return ret ? ret : len;
+		}
+
+		iobase = nhi->iobase;
+		if (!iobase)
+			return -EIO;
+
 		if (strcmp(cmd, "throttle_all") == 0) {
 			u32 slot;
 			for (slot = 0; slot < 16; slot++)
