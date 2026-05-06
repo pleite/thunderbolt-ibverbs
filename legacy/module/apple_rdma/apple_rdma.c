@@ -85,8 +85,10 @@
 #define ARDMA_QPN_STRIDE	0x100
 #define ARDMA_QPN_BASE_SHIFT	8
 
-#define ARDMA_RX_SOF_MASK	0xffff
-#define ARDMA_RX_EOF_MASK	0xffff
+#define ARDMA_RX_RAW_SOF_MASK	0xffff
+#define ARDMA_RX_RAW_EOF_MASK	0xffff
+#define ARDMA_RX_FRAME_SOF_MASK	BIT(1)
+#define ARDMA_RX_FRAME_EOF_MASK	(BIT(2) | BIT(3))
 #define ARDMA_MAX_CTRL_MSGS	32
 #define ARDMA_MAX_CTRL_BYTES	256
 #define ARDMA_NHI_REG_TX_RING_BASE	0x00000
@@ -864,6 +866,51 @@ static int ardma_recv_scatter(struct ardma_pd *pd, struct ardma_recv_wr *r,
 	return copied < len ? -ERANGE : 0;
 }
 
+/* FRAME-mode assembled-frame extractor.
+ *
+ * AMD silicon FRAME-mode RX assembles per-TLP arrivals into one callback
+ * (gated on the configured eof_mask). The assembled wire payload is laid
+ * out as 256-byte slots: 252 user bytes followed by 4 silicon CRC bytes
+ * per slot. A trailing partial fragment (len % 256 != 0) is the tail
+ * with no per-slot CRC overhead.
+ *
+ * Pull just the user bytes out of @payload into @r at @dst_off, and
+ * return how many user bytes were written via @out_user_len.
+ */
+static int ardma_recv_scatter_frame(struct ardma_pd *pd,
+				    struct ardma_recv_wr *r, u32 dst_off,
+				    const void *payload, u32 len,
+				    u32 *out_user_len)
+{
+	u32 num_slots = len / ARDMA_SLOT_WIRE_SIZE;
+	u32 tail = len - num_slots * ARDMA_SLOT_WIRE_SIZE;
+	u32 written = 0;
+	u32 i;
+	int ret;
+
+	for (i = 0; i < num_slots; i++) {
+		ret = ardma_recv_scatter(pd, r, dst_off + written,
+					 (const u8 *)payload +
+					 i * ARDMA_SLOT_WIRE_SIZE,
+					 ARDMA_FRAME_SLOT_USER_SIZE);
+		if (ret)
+			return ret;
+		written += ARDMA_FRAME_SLOT_USER_SIZE;
+	}
+	if (tail) {
+		ret = ardma_recv_scatter(pd, r, dst_off + written,
+					 (const u8 *)payload +
+					 num_slots * ARDMA_SLOT_WIRE_SIZE,
+					 tail);
+		if (ret)
+			return ret;
+		written += tail;
+	}
+	if (out_user_len)
+		*out_user_len = written;
+	return 0;
+}
+
 static int ardma_copy_sges_to_buf(struct ardma_pd *pd,
 				  const struct ib_sge *sg_list, int num_sge,
 				  u32 src_off, void *dst, u32 len)
@@ -1327,11 +1374,21 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 		}
 	} else {
 		dst_off = qp->rx_byte_len;
+		/* copy_len = len; for FRAME mode the helper recomputes
+		 * the user portion (252 user + 4 CRC per 256-byte slot). */
 	}
 	r = qp->rx_wr;
 	spin_unlock_irqrestore(&qp->recv_lock, flags);
 
-	ret = ardma_recv_scatter(pd, r, dst_off, payload, copy_len);
+	if (READ_ONCE(rx_raw_mode)) {
+		ret = ardma_recv_scatter(pd, r, dst_off, payload, copy_len);
+	} else {
+		u32 user_len = 0;
+
+		ret = ardma_recv_scatter_frame(pd, r, dst_off, payload, len,
+					       &user_len);
+		copy_len = user_len;
+	}
 
 	spin_lock_irqsave(&qp->recv_lock, flags);
 	if (ret == -ERANGE)
@@ -3049,13 +3106,18 @@ static int ardma_setup_rings(struct ardma_peer *peer)
 	struct tb_xdomain *xd = peer->xd;
 	unsigned int tx_ring_flags = READ_ONCE(tx_e2e) ? RING_FLAG_E2E : 0;
 	unsigned int rx_ring_flags = READ_ONCE(rx_e2e) ? RING_FLAG_E2E : 0;
+	u16 rx_sof_mask = ARDMA_RX_RAW_SOF_MASK;
+	u16 rx_eof_mask = ARDMA_RX_RAW_EOF_MASK;
 	int e2e_tx_hop;
 	int ret, i;
 
 	if (!READ_ONCE(tx_raw_mode))
 		tx_ring_flags |= RING_FLAG_FRAME;
-	if (!READ_ONCE(rx_raw_mode))
+	if (!READ_ONCE(rx_raw_mode)) {
 		rx_ring_flags |= RING_FLAG_FRAME;
+		rx_sof_mask = ARDMA_RX_FRAME_SOF_MASK;
+		rx_eof_mask = ARDMA_RX_FRAME_EOF_MASK;
+	}
 
 	peer->local_in_hop = -1;
 	peer->local_out_hop = -1;
@@ -3091,15 +3153,13 @@ static int ardma_setup_rings(struct ardma_peer *peer)
 		peer->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, local_rx_hop,
 						 ARDMA_RING_DEPTH,
 						 rx_ring_flags, e2e_tx_hop,
-						 ARDMA_RX_SOF_MASK,
-						 ARDMA_RX_EOF_MASK,
+						 rx_sof_mask, rx_eof_mask,
 						 ardma_rx_start_poll, peer);
 	} else {
 		peer->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, local_rx_hop,
 						 ARDMA_RING_DEPTH,
 						 rx_ring_flags, e2e_tx_hop,
-						 ARDMA_RX_SOF_MASK,
-						 ARDMA_RX_EOF_MASK,
+						 rx_sof_mask, rx_eof_mask,
 						 NULL, NULL);
 	}
 	if (!peer->rx_ring) {
