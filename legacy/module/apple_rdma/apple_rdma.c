@@ -366,10 +366,8 @@ struct ardma_qp {
 	struct list_head recv_q;
 	u32 recv_q_depth;
 	struct ardma_recv_wr *rx_wr;
-	u32 rx_group_base;
 	u32 rx_piece;
 	u32 rx_byte_len;
-	bool rx_tail_pending;
 	bool rx_truncated;
 	struct ardma_pending_rx rx_pending[ARDMA_PENDING_RX_SLOTS];
 	u8 rx_pending_head;
@@ -1170,10 +1168,8 @@ static void ardma_complete_rx_wr(struct ardma_qp *qp, enum ib_wc_status status)
 	r = qp->rx_wr;
 	qp->rx_wr = NULL;
 	byte_len = qp->rx_byte_len;
-	qp->rx_group_base = 0;
 	qp->rx_piece = 0;
 	qp->rx_byte_len = 0;
-	qp->rx_tail_pending = false;
 	qp->rx_truncated = false;
 	spin_unlock_irqrestore(&qp->recv_lock, flags);
 
@@ -1191,33 +1187,6 @@ static void ardma_complete_rx_wr(struct ardma_qp *qp, enum ib_wc_status status)
 	ardma_push_rx_wc(qp, r, byte_len, status);
 }
 
-static bool ardma_known_piece(struct ardma_qp *qp, u32 len, u32 *offset,
-			      bool *group_done)
-{
-	u32 piece = qp->rx_piece;
-
-	*group_done = false;
-
-	if (!qp->rx_tail_pending && piece < 16 && len == 252) {
-		*offset = piece * 0x100;
-		qp->rx_piece++;
-		return true;
-	}
-	if (!qp->rx_tail_pending && piece < 16 && len == 12) {
-		*offset = piece * 0x100;
-		qp->rx_tail_pending = true;
-		return true;
-	}
-	if (qp->rx_tail_pending && piece < 16 && len == 240) {
-		*offset = piece * 0x100 + 0x10;
-		*group_done = true;
-		qp->rx_tail_pending = false;
-		qp->rx_piece = 0;
-		return true;
-	}
-	return false;
-}
-
 static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 				 const void *payload, u32 len, u8 eof)
 {
@@ -1226,10 +1195,9 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 	struct ardma_recv_wr *r;
 	struct ardma_recv_wr *pending_r = NULL;
 	unsigned long flags;
-	u32 dst_off, rel_off;
+	u32 dst_off;
 	u32 copy_len = len;
 	u32 pending_byte_len = 0;
-	bool group_done;
 	enum ib_wc_status complete_status = IB_WC_SUCCESS;
 	enum ib_wc_status pending_status = IB_WC_SUCCESS;
 	int ret;
@@ -1277,7 +1245,7 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 				return;
 			}
 			copy_len = len;
-			if (eof == 2 || eof == 3) {
+			if (READ_ONCE(rx_raw_mode) && (eof == 2 || eof == 3)) {
 				if (len < 4) {
 					copy_len = 0;
 					p->truncated = true;
@@ -1328,10 +1296,8 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 			return;
 		}
 		qp->rx_wr = r;
-		qp->rx_group_base = 0;
 		qp->rx_piece = 0;
 		qp->rx_byte_len = 0;
-		qp->rx_tail_pending = false;
 		qp->rx_truncated = false;
 		if (!ardma_recv_wr_total_len(r, &dst_off))
 			ardma_log_rx_event(peer, ARDMA_RX_EVT_WR_START, qpn,
@@ -1346,7 +1312,6 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 
 	if (eof == 1) {
 		qp->rx_piece = 0;
-		qp->rx_tail_pending = false;
 	}
 
 	if (READ_ONCE(rx_raw_mode)) {
@@ -1360,14 +1325,8 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 				copy_len = len - 4;
 			}
 		}
-	} else if (ardma_known_piece(qp, len, &rel_off, &group_done)) {
-		dst_off = qp->rx_group_base + rel_off;
-		if (group_done && eof == 2)
-			qp->rx_group_base += SZ_4K;
 	} else {
 		dst_off = qp->rx_byte_len;
-		qp->rx_tail_pending = false;
-		atomic64_inc(&peer->rx_bad_shape);
 	}
 	r = qp->rx_wr;
 	spin_unlock_irqrestore(&qp->recv_lock, flags);
@@ -1832,10 +1791,14 @@ static int ardma_send_apple_frame_chunk(struct ardma_peer *peer,
 				 group_first && first_piece ?
 				 ARDMA_TX_PIECE_FIRST : ARDMA_TX_PIECE_MID,
 				 0, &sof, &eof);
+		/* FRAME-mode silicon overwrites the last 4 bytes of a
+		 * non-EOF wire payload with its per-TLP CRC, so set
+		 * wire_len = payload_len + 4 to keep our user data intact.
+		 */
 		ret = ardma_submit_tx_piece(peer, ctx, pd, sg_list, num_sge,
 					    chunk, piece, base + pos,
 					    ARDMA_FRAME_SLOT_USER_SIZE,
-					    ARDMA_FRAME_SLOT_USER_SIZE,
+					    ARDMA_FRAME_SLOT_USER_SIZE + 4,
 					    sof, eof, false, 0);
 		if (ret)
 			return ret;
@@ -1852,9 +1815,10 @@ static int ardma_send_apple_frame_chunk(struct ardma_peer *peer,
 				 group_first && first_piece ?
 				 ARDMA_TX_PIECE_FIRST : ARDMA_TX_PIECE_SPLIT,
 				 0, &sof, &eof);
+		/* Same per-TLP CRC overwrite for the split (eof=0) piece. */
 		ret = ardma_submit_tx_piece(peer, ctx, pd, sg_list, num_sge,
 					    chunk, piece, base + pos,
-					    split_len, split_len, sof, eof,
+					    split_len, split_len + 4, sof, eof,
 					    false, 0);
 		if (ret)
 			return ret;
