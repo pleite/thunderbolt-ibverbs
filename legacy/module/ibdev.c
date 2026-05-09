@@ -63,6 +63,7 @@
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 #include <linux/string.h>
+#include <linux/jiffies.h>
 #include <net/addrconf.h>
 #include <net/net_namespace.h>
 
@@ -328,6 +329,17 @@ static DEFINE_MUTEX(u4r_dev_list_lock);
 static enum u4r_rail_mode u4r_mode = U4R_RAIL_SINGLE;
 static atomic_t u4r_lkey_counter = ATOMIC_INIT(1);
 static DEFINE_IDA(u4r_qpn_ida);
+
+struct u4r_pending_rail {
+	struct list_head link;
+	struct u4_data_peer *rail;
+};
+
+static LIST_HEAD(u4r_pending_rails);
+static DEFINE_MUTEX(u4r_pending_rails_lock);
+static void u4r_register_pending_rails_work(struct work_struct *work);
+static DECLARE_DELAYED_WORK(u4r_register_rails_work,
+			    u4r_register_pending_rails_work);
 
 static int u4r_parse_rail_mode(void)
 {
@@ -3579,27 +3591,155 @@ u4r_find_rail_dev_locked(struct u4_data_peer *rail)
 	return NULL;
 }
 
+static struct u4r_pending_rail *
+u4r_find_pending_rail_locked(struct u4_data_peer *rail)
+{
+	struct u4r_pending_rail *p;
+
+	list_for_each_entry(p, &u4r_pending_rails, link) {
+		if (p->rail == rail)
+			return p;
+	}
+	return NULL;
+}
+
+static void u4r_remove_pending_rail(struct u4_data_peer *rail)
+{
+	struct u4r_pending_rail *p;
+
+	mutex_lock(&u4r_pending_rails_lock);
+	p = u4r_find_pending_rail_locked(rail);
+	if (p)
+		list_del(&p->link);
+	mutex_unlock(&u4r_pending_rails_lock);
+
+	if (p) {
+		usb4_rdma_data_rail_put(p->rail);
+		kfree(p);
+	}
+}
+
+static void u4r_sort_rails(struct u4_data_peer **rails, int n)
+{
+	int i;
+
+	for (i = 1; i < n; i++) {
+		struct u4_data_peer *rail = rails[i];
+		int idx = usb4_rdma_data_rail_index(rail);
+		int j = i - 1;
+
+		while (j >= 0 &&
+		       usb4_rdma_data_rail_index(rails[j]) > idx) {
+			rails[j + 1] = rails[j];
+			j--;
+		}
+		rails[j + 1] = rail;
+	}
+}
+
+static void u4r_register_pending_rails_work(struct work_struct *work)
+{
+	struct u4r_pending_rail *p, *tmp;
+	struct u4_data_peer **rails;
+	LIST_HEAD(local);
+	int n = 0, i = 0;
+
+	mutex_lock(&u4r_pending_rails_lock);
+	list_splice_init(&u4r_pending_rails, &local);
+	mutex_unlock(&u4r_pending_rails_lock);
+
+	list_for_each_entry(p, &local, link)
+		n++;
+	if (!n)
+		return;
+
+	rails = kcalloc(n, sizeof(*rails), GFP_KERNEL);
+	if (!rails)
+		goto out_put;
+
+	list_for_each_entry_safe(p, tmp, &local, link) {
+		list_del(&p->link);
+		rails[i++] = p->rail;
+		kfree(p);
+	}
+
+	u4r_sort_rails(rails, n);
+	for (i = 0; i < n; i++) {
+		struct usb4_rdma_ib_dev *u4r;
+		struct u4_data_peer *rail = rails[i];
+		int ret;
+
+		mutex_lock(&u4r_dev_list_lock);
+		u4r = u4r_find_rail_dev_locked(rail);
+		mutex_unlock(&u4r_dev_list_lock);
+		if (u4r)
+			goto put_rail;
+
+		if (!usb4_rdma_data_rail_get(rail))
+			goto put_rail;
+		usb4_rdma_data_rail_put(rail);
+
+		ret = u4r_register_ibdev(rail, true, true, NULL);
+		if (ret)
+			pr_warn("lane rail ib_device registration failed: %d\n",
+				ret);
+put_rail:
+		usb4_rdma_data_rail_put(rail);
+	}
+	kfree(rails);
+	return;
+
+out_put:
+	list_for_each_entry_safe(p, tmp, &local, link) {
+		list_del(&p->link);
+		usb4_rdma_data_rail_put(p->rail);
+		kfree(p);
+	}
+}
+
 void usb4_rdma_ibdev_rail_event(struct u4_data_peer *rail, bool joined)
 {
 	struct usb4_rdma_ib_dev *u4r;
-	int ret;
 
 	if (!u4r_lane_mode() || !rail)
 		return;
 
 	if (joined) {
+		struct u4r_pending_rail *pending;
+
 		mutex_lock(&u4r_dev_list_lock);
 		u4r = u4r_find_rail_dev_locked(rail);
 		mutex_unlock(&u4r_dev_list_lock);
 		if (u4r)
 			return;
-		ret = u4r_register_ibdev(rail, true, true, NULL);
-		if (ret)
-			pr_warn("lane rail ib_device registration failed: %d\n",
-				ret);
+
+		pending = kzalloc(sizeof(*pending), GFP_KERNEL);
+		if (!pending) {
+			pr_warn("lane rail ib_device registration skipped: no memory\n");
+			return;
+		}
+		if (!usb4_rdma_data_rail_get(rail)) {
+			kfree(pending);
+			return;
+		}
+		pending->rail = rail;
+
+		mutex_lock(&u4r_pending_rails_lock);
+		if (u4r_find_pending_rail_locked(rail)) {
+			mutex_unlock(&u4r_pending_rails_lock);
+			usb4_rdma_data_rail_put(rail);
+			kfree(pending);
+			return;
+		}
+		list_add_tail(&pending->link, &u4r_pending_rails);
+		mutex_unlock(&u4r_pending_rails_lock);
+
+		schedule_delayed_work(&u4r_register_rails_work,
+				      msecs_to_jiffies(500));
 		return;
 	}
 
+	u4r_remove_pending_rail(rail);
 	mutex_lock(&u4r_dev_list_lock);
 	u4r = u4r_find_rail_dev_locked(rail);
 	if (u4r)
@@ -3666,6 +3806,19 @@ int usb4_rdma_ibdev_init(void)
 void usb4_rdma_ibdev_exit(void)
 {
 	struct usb4_rdma_ib_dev *u4r, *tmp;
+	struct u4r_pending_rail *p, *ptmp;
+
+	cancel_delayed_work_sync(&u4r_register_rails_work);
+
+	mutex_lock(&u4r_pending_rails_lock);
+	list_for_each_entry_safe(p, ptmp, &u4r_pending_rails, link) {
+		list_del(&p->link);
+		mutex_unlock(&u4r_pending_rails_lock);
+		usb4_rdma_data_rail_put(p->rail);
+		kfree(p);
+		mutex_lock(&u4r_pending_rails_lock);
+	}
+	mutex_unlock(&u4r_pending_rails_lock);
 
 	usb4_rdma_data_set_rx_zcopy_prepare(NULL);
 	usb4_rdma_data_set_rx_handler(NULL);

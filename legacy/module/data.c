@@ -47,6 +47,7 @@
 #include <linux/kthread.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
+#include <linux/random.h>
 
 #include "usb4_rdma.h"
 #include "wire.h"
@@ -181,6 +182,10 @@ struct u4_data_peer {
 	struct tb_service *svc;
 	struct tb_xdomain *xd;
 	int lane_idx;
+	u64 local_rail_id;
+	u64 remote_rail_id;
+	u64 pair_key;
+	int rail_index;
 
 	int out_hop;
 	int in_hop;
@@ -222,6 +227,7 @@ struct u4_data_peer {
 	atomic64_t tx_frames_sent;
 	atomic64_t rx_frames_recv;
 	atomic64_t rx_frames_dropped;
+	atomic64_t rx_cross_rail_qp;
 	atomic64_t rx_invalid_hdr;
 	atomic64_t rx_poll_armed_frames;
 	atomic64_t rx_poll_opportunistic_frames;
@@ -264,11 +270,12 @@ struct u4_login_header {
 #define U4_LOGIN_HDR_LENGTH_MASK GENMASK(5, 0)
 #define U4_LOGIN_HDR_SN_MASK     GENMASK(28, 27)
 #define U4_LOGIN_HDR_SN_SHIFT    27
-#define U4_LOGIN_PROTO_VERSION   1
+#define U4_LOGIN_PROTO_VERSION   2
 
 struct u4_login_lane {
 	u32 lane_idx;
 	u32 transmit_path;
+	u64 rail_id;
 };
 
 struct u4_login_request {
@@ -296,6 +303,7 @@ struct u4_login_ctx {
 	struct completion remote_ready;
 	int remote_count;
 	int remote_tx_path[U4_MAX_LANES_PER_SERVICE];
+	u64 remote_rail_id[U4_MAX_LANES_PER_SERVICE];
 	int login_attempts;
 	bool closing;
 	bool notified_joined;
@@ -423,6 +431,41 @@ void usb4_rdma_data_rail_put(struct u4_data_peer *rail)
 		u4_data_peer_put(rail);
 }
 
+static u64 u4_data_mix64(u64 x)
+{
+	x ^= x >> 30;
+	x *= 0xbf58476d1ce4e5b9ULL;
+	x ^= x >> 27;
+	x *= 0x94d049bb133111ebULL;
+	x ^= x >> 31;
+	return x;
+}
+
+static u64 u4_data_pair_key(u64 a, u64 b)
+{
+	u64 lo = min(a, b);
+	u64 hi = max(a, b);
+
+	return u4_data_mix64(lo ^ (hi + 0x9e3779b97f4a7c15ULL +
+				   (lo << 6) + (lo >> 2)));
+}
+
+static int u4_data_pair_index(u64 pair_key, int lane_idx)
+{
+	u32 slot;
+
+	if (lane_idx < 0 || lane_idx >= U4_MAX_LANES_PER_SERVICE)
+		return -EINVAL;
+
+	/* Reserve the low bit for the negotiated lane within this service.
+	 * Both hosts compute the same pair_key from the two exchanged random
+	 * rail IDs, so userspace can pass one identical NCCL_IB_HCA list on
+	 * both nodes even when local Thunderbolt domain numbers differ.
+	 */
+	slot = (u32)(pair_key & GENMASK(29, 0));
+	return (int)(slot * U4_MAX_LANES_PER_SERVICE + lane_idx);
+}
+
 int usb4_rdma_data_rail_index(struct u4_data_peer *rail)
 {
 	const char *name;
@@ -430,6 +473,8 @@ int usb4_rdma_data_rail_index(struct u4_data_peer *rail)
 
 	if (!rail || !rail->svc)
 		return -ENODEV;
+	if (rail->rail_index >= 0)
+		return rail->rail_index;
 
 	name = dev_name(&rail->svc->dev);
 	if (sscanf(name, "%u-", &domain) != 1)
@@ -770,7 +815,8 @@ static int u4_login_handle_packet(const void *buf, size_t size, void *data)
 			break;
 		}
 		for (i = 0; i < resp_count; i++) {
-			if (!req->lanes[i].transmit_path) {
+			if (!req->lanes[i].transmit_path ||
+			    !req->lanes[i].rail_id) {
 				res.status = U4_LOGIN_NO_LANES;
 				mutex_unlock(&ctx->lock);
 				goto out_unlock;
@@ -780,8 +826,10 @@ static int u4_login_handle_packet(const void *buf, size_t size, void *data)
 		ctx->remote_count = resp_count;
 		for (i = 0; i < resp_count; i++) {
 			ctx->remote_tx_path[i] = req->lanes[i].transmit_path;
+			ctx->remote_rail_id[i] = req->lanes[i].rail_id;
 			res.lanes[i].lane_idx = i;
 			res.lanes[i].transmit_path = ctx->lanes[i]->out_hop;
+			res.lanes[i].rail_id = ctx->lanes[i]->local_rail_id;
 		}
 		res.status = U4_LOGIN_OK;
 		res.lane_count = resp_count;
@@ -809,7 +857,8 @@ out_unlock:
 
 static int u4_login_parse_response(struct u4_login_ctx *ctx,
 				   const struct u4_login_response *res,
-				   int *remote_tx_path, int *remote_count)
+				   int *remote_tx_path, u64 *remote_rail_id,
+				   int *remote_count)
 {
 	u64 route;
 	u32 count;
@@ -847,16 +896,17 @@ static int u4_login_parse_response(struct u4_login_ctx *ctx,
 		return -EPROTO;
 
 	for (i = 0; i < count; i++) {
-		if (!res->lanes[i].transmit_path)
+		if (!res->lanes[i].transmit_path || !res->lanes[i].rail_id)
 			return -EPROTO;
 		remote_tx_path[i] = res->lanes[i].transmit_path;
+		remote_rail_id[i] = res->lanes[i].rail_id;
 	}
 	*remote_count = count;
 	return 0;
 }
 
 static int u4_login_request(struct u4_login_ctx *ctx, int *remote_tx_path,
-			    int *remote_count)
+			    u64 *remote_rail_id, int *remote_count)
 {
 	struct u4_login_response res;
 	struct u4_login_request req;
@@ -876,6 +926,7 @@ static int u4_login_request(struct u4_login_ctx *ctx, int *remote_tx_path,
 		for (i = 0; i < ctx->lane_count; i++) {
 			req.lanes[i].lane_idx = i;
 			req.lanes[i].transmit_path = ctx->lanes[i]->out_hop;
+			req.lanes[i].rail_id = ctx->lanes[i]->local_rail_id;
 		}
 
 		/* Use XDOMAIN_REQ for the login request so simultaneous
@@ -888,6 +939,7 @@ static int u4_login_request(struct u4_login_ctx *ctx, int *remote_tx_path,
 		if (!ret)
 			ret = u4_login_parse_response(ctx, &res,
 						      remote_tx_path,
+						      remote_rail_id,
 						      remote_count);
 		if (!ret)
 			return 0;
@@ -901,8 +953,10 @@ static int u4_login_request(struct u4_login_ctx *ctx, int *remote_tx_path,
 		mutex_lock(&ctx->lock);
 		if (ctx->remote_count > 0) {
 			*remote_count = ctx->remote_count;
-			for (i = 0; i < ctx->remote_count; i++)
+			for (i = 0; i < ctx->remote_count; i++) {
 				remote_tx_path[i] = ctx->remote_tx_path[i];
+				remote_rail_id[i] = ctx->remote_rail_id[i];
+			}
 			ret = 0;
 		}
 		mutex_unlock(&ctx->lock);
@@ -1128,10 +1182,16 @@ static void u4_data_zcopy_tx_complete(struct tb_ring *ring,
 	u4_data_free_tx_zcopy_frame(zf);
 }
 
-static void *u4_data_lookup_qp_rcu(u32 qp_num, struct u4_data_peer *rail)
+static void *u4_data_lookup_qp_rcu(u32 qp_num, struct u4_data_peer *rail,
+				   bool *cross_rail)
 {
 	struct u4_data_qp_entry *qe;
 	void *fallback = NULL;
+	void *other = NULL;
+	int other_count = 0;
+
+	if (cross_rail)
+		*cross_rail = false;
 
 	hash_for_each_possible_rcu(u4_data_qp_table, qe, node, qp_num) {
 		if (qe->qp_num != qp_num)
@@ -1140,8 +1200,27 @@ static void *u4_data_lookup_qp_rcu(u32 qp_num, struct u4_data_peer *rail)
 			return qe->qp;
 		if (!qe->rail)
 			fallback = qe->qp;
+		else {
+			other = qe->qp;
+			other_count++;
+		}
 	}
-	return fallback;
+	if (fallback)
+		return fallback;
+
+	/* QPNs for normal RC/UC QPs come from one global IDA, so there is
+	 * normally exactly one non-GSI owner. If a peer's HCA names are
+	 * crossed between cables, dispatching by QPN is safer than silently
+	 * dropping the frame and wedging the sender. Leave ambiguous QPNs
+	 * such as per-device QP1 alone.
+	 */
+	if (other_count == 1) {
+		if (cross_rail)
+			*cross_rail = true;
+		return other;
+	}
+
+	return NULL;
 }
 
 static void u4_data_repost_rx_frame(struct u4_data_peer *p,
@@ -1373,6 +1452,7 @@ static bool u4_data_try_rx_zcopy(struct u4_data_peer *p,
 	void *target_qp = NULL;
 	u32 min_bytes = READ_ONCE(rx_zcopy_min_bytes);
 	u32 dest_qp;
+	bool cross_rail = false;
 	int posted = 0;
 	int ret = 0;
 
@@ -1389,7 +1469,9 @@ static bool u4_data_try_rx_zcopy(struct u4_data_peer *p,
 
 	dest_qp = le32_to_cpu(hdr->dest_qp);
 	rcu_read_lock();
-	target_qp = u4_data_lookup_qp_rcu(dest_qp, p);
+	target_qp = u4_data_lookup_qp_rcu(dest_qp, p, &cross_rail);
+	if (cross_rail)
+		atomic64_inc(&p->rx_cross_rail_qp);
 	if (target_qp)
 		ret = u4_data_prepare_rx_zcopy(p, target_qp, hdr, length,
 					       &frames, &s);
@@ -1448,6 +1530,7 @@ static void u4_data_dispatch_raw(struct u4_data_peer *p, const void *payload,
 	void *target_qp = NULL;
 	u32 dest_qp;
 	u32 length;
+	bool cross_rail = false;
 
 	if (!frame_len || frame_len > p->raw_remaining ||
 	    frame_len > U4_FRAME_SIZE) {
@@ -1469,7 +1552,9 @@ static void u4_data_dispatch_raw(struct u4_data_peer *p, const void *payload,
 
 	dest_qp = le32_to_cpu(hdr.dest_qp);
 	rcu_read_lock();
-	target_qp = u4_data_lookup_qp_rcu(dest_qp, p);
+	target_qp = u4_data_lookup_qp_rcu(dest_qp, p, &cross_rail);
+	if (cross_rail)
+		atomic64_inc(&p->rx_cross_rail_qp);
 	if (target_qp && u4_data_rx_handler)
 		u4_data_rx_handler(target_qp, &hdr, payload, length);
 	rcu_read_unlock();
@@ -1490,6 +1575,7 @@ static void u4_data_rx_complete_one(struct tb_ring *ring,
 	u32 dest_qp;
 	struct device *dma_dev = tb_ring_dma_device(ring);
 	u32 frame_len;
+	bool cross_rail = false;
 
 	if (canceled)
 		return;
@@ -1546,7 +1632,9 @@ static void u4_data_rx_complete_one(struct tb_ring *ring,
 	payload = (u8 *)f->buf + U4_HDR_SIZE;
 
 	rcu_read_lock();
-	target_qp = u4_data_lookup_qp_rcu(dest_qp, f->peer);
+	target_qp = u4_data_lookup_qp_rcu(dest_qp, f->peer, &cross_rail);
+	if (cross_rail)
+		atomic64_inc(&f->peer->rx_cross_rail_qp);
 	if (target_qp && u4_data_rx_handler)
 		u4_data_rx_handler(target_qp, hdr, payload, length);
 	rcu_read_unlock();
@@ -1585,6 +1673,12 @@ static int u4_data_prepare_lane(struct u4_data_peer *p, struct tb_service *svc,
 	p->svc = svc;
 	p->xd = xd;
 	p->lane_idx = lane_idx;
+	p->local_rail_id = get_random_u64();
+	if (!p->local_rail_id)
+		p->local_rail_id = 1;
+	p->remote_rail_id = 0;
+	p->pair_key = 0;
+	p->rail_index = -1;
 	p->out_hop = -1;
 	p->in_hop = -1;
 	p->ring_depth = u4_data_ring_depth();
@@ -1676,10 +1770,20 @@ err_out:
 	return ret;
 }
 
-static int u4_data_enable_lane(struct u4_data_peer *p, int remote_tx_path)
+static int u4_data_enable_lane(struct u4_data_peer *p, int remote_tx_path,
+			       u64 remote_rail_id)
 {
 	unsigned long flags;
 	int ret;
+
+	if (!remote_rail_id)
+		return -EPROTO;
+
+	p->remote_rail_id = remote_rail_id;
+	p->pair_key = u4_data_pair_key(p->local_rail_id, p->remote_rail_id);
+	p->rail_index = u4_data_pair_index(p->pair_key, p->lane_idx);
+	if (p->rail_index < 0)
+		return p->rail_index;
 
 	ret = tb_xdomain_alloc_in_hopid(p->xd, remote_tx_path);
 	if (ret != remote_tx_path) {
@@ -1727,9 +1831,12 @@ static int u4_data_enable_lane(struct u4_data_peer *p, int remote_tx_path)
 	}
 
 	dev_info(&p->svc->dev,
-		 "data: lane %d attached, ring hops tx=%d rx=%d, depth=%u, local transmit path=%d remote transmit path=%d, rx_posted=%d/%u\n",
-		 p->lane_idx, p->tx_ring->hop, p->rx_ring->hop,
+		 "data: lane %d attached as usb4_rdma%d, ring hops tx=%d rx=%d, depth=%u, local transmit path=%d remote transmit path=%d, rail local=%016llx remote=%016llx pair=%016llx, rx_posted=%d/%u\n",
+		 p->lane_idx, p->rail_index, p->tx_ring->hop, p->rx_ring->hop,
 		 p->ring_depth, p->out_hop, p->in_hop,
+		 (unsigned long long)p->local_rail_id,
+		 (unsigned long long)p->remote_rail_id,
+		 (unsigned long long)p->pair_key,
 		 p->rx_posted_initial, p->frames_per_dir);
 	usb4_rdma_ibdev_rail_event(p, true);
 	return 0;
@@ -1829,6 +1936,13 @@ static int u4_data_stats_show(struct seq_file *m, void *unused)
 		seq_printf(m, "  service:            %s\n",
 			   p->svc ? dev_name(&p->svc->dev) : "(none)");
 		seq_printf(m, "  lane_idx:           %d\n", p->lane_idx);
+		seq_printf(m, "  rail_index:         %d\n", p->rail_index);
+		seq_printf(m, "  local_rail_id:      %016llx\n",
+			   (unsigned long long)p->local_rail_id);
+		seq_printf(m, "  remote_rail_id:     %016llx\n",
+			   (unsigned long long)p->remote_rail_id);
+		seq_printf(m, "  pair_key:           %016llx\n",
+			   (unsigned long long)p->pair_key);
 		seq_printf(m, "  closing:            %u\n", READ_ONCE(p->closing));
 		seq_printf(m, "  paths_enabled:      %u\n", p->paths_enabled);
 		seq_printf(m, "  tx_hop:             %d\n",
@@ -1857,6 +1971,8 @@ static int u4_data_stats_show(struct seq_file *m, void *unused)
 			   (long long)atomic64_read(&p->rx_frames_recv));
 		seq_printf(m, "  rx_frames_dropped:  %lld\n",
 			   (long long)atomic64_read(&p->rx_frames_dropped));
+		seq_printf(m, "  rx_cross_rail_qp:   %lld\n",
+			   (long long)atomic64_read(&p->rx_cross_rail_qp));
 		seq_printf(m, "  rx_invalid_hdr:     %lld\n",
 			   (long long)atomic64_read(&p->rx_invalid_hdr));
 		seq_printf(m, "  rx_poll_armed_frames: %lld\n",
@@ -1891,6 +2007,33 @@ static int u4_data_stats_show(struct seq_file *m, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(u4_data_stats);
 
+static int u4_data_rail_map_show(struct seq_file *m, void *unused)
+{
+	struct u4_data_peer *p;
+	unsigned long flags;
+
+	seq_puts(m, "ibdev service route lane tx_hop rx_hop out_hop in_hop local_rail_id remote_rail_id pair_key\n");
+
+	read_lock_irqsave(&peer_lock, flags);
+	list_for_each_entry(p, &peer_list, list) {
+		seq_printf(m,
+			   "usb4_rdma%d %s 0x%llx %d %d %d %d %d %016llx %016llx %016llx\n",
+			   p->rail_index,
+			   p->svc ? dev_name(&p->svc->dev) : "(none)",
+			   p->xd ? (unsigned long long)p->xd->route : 0ULL,
+			   p->lane_idx,
+			   p->tx_ring ? p->tx_ring->hop : -1,
+			   p->rx_ring ? p->rx_ring->hop : -1,
+			   p->out_hop, p->in_hop,
+			   (unsigned long long)p->local_rail_id,
+			   (unsigned long long)p->remote_rail_id,
+			   (unsigned long long)p->pair_key);
+	}
+	read_unlock_irqrestore(&peer_lock, flags);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(u4_data_rail_map);
+
 int usb4_rdma_data_init(struct dentry *parent_dir)
 {
 	int ret;
@@ -1908,6 +2051,9 @@ int usb4_rdma_data_init(struct dentry *parent_dir)
 	if (!IS_ERR_OR_NULL(data_debugfs_root))
 		debugfs_create_file("stats", 0444, data_debugfs_root, NULL,
 				    &u4_data_stats_fops);
+	if (!IS_ERR_OR_NULL(data_debugfs_root))
+		debugfs_create_file("rail_map", 0444, data_debugfs_root, NULL,
+				    &u4_data_rail_map_fops);
 	return 0;
 }
 
@@ -1929,6 +2075,7 @@ static void u4_login_work(struct work_struct *work)
 	struct u4_data_peer *dead[U4_MAX_LANES_PER_SERVICE] = {};
 	struct u4_data_peer *p;
 	int remote_tx_path[U4_MAX_LANES_PER_SERVICE];
+	u64 remote_rail_id[U4_MAX_LANES_PER_SERVICE];
 	int remote_count = 0;
 	int dead_count = 0;
 	int ret, lane, prepared, attached = 0;
@@ -1939,7 +2086,8 @@ static void u4_login_work(struct work_struct *work)
 
 	attempt = ++login->login_attempts;
 	prepared = login->lane_count;
-	ret = u4_login_request(login, remote_tx_path, &remote_count);
+	ret = u4_login_request(login, remote_tx_path, remote_rail_id,
+			       &remote_count);
 	if (ret) {
 		if (!READ_ONCE(login->closing) &&
 		    attempt < U4_LOGIN_WORK_RETRIES) {
@@ -1982,7 +2130,8 @@ static void u4_login_work(struct work_struct *work)
 			continue;
 		}
 
-		ret = u4_data_enable_lane(p, remote_tx_path[lane]);
+		ret = u4_data_enable_lane(p, remote_tx_path[lane],
+					   remote_rail_id[lane]);
 		if (ret) {
 			dev_warn(&login->svc->dev,
 				 "data: lane %d negotiated but failed to enable (%d)\n",

@@ -58,7 +58,7 @@ static const uuid_t usb4_rdma_uuid =
 
 /* Protocol revision advertised in the property directory. Bump when
  * the wire format changes. */
-#define USB4_RDMA_PROTOCOL_REV 1
+#define USB4_RDMA_PROTOCOL_REV 2
 
 /*
  * Per-bound-service state. One of these per discovered peer.

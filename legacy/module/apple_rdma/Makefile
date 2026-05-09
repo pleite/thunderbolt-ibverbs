@@ -39,4 +39,4 @@ help:
 	@echo "  clean              Remove build artefacts"
 	@echo ""
 	@echo "Useful load:"
-	@echo "  sudo insmod apple_rdma.ko service_uuid=<mac-ad-fa57-uuid>"
+	@echo "  sudo insmod apple_rdma.ko peer_route=0-2 ring_depth=16384 rx_post_frames=0"
