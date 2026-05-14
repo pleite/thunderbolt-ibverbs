@@ -360,6 +360,11 @@ module_param(raw_rx_window_bytes, uint, 0644);
 MODULE_PARM_DESC(raw_rx_window_bytes,
 		 "Maximum total bytes of posted Apple RAW receive WRs per peer; 0 disables (default: 2097152)");
 
+static unsigned int apple_max_uc_qps = 1;
+module_param(apple_max_uc_qps, uint, 0644);
+MODULE_PARM_DESC(apple_max_uc_qps,
+		 "Maximum simultaneous UC QPs allowed per Apple peer; 0 disables (default: 1)");
+
 struct ardma_peer;
 struct ardma_qp;
 
@@ -716,8 +721,7 @@ static LIST_HEAD(ardma_ctrl_list);
 
 static int ardma_ctrl_callback(const void *buf, size_t size, void *data);
 static void ardma_peer_put(struct ardma_peer *peer);
-static void ardma_peer_qp_activate(struct ardma_qp *qp,
-				   struct ardma_peer *peer);
+static int ardma_peer_qp_activate(struct ardma_qp *qp, struct ardma_peer *peer);
 
 static bool ardma_xdomain_is_apple(const struct tb_xdomain *xd)
 {
@@ -1493,8 +1497,15 @@ static int ardma_bind_qp_peer(struct ardma_qp *qp, struct ardma_peer *peer)
 	}
 
 	qp->peer = peer;
-	if (qp->qp_type == IB_QPT_UC)
-		ardma_peer_qp_activate(qp, peer);
+	if (qp->qp_type == IB_QPT_UC) {
+		int ret = ardma_peer_qp_activate(qp, peer);
+
+		if (ret) {
+			qp->peer = NULL;
+			ardma_peer_put(peer);
+			return ret;
+		}
+	}
 	return 0;
 }
 
@@ -1595,15 +1606,28 @@ static void ardma_disable_peer_paths_locked(struct ardma_peer *peer)
 		peer->local_out_hop, peer->tx_ring ? peer->tx_ring->hop : -1);
 }
 
-static void ardma_peer_qp_activate(struct ardma_qp *qp, struct ardma_peer *peer)
+static int ardma_peer_qp_activate(struct ardma_qp *qp, struct ardma_peer *peer)
 {
-	if (!qp || !peer || qp->peer_qp_active)
-		return;
+	unsigned int max_qps = READ_ONCE(apple_max_uc_qps);
+
+	if (!qp || !peer)
+		return -ENOTCONN;
+	if (qp->peer_qp_active)
+		return 0;
 
 	mutex_lock(&peer->tx_lock);
+	if (peer->remote_is_apple && max_qps &&
+	    peer->active_uc_qps >= max_qps) {
+		mutex_unlock(&peer->tx_lock);
+		pr_warn_ratelimited("rejecting UC QP: Apple peer %s already has %u active UC QPs (max=%u)\n",
+				    dev_name(&peer->svc->dev),
+				    peer->active_uc_qps, max_qps);
+		return -EBUSY;
+	}
 	peer->active_uc_qps++;
 	qp->peer_qp_active = true;
 	mutex_unlock(&peer->tx_lock);
+	return 0;
 }
 
 static void ardma_peer_qp_deactivate(struct ardma_qp *qp)
@@ -3526,7 +3550,22 @@ static int ardma_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 			ardma_peer_put(peer);
 			return ret;
 		}
-		ardma_peer_qp_activate(qp, peer);
+		ret = ardma_peer_qp_activate(qp, peer);
+		if (ret) {
+			int i;
+
+			ardma_tx_pool_destroy(qp);
+			if (qp->qpn_allocated) {
+				ardma_free_qpn(ibqp->qp_num);
+				qp->qpn_allocated = false;
+			}
+			for (i = 0; i < ARDMA_PENDING_RX_SLOTS; i++) {
+				kfree(qp->rx_pending[i].buf);
+				qp->rx_pending[i].buf = NULL;
+			}
+			ardma_peer_put(peer);
+			return ret;
+		}
 	}
 
 	pr_info("create_qp %s qpn=0x%x peer=%s peer_count=%d\n",
@@ -4852,6 +4891,7 @@ static int ardma_stats_show(struct seq_file *m, void *unused)
 	seq_printf(m, "receive_path: %d\n", receive_path);
 	seq_printf(m, "paths_enabled: %u\n", peer->paths_enabled);
 	seq_printf(m, "active_uc_qps: %u\n", READ_ONCE(peer->active_uc_qps));
+	seq_printf(m, "apple_max_uc_qps: %u\n", READ_ONCE(apple_max_uc_qps));
 	seq_printf(m, "raw_rx_credits_reserved: %d\n",
 		   atomic_read(&peer->raw_rx_credits_reserved));
 	seq_printf(m, "raw_rx_credit_budget: %u\n",
@@ -5129,6 +5169,7 @@ static int ardma_nhi_stall_dump_show(struct seq_file *m, void *unused)
 	seq_printf(m, "receive_path: %d\n", receive_path);
 	seq_printf(m, "paths_enabled: %u\n", peer->paths_enabled);
 	seq_printf(m, "active_uc_qps: %u\n", READ_ONCE(peer->active_uc_qps));
+	seq_printf(m, "apple_max_uc_qps: %u\n", READ_ONCE(apple_max_uc_qps));
 	seq_printf(m, "raw_rx_credits_reserved: %d\n",
 		   atomic_read(&peer->raw_rx_credits_reserved));
 	seq_printf(m, "raw_rx_credit_budget: %u\n",
