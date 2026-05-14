@@ -82,6 +82,11 @@
 #define ARDMA_PENDING_RX_SLOTS	16
 #define ARDMA_DEFAULT_TX_POOL_FRAMES	4096
 #define ARDMA_MAX_TX_POOL_FRAMES	16384
+#define ARDMA_MAX_PATH_LANES		4
+#define ARDMA_APPLE_RAW_CHUNK_BYTES	SZ_4K
+#define ARDMA_APPLE_RAW_FRAMES_PER_CHUNK	17
+#define ARDMA_APPLE_RAW_MAX_RECV_BYTES	SZ_512K
+#define ARDMA_RAW_RX_CREDIT_HEADROOM	64
 #define ARDMA_RX_MARKER_LOG_ENTRIES	64
 #define ARDMA_RX_MARKER_PREFIX	16
 #define ARDMA_EVENT_LOG_ENTRIES	4096
@@ -212,20 +217,44 @@ MODULE_PARM_DESC(peer_netdevs,
 		 "Comma-separated route-to-netdev map for per-peer RDMA devices, e.g. 0-2=thunderbolt0,1-2=thunderbolt1");
 
 static bool tx_enabled = true;
+module_param(tx_enabled, bool, 0444);
+MODULE_PARM_DESC(tx_enabled,
+		 "Enable TX data path (default: true)");
 
 static bool tx_raw_mode;
+module_param(tx_raw_mode, bool, 0444);
+MODULE_PARM_DESC(tx_raw_mode,
+		 "Transmit RAW descriptors instead of FRAME descriptors (default: false)");
 
 static bool tx_e2e = true;
+module_param(tx_e2e, bool, 0444);
+MODULE_PARM_DESC(tx_e2e,
+		 "Enable E2E flow control on the TX ring (default: true)");
 
 static bool rx_e2e = true;
+module_param(rx_e2e, bool, 0444);
+MODULE_PARM_DESC(rx_e2e,
+		 "Enable E2E flow control on the RX ring (default: true)");
 
 static bool tx_honor_path_mtu;
+module_param(tx_honor_path_mtu, bool, 0444);
+MODULE_PARM_DESC(tx_honor_path_mtu,
+		 "Honor QP path MTU in FRAME mode instead of active_mtu (default: false)");
 
 static bool tx_frame_single_desc = true;
+module_param(tx_frame_single_desc, bool, 0644);
+MODULE_PARM_DESC(tx_frame_single_desc,
+		 "Use one FRAME descriptor per Apple TX chunk when possible (default: true)");
 
 static unsigned int active_mtu = 4096;
+module_param(active_mtu, uint, 0444);
+MODULE_PARM_DESC(active_mtu,
+		 "Advertised and effective active MTU bytes (default: 4096)");
 
 static bool rx_poll_mode;
+module_param(rx_poll_mode, bool, 0444);
+MODULE_PARM_DESC(rx_poll_mode,
+		 "Use RX polling thread instead of ring callback (default: false)");
 
 static unsigned int rx_post_frames;
 module_param(rx_post_frames, uint, 0444);
@@ -247,6 +276,11 @@ module_param(ring_depth, uint, 0444);
 MODULE_PARM_DESC(ring_depth,
 		 "NHI TX/RX ring depth, power of two, 256..32768; load-time only (default: 16384)");
 
+static unsigned int path_lanes = 1;
+module_param(path_lanes, uint, 0444);
+MODULE_PARM_DESC(path_lanes,
+		 "Diagnostic Apple HopID lanes to wire starting at receive_path; lane i maps incoming HopID receive_path+i to QPN (receive_path+i)<<8 (default: 1, max: 4)");
+
 enum {
 	ARDMA_TX_MARKER_APPLE_EOF = 0,
 	ARDMA_TX_MARKER_GEMINI_SOF = 1,
@@ -256,10 +290,22 @@ enum {
 };
 
 static unsigned int tx_marker_mode = ARDMA_TX_MARKER_GEMINI_SOF;
+module_param(tx_marker_mode, uint, 0644);
+MODULE_PARM_DESC(tx_marker_mode,
+		 "TX marker mode diagnostic knob (default: 1)");
 
 static unsigned int tx_terminal_eof = 3;
+module_param(tx_terminal_eof, uint, 0644);
+MODULE_PARM_DESC(tx_terminal_eof,
+		 "Terminal EOF marker value for Apple TX descriptors (default: 3)");
 static unsigned int tx_pace_us;
+module_param(tx_pace_us, uint, 0644);
+MODULE_PARM_DESC(tx_pace_us,
+		 "Microseconds to sleep between TX chunks (default: 0)");
 static unsigned int tx_inter_wr_gap_us;
+module_param(tx_inter_wr_gap_us, uint, 0644);
+MODULE_PARM_DESC(tx_inter_wr_gap_us,
+		 "Minimum microseconds between posted send WRs (default: 0)");
 
 /* Diagnostic-only pacing knobs. Default 0 (no pacing). When nonzero,
  * ardma_send_apple sleeps tx_pace_us microseconds between negotiated MTU chunks
@@ -271,9 +317,35 @@ module_param(event_log, bool, 0644);
 MODULE_PARM_DESC(event_log,
 		 "Record per-peer TX/RX debugfs event rings with timestamps (default: true)");
 
-static bool tx_force_drain_on_destroy;
+static bool tx_force_drain_on_destroy = true;
+module_param(tx_force_drain_on_destroy, bool, 0644);
+MODULE_PARM_DESC(tx_force_drain_on_destroy,
+		 "Force-cancel the shared TX ring when QP destroy cannot drain pending TX refs (default: true)");
+
+static unsigned int mr_dereg_timeout_ms = 5000;
+module_param(mr_dereg_timeout_ms, uint, 0644);
+MODULE_PARM_DESC(mr_dereg_timeout_ms,
+		 "Milliseconds to wait for MR refs before forcing TX drain; 0 waits forever (default: 5000)");
 
 static bool enable_paths_on_setup = true;
+module_param(enable_paths_on_setup, bool, 0444);
+MODULE_PARM_DESC(enable_paths_on_setup,
+		 "Enable Thunderbolt DMA paths during probe; disable for TB-IP coexistence diagnostics (default: true)");
+
+static bool disable_paths_on_idle = true;
+module_param(disable_paths_on_idle, bool, 0644);
+MODULE_PARM_DESC(disable_paths_on_idle,
+		 "Disable Thunderbolt DMA paths when the last UC QP is destroyed (default: true)");
+
+static bool raw_rx_credit_guard = true;
+module_param(raw_rx_credit_guard, bool, 0644);
+MODULE_PARM_DESC(raw_rx_credit_guard,
+		 "Reject Apple RAW recv windows that exceed the RX descriptor credit budget (default: true)");
+
+static unsigned int raw_rx_max_recv_bytes = ARDMA_APPLE_RAW_MAX_RECV_BYTES;
+module_param(raw_rx_max_recv_bytes, uint, 0644);
+MODULE_PARM_DESC(raw_rx_max_recv_bytes,
+		 "Maximum single posted receive size accepted for Apple RAW RX; 0 disables (default: 524288)");
 
 struct ardma_peer;
 struct ardma_qp;
@@ -328,6 +400,7 @@ struct ardma_recv_wr {
 	struct list_head list;
 	u64 wr_id;
 	struct ib_cqe *wr_cqe;
+	u32 raw_rx_credits;
 	int num_sge;
 	struct ib_sge sge[ARDMA_MAX_SGE];
 	struct ardma_mr *mr[ARDMA_MAX_SGE];
@@ -353,6 +426,7 @@ struct ardma_qp {
 	wait_queue_head_t ref_wait;
 	bool qpn_allocated;
 	bool registered;
+	bool peer_qp_active;
 	bool sq_sig_all;
 
 	spinlock_t recv_lock;
@@ -395,8 +469,22 @@ struct ardma_ibdev {
 struct ardma_rx_frame {
 	struct ring_frame frame;
 	struct ardma_peer *peer;
+	u32 qpn;
 	void *data;
 	dma_addr_t dma;
+};
+
+struct ardma_path_lane {
+	int local_in_hop;
+	int local_out_hop;
+	bool paths_enabled;
+	bool tx_ring_running;
+	struct tb_ring *tx_ring;
+	struct tb_ring *rx_ring;
+	struct ardma_rx_frame *rx_frames;
+	u32 rx_posted_frames;
+	u32 rx_frame_capacity;
+	u32 qpn;
 };
 
 struct ardma_send_ctx {
@@ -544,6 +632,7 @@ struct ardma_peer {
 	u32 rx_frame_capacity;
 	struct mutex tx_lock;
 	bool tx_ring_running;
+	unsigned int active_uc_qps;
 
 	/* RX poll-mode (rx_poll_mode=1): per-peer kthread drains the RX ring
 	 * via tb_ring_poll() to bypass NHI IRQ moderation. Unused (NULL) when
@@ -580,6 +669,9 @@ struct ardma_peer {
 	atomic64_t tx_zcopy_frames;
 	atomic64_t tx_pool_frames;
 	atomic64_t tx_dynamic_frames;
+	atomic_t raw_rx_credits_reserved;
+	unsigned int extra_lane_count;
+	struct ardma_path_lane extra_lanes[ARDMA_MAX_PATH_LANES - 1];
 };
 
 struct ardma_ctrl_log_entry {
@@ -607,6 +699,8 @@ static LIST_HEAD(ardma_ctrl_list);
 
 static int ardma_ctrl_callback(const void *buf, size_t size, void *data);
 static void ardma_peer_put(struct ardma_peer *peer);
+static void ardma_peer_qp_activate(struct ardma_qp *qp,
+				   struct ardma_peer *peer);
 
 static bool ardma_xdomain_is_apple(const struct tb_xdomain *xd)
 {
@@ -858,6 +952,38 @@ static void ardma_recv_wr_free(struct ardma_recv_wr *r)
 		if (r->mr[i])
 			ardma_mr_put(r->mr[i]);
 	kfree(r);
+}
+
+static u32 ardma_apple_raw_rx_credits(u32 len)
+{
+	u32 chunks;
+
+	if (!len)
+		return 1;
+	chunks = DIV_ROUND_UP(len, ARDMA_APPLE_RAW_CHUNK_BYTES);
+	if (chunks > U32_MAX / ARDMA_APPLE_RAW_FRAMES_PER_CHUNK)
+		return U32_MAX;
+	return chunks * ARDMA_APPLE_RAW_FRAMES_PER_CHUNK;
+}
+
+static u32 ardma_peer_raw_rx_credit_budget(const struct ardma_peer *peer)
+{
+	u32 budget;
+
+	if (!peer || !peer->rx_frame_capacity)
+		return 0;
+	budget = peer->rx_frame_capacity;
+	if (budget > ARDMA_RAW_RX_CREDIT_HEADROOM)
+		budget -= ARDMA_RAW_RX_CREDIT_HEADROOM;
+	return budget;
+}
+
+static void ardma_recv_wr_release(struct ardma_qp *qp, struct ardma_recv_wr *r)
+{
+	if (r && r->raw_rx_credits && qp && qp->peer)
+		atomic_sub(r->raw_rx_credits,
+			   &qp->peer->raw_rx_credits_reserved);
+	ardma_recv_wr_free(r);
 }
 
 static int ardma_mr_check_range(struct ardma_mr *mr, u64 vaddr, size_t len)
@@ -1345,6 +1471,8 @@ static int ardma_bind_qp_peer(struct ardma_qp *qp, struct ardma_peer *peer)
 	}
 
 	qp->peer = peer;
+	if (qp->qp_type == IB_QPT_UC)
+		ardma_peer_qp_activate(qp, peer);
 	return 0;
 }
 
@@ -1381,6 +1509,98 @@ static void ardma_stop_tx_ring(struct ardma_peer *peer)
 		tb_ring_stop(peer->tx_ring);
 		peer->tx_ring_running = false;
 	}
+	mutex_unlock(&peer->tx_lock);
+}
+
+static void ardma_restart_tx_ring(struct ardma_peer *peer)
+{
+	if (!peer || !peer->tx_ring || READ_ONCE(peer->closing))
+		return;
+
+	mutex_lock(&peer->tx_lock);
+	if (peer->tx_ring && !peer->tx_ring_running &&
+	    !READ_ONCE(peer->closing)) {
+		tb_ring_start(peer->tx_ring);
+		peer->tx_ring_running = true;
+	}
+	mutex_unlock(&peer->tx_lock);
+}
+
+static int ardma_enable_peer_paths(struct ardma_peer *peer)
+{
+	int ret = 0;
+
+	if (!peer || !peer->tx_ring || !peer->rx_ring)
+		return -ENOTCONN;
+	if (READ_ONCE(peer->paths_enabled))
+		return 0;
+	if (READ_ONCE(peer->closing))
+		return -ESHUTDOWN;
+
+	mutex_lock(&peer->tx_lock);
+	if (!peer->paths_enabled && !READ_ONCE(peer->closing)) {
+		ret = tb_xdomain_enable_paths(peer->xd, peer->local_out_hop,
+					      peer->tx_ring->hop,
+					      peer->local_in_hop,
+					      peer->rx_ring->hop);
+		if (!ret) {
+			peer->paths_enabled = true;
+			pr_info("enabled DMA paths lazily: in_path=%d rx_hop=%d out_path=%d tx_hop=%d\n",
+				peer->local_in_hop, peer->rx_ring->hop,
+				peer->local_out_hop, peer->tx_ring->hop);
+		} else {
+			pr_warn("lazy enable_paths failed: %d\n", ret);
+		}
+	} else if (READ_ONCE(peer->closing)) {
+		ret = -ESHUTDOWN;
+	}
+	mutex_unlock(&peer->tx_lock);
+	return ret;
+}
+
+static void ardma_disable_peer_paths_locked(struct ardma_peer *peer)
+{
+	if (!peer || !peer->paths_enabled)
+		return;
+
+	tb_xdomain_disable_paths(peer->xd, peer->local_out_hop,
+				 peer->tx_ring ? peer->tx_ring->hop : -1,
+				 peer->local_in_hop,
+				 peer->rx_ring ? peer->rx_ring->hop : -1);
+	peer->paths_enabled = false;
+	pr_info("disabled DMA paths at idle: in_path=%d rx_hop=%d out_path=%d tx_hop=%d\n",
+		peer->local_in_hop, peer->rx_ring ? peer->rx_ring->hop : -1,
+		peer->local_out_hop, peer->tx_ring ? peer->tx_ring->hop : -1);
+}
+
+static void ardma_peer_qp_activate(struct ardma_qp *qp, struct ardma_peer *peer)
+{
+	if (!qp || !peer || qp->peer_qp_active)
+		return;
+
+	mutex_lock(&peer->tx_lock);
+	peer->active_uc_qps++;
+	qp->peer_qp_active = true;
+	mutex_unlock(&peer->tx_lock);
+}
+
+static void ardma_peer_qp_deactivate(struct ardma_qp *qp)
+{
+	struct ardma_peer *peer;
+
+	if (!qp || !qp->peer_qp_active)
+		return;
+	peer = qp->peer;
+	if (!peer)
+		return;
+
+	mutex_lock(&peer->tx_lock);
+	if (peer->active_uc_qps)
+		peer->active_uc_qps--;
+	qp->peer_qp_active = false;
+	if (!peer->active_uc_qps && READ_ONCE(disable_paths_on_idle) &&
+	    !READ_ONCE(peer->closing))
+		ardma_disable_peer_paths_locked(peer);
 	mutex_unlock(&peer->tx_lock);
 }
 
@@ -1544,7 +1764,7 @@ static void ardma_push_rx_wc(struct ardma_qp *qp, struct ardma_recv_wr *r,
 			   qp->rx_pending_ready_count, qp->rx_pending_active,
 			   qp->rx_piece, 0);
 	ardma_cq_push_wc(recv_cq, &wc);
-	ardma_recv_wr_free(r);
+	ardma_recv_wr_release(qp, r);
 }
 
 static struct ardma_recv_wr *
@@ -1568,7 +1788,7 @@ ardma_flush_pending_locked(struct ardma_qp *qp, u32 *byte_len,
 	*byte_len = p->len;
 	*status = p->truncated ? IB_WC_LOC_LEN_ERR : IB_WC_SUCCESS;
 	if (!ardma_recv_wr_total_len(r, &expected_len) &&
-	    p->len != expected_len)
+	    p->len > expected_len)
 		*status = IB_WC_LOC_LEN_ERR;
 	ret = ardma_recv_scatter(pd, r, 0, p->buf, p->len);
 	if (ret == -ERANGE)
@@ -1792,16 +2012,13 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 	else if (ret)
 		qp->rx_truncated = true;
 	qp->rx_byte_len = max(qp->rx_byte_len, dst_off + copy_len);
+	/* The posted receive length is capacity. A shorter SEND completes
+	 * successfully; only overflow is a local length error. */
 	if (!ardma_recv_wr_total_len(r, &dst_off)) {
-		if (qp->rx_byte_len >= dst_off) {
-			if (qp->rx_byte_len != dst_off) {
-				qp->rx_truncated = true;
-				atomic64_inc(&peer->rx_bad_shape);
-			}
-		} else if (eof == 3) {
+		if (qp->rx_byte_len > dst_off) {
 			qp->rx_truncated = true;
 			atomic64_inc(&peer->rx_bad_shape);
-		} else {
+		} else if (eof != 3) {
 			spin_unlock_irqrestore(&qp->recv_lock, flags);
 			ardma_qp_put(qp);
 			return;
@@ -1858,6 +2075,8 @@ static void ardma_rx_callback(struct tb_ring *ring, struct ring_frame *frame,
 	struct ardma_rx_frame *rf = container_of(frame, typeof(*rf), frame);
 	struct ardma_peer *peer = rf->peer;
 	struct device *dma_dev = tb_ring_dma_device(ring);
+	u32 qpn = rf->qpn ? rf->qpn :
+		((u32)receive_path << ARDMA_QPN_BASE_SHIFT);
 	u32 len;
 	int ret;
 
@@ -1878,11 +2097,10 @@ static void ardma_rx_callback(struct tb_ring *ring, struct ring_frame *frame,
 	/* The incoming path is the destination HopID. Apple's visible QPN is
 	 * HopID << 8 for the first QP shape we have observed. */
 	ardma_log_rx_event(peer, ARDMA_RX_EVT_FRAME,
-			   (u32)receive_path << 8, 0, 0, len, 0, 0,
+			   qpn, 0, 0, len, 0, 0,
 			   frame->sof, frame->eof, 0, 0, 0, false, 0, 0,
 			   -1, 0, 0);
-	ardma_rx_apple_frame(peer, (u32)receive_path << 8, rf->data, len,
-			     frame->eof);
+	ardma_rx_apple_frame(peer, qpn, rf->data, len, frame->eof);
 
 	dma_sync_single_for_device(dma_dev, rf->dma, ARDMA_FRAME_SIZE,
 				   DMA_FROM_DEVICE);
@@ -2633,11 +2851,19 @@ static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
 			qp->base.qp_num);
 		return -EOPNOTSUPP;
 	}
-	if (!peer || !peer->tx_ring || !peer->paths_enabled) {
+	if (!peer || !peer->tx_ring) {
 		pr_warn_ratelimited("send_apple[qp=0x%x]: peer=%p tx_ring=%p paths=%d -> ENOTCONN\n",
 			qp->base.qp_num, peer, peer ? peer->tx_ring : NULL,
 			peer ? peer->paths_enabled : -1);
 		return -ENOTCONN;
+	}
+	if (!READ_ONCE(peer->paths_enabled)) {
+		ret = ardma_enable_peer_paths(peer);
+		if (ret) {
+			pr_warn_ratelimited("send_apple[qp=0x%x]: lazy paths enable failed=%d -> ENOTCONN\n",
+				qp->base.qp_num, ret);
+			return ret;
+		}
 	}
 	if (!READ_ONCE(peer->tx_ring_running)) {
 		pr_warn_ratelimited("send_apple[qp=0x%x]: tx_ring_running=0 -> ESHUTDOWN\n",
@@ -2915,6 +3141,7 @@ static struct ib_mr *ardma_reg_user_mr(struct ib_pd *ibpd, u64 start,
 	mr->npages = npages;
 	refcount_set(&mr->refs, 1);
 	init_waitqueue_head(&mr->ref_wait);
+	INIT_LIST_HEAD(&mr->pd_link);
 
 	mr->pages = kvcalloc(npages, sizeof(*mr->pages), GFP_KERNEL);
 	if (!mr->pages) {
@@ -2993,14 +3220,47 @@ static int ardma_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
 {
 	struct ardma_mr *mr = container_of(ibmr, struct ardma_mr, base);
 	struct ardma_pd *pd = container_of(ibmr->pd, struct ardma_pd, base);
+	struct ardma_ibdev *dev =
+		container_of(ibmr->device, struct ardma_ibdev, base);
 	unsigned long flags;
+	unsigned int timeout_ms;
 
 	spin_lock_irqsave(&pd->mr_lock, flags);
-	mr->dying = true;
-	list_del(&mr->pd_link);
+	if (!mr->dying) {
+		mr->dying = true;
+		list_del_init(&mr->pd_link);
+	}
 	spin_unlock_irqrestore(&pd->mr_lock, flags);
 
-	wait_event(mr->ref_wait, refcount_read(&mr->refs) == 1);
+	timeout_ms = READ_ONCE(mr_dereg_timeout_ms);
+	if (timeout_ms) {
+		unsigned long timeout = msecs_to_jiffies(timeout_ms);
+
+		if (!wait_event_timeout(mr->ref_wait,
+					refcount_read(&mr->refs) == 1,
+					timeout)) {
+			struct ardma_peer *peer = dev->peer;
+
+			pr_warn("dereg_mr lkey=0x%x refs=%u after %u ms; forcing TX ring drain\n",
+				mr->base.lkey, refcount_read(&mr->refs),
+				timeout_ms);
+			if (peer && peer->tx_ring) {
+				ardma_stop_tx_ring(peer);
+				wait_event_timeout(mr->ref_wait,
+						   refcount_read(&mr->refs) == 1,
+						   msecs_to_jiffies(2000));
+				ardma_restart_tx_ring(peer);
+			}
+			if (refcount_read(&mr->refs) != 1) {
+				pr_warn("dereg_mr lkey=0x%x still busy refs=%u; leaving MR for retry\n",
+					mr->base.lkey,
+					refcount_read(&mr->refs));
+				return -EBUSY;
+			}
+		}
+	} else {
+		wait_event(mr->ref_wait, refcount_read(&mr->refs) == 1);
+	}
 	if (mr->dma_addrs && mr->dma_dev) {
 		int i;
 
@@ -3200,6 +3460,7 @@ static int ardma_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 			ardma_peer_put(peer);
 			return ret;
 		}
+		ardma_peer_qp_activate(qp, peer);
 	}
 
 	pr_info("create_qp %s qpn=0x%x peer=%s peer_count=%d\n",
@@ -3368,12 +3629,7 @@ static int ardma_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 			/* Restart the ring so future post_sends on other QPs
 			 * (or a fresh QP create on this peer) don't get
 			 * permanent ESHUTDOWN. */
-			mutex_lock(&qp->peer->tx_lock);
-			if (qp->peer->tx_ring && !qp->peer->tx_ring_running) {
-				tb_ring_start(qp->peer->tx_ring);
-				qp->peer->tx_ring_running = true;
-			}
-			mutex_unlock(&qp->peer->tx_lock);
+			ardma_restart_tx_ring(qp->peer);
 		}
 
 		if (!drained) {
@@ -3389,6 +3645,7 @@ static int ardma_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 				ardma_free_qpn(ibqp->qp_num);
 				qp->qpn_allocated = false;
 			}
+			ardma_peer_qp_deactivate(qp);
 			ardma_peer_put(qp->peer);
 			qp->peer = NULL;
 			return -ETIMEDOUT;
@@ -3400,9 +3657,9 @@ static int ardma_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 	spin_lock_irqsave(&qp->recv_lock, flags);
 	list_for_each_entry_safe(r, tmp, &qp->recv_q, list) {
 		list_del(&r->list);
-		ardma_recv_wr_free(r);
+		ardma_recv_wr_release(qp, r);
 	}
-	ardma_recv_wr_free(qp->rx_wr);
+	ardma_recv_wr_release(qp, qp->rx_wr);
 	qp->rx_wr = NULL;
 	spin_unlock_irqrestore(&qp->recv_lock, flags);
 	ardma_tx_pool_destroy(qp);
@@ -3415,6 +3672,7 @@ static int ardma_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 		ardma_free_qpn(ibqp->qp_num);
 		qp->qpn_allocated = false;
 	}
+	ardma_peer_qp_deactivate(qp);
 	ardma_peer_put(qp->peer);
 	qp->peer = NULL;
 	return 0;
@@ -3426,6 +3684,7 @@ static int ardma_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
 	struct ardma_qp *qp = container_of(ibqp, struct ardma_qp, base);
 	struct ardma_pd *pd = container_of(qp->base.pd, struct ardma_pd, base);
 	unsigned long flags;
+	bool posted = false;
 
 	if (qp->state != IB_QPS_INIT && qp->state != IB_QPS_RTR &&
 	    qp->state != IB_QPS_RTS && qp->state != IB_QPS_SQD &&
@@ -3477,7 +3736,56 @@ static int ardma_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
 				return ret;
 			}
 		}
-		ardma_recv_wr_total_len(r, &total_len);
+		if (ardma_recv_wr_total_len(r, &total_len) ||
+		    total_len > ARDMA_MAX_MSG_SIZE) {
+			ardma_recv_wr_free(r);
+			if (bad_wr)
+				*bad_wr = wr;
+			return -EMSGSIZE;
+		}
+
+		if (READ_ONCE(raw_rx_credit_guard) &&
+		    ardma_peer_rx_raw(qp->peer)) {
+			u32 credits = ardma_apple_raw_rx_credits(total_len);
+			u32 budget = ardma_peer_raw_rx_credit_budget(qp->peer);
+			u32 max_recv = READ_ONCE(raw_rx_max_recv_bytes);
+			int reserved;
+
+			if (max_recv && total_len > max_recv) {
+				pr_warn_ratelimited("post_recv[qp=0x%x]: rejecting Apple RAW recv len=%u max=%u\n",
+						    ibqp->qp_num, total_len,
+						    max_recv);
+				ardma_recv_wr_free(r);
+				if (bad_wr)
+					*bad_wr = wr;
+				return -EMSGSIZE;
+			}
+
+			if (!budget || credits > budget) {
+				pr_warn_ratelimited("post_recv[qp=0x%x]: rejecting Apple RAW recv len=%u credits=%u budget=%u\n",
+						    ibqp->qp_num, total_len,
+						    credits, budget);
+				ardma_recv_wr_free(r);
+				if (bad_wr)
+					*bad_wr = wr;
+				return -EMSGSIZE;
+			}
+
+			reserved = atomic_add_return(credits,
+						     &qp->peer->raw_rx_credits_reserved);
+			if (reserved > budget) {
+				atomic_sub(credits,
+					   &qp->peer->raw_rx_credits_reserved);
+				pr_warn_ratelimited("post_recv[qp=0x%x]: rejecting Apple RAW recv window len=%u credits=%u reserved=%d budget=%u\n",
+						    ibqp->qp_num, total_len,
+						    credits, reserved, budget);
+				ardma_recv_wr_free(r);
+				if (bad_wr)
+					*bad_wr = wr;
+				return -ENOMEM;
+			}
+			r->raw_rx_credits = credits;
+		}
 
 		spin_lock_irqsave(&qp->recv_lock, flags);
 		list_add_tail(&r->list, &qp->recv_q);
@@ -3490,7 +3798,18 @@ static int ardma_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
 				   qp->rx_pending_ready_count,
 				   qp->rx_pending_active, qp->rx_piece, 0);
 		spin_unlock_irqrestore(&qp->recv_lock, flags);
+		posted = true;
 	}
+
+	if (posted && qp->peer && !READ_ONCE(qp->peer->paths_enabled)) {
+		int ret = ardma_enable_peer_paths(qp->peer);
+
+		if (ret) {
+			pr_warn_ratelimited("post_recv[qp=0x%x]: lazy paths enable failed=%d\n",
+					    ibqp->qp_num, ret);
+		}
+	}
+
 	for (;;) {
 		struct ardma_recv_wr *r;
 		enum ib_wc_status status;
@@ -3892,20 +4211,25 @@ static u32 ardma_rx_frame_capacity(unsigned int depth)
 	return depth - ARDMA_RING_RESERVE;
 }
 
-static int ardma_alloc_rx_frames(struct ardma_peer *peer)
+static int ardma_alloc_rx_frames_for(struct ardma_peer *peer,
+				     struct tb_ring *rx_ring,
+				     struct ardma_rx_frame **frames_out,
+				     u32 *capacity_io, u32 qpn)
 {
-	struct device *dma_dev = tb_ring_dma_device(peer->rx_ring);
-	u32 count = peer->rx_frame_capacity;
+	struct device *dma_dev = tb_ring_dma_device(rx_ring);
+	struct ardma_rx_frame *frames;
+	u32 count = *capacity_io;
 	u32 i;
 
-	peer->rx_frames = kcalloc(count, sizeof(*peer->rx_frames), GFP_KERNEL);
-	if (!peer->rx_frames)
+	frames = kcalloc(count, sizeof(*frames), GFP_KERNEL);
+	if (!frames)
 		return -ENOMEM;
 
 	for (i = 0; i < count; i++) {
-		struct ardma_rx_frame *rf = &peer->rx_frames[i];
+		struct ardma_rx_frame *rf = &frames[i];
 
 		rf->peer = peer;
+		rf->qpn = qpn;
 		rf->data = kmalloc(ARDMA_FRAME_SIZE, GFP_KERNEL);
 		if (!rf->data)
 			goto err;
@@ -3921,6 +4245,7 @@ static int ardma_alloc_rx_frames(struct ardma_peer *peer)
 		rf->frame.callback = ardma_rx_callback;
 		INIT_LIST_HEAD(&rf->frame.list);
 	}
+	*frames_out = frames;
 	return 0;
 
 err:
@@ -3928,7 +4253,7 @@ err:
 		struct ardma_rx_frame *rf;
 
 		i--;
-		rf = &peer->rx_frames[i];
+		rf = &frames[i];
 
 		if (rf->data) {
 			dma_unmap_single(dma_dev, rf->dma, ARDMA_FRAME_SIZE,
@@ -3936,32 +4261,48 @@ err:
 			kfree(rf->data);
 		}
 	}
-	kfree(peer->rx_frames);
-	peer->rx_frames = NULL;
-	peer->rx_frame_capacity = 0;
+	kfree(frames);
+	*frames_out = NULL;
+	*capacity_io = 0;
 	return -ENOMEM;
 }
 
-static u32 ardma_rx_post_count(struct ardma_peer *peer)
+static int ardma_alloc_rx_frames(struct ardma_peer *peer)
+{
+	u32 qpn = (u32)receive_path << ARDMA_QPN_BASE_SHIFT;
+
+	return ardma_alloc_rx_frames_for(peer, peer->rx_ring, &peer->rx_frames,
+					 &peer->rx_frame_capacity, qpn);
+}
+
+static u32 ardma_rx_post_count_for(struct ardma_peer *peer, u32 capacity)
 {
 	unsigned int requested = READ_ONCE(rx_post_frames);
-	u32 max = peer->rx_frame_capacity;
+	u32 max = capacity;
 
 	if (!requested || requested > max)
 		return peer->rx_raw_wire ? max : min_t(u32, 64, max);
 	return requested;
 }
 
-static void ardma_free_rx_frames(struct ardma_peer *peer)
+static u32 ardma_rx_post_count(struct ardma_peer *peer)
+{
+	return ardma_rx_post_count_for(peer, peer->rx_frame_capacity);
+}
+
+static void ardma_free_rx_frames_for(struct tb_ring *rx_ring,
+				     struct ardma_rx_frame **frames_io,
+				     u32 *capacity_io)
 {
 	struct device *dma_dev;
+	struct ardma_rx_frame *frames = *frames_io;
 	u32 i;
 
-	if (!peer->rx_frames || !peer->rx_ring)
+	if (!frames || !rx_ring)
 		return;
-	dma_dev = tb_ring_dma_device(peer->rx_ring);
-	for (i = 0; i < peer->rx_frame_capacity; i++) {
-		struct ardma_rx_frame *rf = &peer->rx_frames[i];
+	dma_dev = tb_ring_dma_device(rx_ring);
+	for (i = 0; i < *capacity_io; i++) {
+		struct ardma_rx_frame *rf = &frames[i];
 
 		if (rf->data) {
 			dma_unmap_single(dma_dev, rf->dma, ARDMA_FRAME_SIZE,
@@ -3969,9 +4310,15 @@ static void ardma_free_rx_frames(struct ardma_peer *peer)
 			kfree(rf->data);
 		}
 	}
-	kfree(peer->rx_frames);
-	peer->rx_frames = NULL;
-	peer->rx_frame_capacity = 0;
+	kfree(frames);
+	*frames_io = NULL;
+	*capacity_io = 0;
+}
+
+static void ardma_free_rx_frames(struct ardma_peer *peer)
+{
+	ardma_free_rx_frames_for(peer->rx_ring, &peer->rx_frames,
+				 &peer->rx_frame_capacity);
 }
 
 /* RX polling support (rx_poll_mode=1).
@@ -4019,12 +4366,146 @@ static int ardma_rx_poll_thread(void *data)
 	return 0;
 }
 
+static void ardma_teardown_extra_lane(struct ardma_peer *peer,
+				      struct ardma_path_lane *lane)
+{
+	if (lane->paths_enabled) {
+		tb_xdomain_disable_paths(peer->xd, lane->local_out_hop,
+					 lane->tx_ring ? lane->tx_ring->hop : -1,
+					 lane->local_in_hop,
+					 lane->rx_ring ? lane->rx_ring->hop : -1);
+		lane->paths_enabled = false;
+	}
+	if (lane->rx_ring) {
+		tb_ring_stop(lane->rx_ring);
+		ardma_free_rx_frames_for(lane->rx_ring, &lane->rx_frames,
+					 &lane->rx_frame_capacity);
+		tb_ring_free(lane->rx_ring);
+		lane->rx_ring = NULL;
+	}
+	if (lane->tx_ring) {
+		if (lane->tx_ring_running)
+			tb_ring_stop(lane->tx_ring);
+		lane->tx_ring_running = false;
+		tb_ring_free(lane->tx_ring);
+		lane->tx_ring = NULL;
+	}
+	if (lane->local_in_hop >= 0) {
+		tb_xdomain_release_in_hopid(peer->xd, lane->local_in_hop);
+		lane->local_in_hop = -1;
+	}
+	if (lane->local_out_hop >= 0) {
+		tb_xdomain_release_out_hopid(peer->xd, lane->local_out_hop);
+		lane->local_out_hop = -1;
+	}
+	lane->rx_posted_frames = 0;
+	lane->qpn = 0;
+}
+
+static int ardma_setup_extra_lane(struct ardma_peer *peer, unsigned int lane_idx,
+				  unsigned int depth, unsigned int tx_ring_flags,
+				  unsigned int rx_ring_flags, u16 rx_sof_mask,
+				  u16 rx_eof_mask)
+{
+	struct tb_xdomain *xd = peer->xd;
+	struct ardma_path_lane *lane = &peer->extra_lanes[lane_idx - 1];
+	int path = receive_path + lane_idx;
+	u32 post_count;
+	u32 i;
+	int ret;
+
+	lane->local_in_hop = -1;
+	lane->local_out_hop = -1;
+	lane->qpn = (u32)path << ARDMA_QPN_BASE_SHIFT;
+
+	ret = tb_xdomain_alloc_in_hopid(xd, path);
+	if (ret != path) {
+		if (ret >= 0) {
+			tb_xdomain_release_in_hopid(xd, ret);
+			ret = -EINVAL;
+		}
+		pr_warn("lane %u: alloc_in_hopid(%d) failed: %d\n",
+			lane_idx, path, ret);
+		return ret;
+	}
+	lane->local_in_hop = ret;
+
+	ret = tb_xdomain_alloc_out_hopid(xd, path);
+	if (ret != path) {
+		if (ret >= 0) {
+			tb_xdomain_release_out_hopid(xd, ret);
+			ret = -EINVAL;
+		}
+		pr_warn("lane %u: alloc_out_hopid(%d) failed: %d\n",
+			lane_idx, path, ret);
+		goto err;
+	}
+	lane->local_out_hop = ret;
+
+	lane->tx_ring = tb_ring_alloc_tx(xd->tb->nhi, -1, depth,
+					 tx_ring_flags);
+	if (!lane->tx_ring) {
+		ret = -ENOMEM;
+		pr_warn("lane %u: TX ring allocation failed\n", lane_idx);
+		goto err;
+	}
+
+	lane->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, -1, depth,
+					 rx_ring_flags, lane->tx_ring->hop,
+					 rx_sof_mask, rx_eof_mask, NULL, NULL);
+	if (!lane->rx_ring) {
+		ret = -ENOMEM;
+		pr_warn("lane %u: RX ring allocation failed\n", lane_idx);
+		goto err;
+	}
+
+	lane->rx_frame_capacity = ardma_rx_frame_capacity(depth);
+	ret = ardma_alloc_rx_frames_for(peer, lane->rx_ring, &lane->rx_frames,
+					&lane->rx_frame_capacity, lane->qpn);
+	if (ret)
+		goto err;
+	post_count = ardma_rx_post_count_for(peer, lane->rx_frame_capacity);
+	lane->rx_posted_frames = post_count;
+
+	tb_ring_start(lane->tx_ring);
+	lane->tx_ring_running = true;
+	tb_ring_start(lane->rx_ring);
+
+	for (i = 0; i < post_count; i++) {
+		ret = tb_ring_rx(lane->rx_ring, &lane->rx_frames[i].frame);
+		if (ret) {
+			pr_warn("lane %u: post RX frame %u failed: %d\n",
+				lane_idx, i, ret);
+			goto err;
+		}
+	}
+
+	ret = tb_xdomain_enable_paths(xd, lane->local_out_hop,
+				      lane->tx_ring->hop, lane->local_in_hop,
+				      lane->rx_ring->hop);
+	if (ret) {
+		pr_warn("lane %u: enable_paths failed: %d\n", lane_idx, ret);
+		goto err;
+	}
+	lane->paths_enabled = true;
+	pr_info("lane %u active: in_path=%d rx_hop=%d out_path=%d tx_hop=%d qpn=0x%x posted=%u/%u\n",
+		lane_idx, lane->local_in_hop, lane->rx_ring->hop,
+		lane->local_out_hop, lane->tx_ring->hop, lane->qpn,
+		lane->rx_posted_frames, lane->rx_frame_capacity);
+	return 0;
+
+err:
+	ardma_teardown_extra_lane(peer, lane);
+	return ret;
+}
+
 static int ardma_setup_rings(struct ardma_peer *peer)
 {
 	struct tb_xdomain *xd = peer->xd;
 	unsigned int tx_ring_flags = READ_ONCE(tx_e2e) ? RING_FLAG_E2E : 0;
 	unsigned int rx_ring_flags = READ_ONCE(rx_e2e) ? RING_FLAG_E2E : 0;
 	unsigned int depth = READ_ONCE(ring_depth);
+	unsigned int lanes = READ_ONCE(path_lanes);
 	u16 rx_sof_mask = ARDMA_RX_RAW_SOF_MASK;
 	u16 rx_eof_mask = ARDMA_RX_RAW_EOF_MASK;
 	int e2e_tx_hop;
@@ -4035,6 +4516,15 @@ static int ardma_setup_rings(struct ardma_peer *peer)
 		pr_warn("invalid ring_depth=%u (must be power-of-two %u..%u)\n",
 			depth, ARDMA_MIN_RING_DEPTH, ARDMA_MAX_RING_DEPTH);
 		return -EINVAL;
+	}
+	if (!lanes)
+		lanes = 1;
+	if (lanes > ARDMA_MAX_PATH_LANES)
+		lanes = ARDMA_MAX_PATH_LANES;
+	if (lanes > 1 && READ_ONCE(rx_poll_mode)) {
+		pr_warn("path_lanes=%u is not supported with rx_poll_mode=1\n",
+			lanes);
+		return -EOPNOTSUPP;
 	}
 	if (!READ_ONCE(tx_raw_mode))
 		tx_ring_flags |= RING_FLAG_FRAME;
@@ -4067,9 +4557,18 @@ static int ardma_setup_rings(struct ardma_peer *peer)
 	}
 	e2e_tx_hop = peer->tx_ring->hop;
 
-	ret = tb_xdomain_alloc_out_hopid(xd, -1);
+	ret = tb_xdomain_alloc_out_hopid(xd, lanes > 1 ? receive_path : -1);
 	if (ret < 0)
 		goto err_tx_ring;
+	if (lanes > 1 && ret != receive_path) {
+		if (ret >= 0) {
+			tb_xdomain_release_out_hopid(xd, ret);
+			ret = -EINVAL;
+		}
+		pr_warn("alloc_out_hopid(%d) for lane 0 failed: %d\n",
+			receive_path, ret);
+		goto err_tx_ring;
+	}
 	peer->local_out_hop = ret;
 
 	if (READ_ONCE(rx_poll_mode)) {
@@ -4143,8 +4642,23 @@ static int ardma_setup_rings(struct ardma_peer *peer)
 		peer->paths_enabled);
 	pr_info("ring_depth=%u posted %u/%u RX descriptors\n", depth,
 		peer->rx_posted_frames, peer->rx_frame_capacity);
+
+	for (i = 1; i < lanes; i++) {
+		ret = ardma_setup_extra_lane(peer, i, depth, tx_ring_flags,
+					     rx_ring_flags, rx_sof_mask,
+					     rx_eof_mask);
+		if (ret)
+			goto err_extra_lanes;
+		peer->extra_lane_count = i;
+	}
 	return 0;
 
+err_extra_lanes:
+	while (peer->extra_lane_count) {
+		ardma_teardown_extra_lane(peer,
+			&peer->extra_lanes[peer->extra_lane_count - 1]);
+		peer->extra_lane_count--;
+	}
 err_started:
 	if (peer->rx_poll_task) {
 		atomic_set(&peer->rx_poll_stop, 1);
@@ -4177,6 +4691,11 @@ err_in_hop:
 
 static void ardma_teardown_rings(struct ardma_peer *peer)
 {
+	while (peer->extra_lane_count) {
+		ardma_teardown_extra_lane(peer,
+			&peer->extra_lanes[peer->extra_lane_count - 1]);
+		peer->extra_lane_count--;
+	}
 	if (peer->paths_enabled) {
 		tb_xdomain_disable_paths(peer->xd, peer->local_out_hop,
 					 peer->tx_ring ? peer->tx_ring->hop : -1,
@@ -4217,6 +4736,11 @@ static int ardma_stats_show(struct seq_file *m, void *unused)
 
 	seq_printf(m, "receive_path: %d\n", receive_path);
 	seq_printf(m, "paths_enabled: %u\n", peer->paths_enabled);
+	seq_printf(m, "active_uc_qps: %u\n", READ_ONCE(peer->active_uc_qps));
+	seq_printf(m, "raw_rx_credits_reserved: %d\n",
+		   atomic_read(&peer->raw_rx_credits_reserved));
+	seq_printf(m, "raw_rx_credit_budget: %u\n",
+		   ardma_peer_raw_rx_credit_budget(peer));
 	seq_printf(m, "local_in_hop: %d\n", peer->local_in_hop);
 	seq_printf(m, "rx_hop: %d\n", peer->rx_ring ? peer->rx_ring->hop : -1);
 	seq_printf(m, "local_out_hop: %d\n", peer->local_out_hop);
@@ -4484,6 +5008,11 @@ static int ardma_nhi_stall_dump_show(struct seq_file *m, void *unused)
 
 	seq_printf(m, "receive_path: %d\n", receive_path);
 	seq_printf(m, "paths_enabled: %u\n", peer->paths_enabled);
+	seq_printf(m, "active_uc_qps: %u\n", READ_ONCE(peer->active_uc_qps));
+	seq_printf(m, "raw_rx_credits_reserved: %d\n",
+		   atomic_read(&peer->raw_rx_credits_reserved));
+	seq_printf(m, "raw_rx_credit_budget: %u\n",
+		   ardma_peer_raw_rx_credit_budget(peer));
 	seq_printf(m, "local_in_hop: %d\n", peer->local_in_hop);
 	seq_printf(m, "local_out_hop: %d\n", peer->local_out_hop);
 	seq_printf(m, "remote_is_apple: %u\n", peer->remote_is_apple);
@@ -5860,6 +6389,15 @@ static int __init ardma_init(void)
 	if (receive_path <= 0 || receive_path > (ARDMA_QPN_MAX >> 8)) {
 		pr_err("invalid receive_path %d for Apple-shaped QPNs\n",
 		       receive_path);
+		return -EINVAL;
+	}
+	if (!path_lanes)
+		path_lanes = 1;
+	if (path_lanes > ARDMA_MAX_PATH_LANES)
+		path_lanes = ARDMA_MAX_PATH_LANES;
+	if (receive_path + path_lanes - 1 > (ARDMA_QPN_MAX >> 8)) {
+		pr_err("receive_path=%d path_lanes=%u exceeds Apple-shaped QPN range\n",
+		       receive_path, path_lanes);
 		return -EINVAL;
 	}
 
