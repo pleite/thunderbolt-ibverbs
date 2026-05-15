@@ -4,6 +4,7 @@
 
 #include <linux/atomic.h>
 #include <linux/bitops.h>
+#include <linux/completion.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/refcount.h>
@@ -153,6 +154,8 @@ struct tbv_rail {
 	struct tbv_rail_key key;
 	struct tbv_path path;
 	struct delayed_work native_work;
+	refcount_t refcnt;
+	struct completion refs_zero;
 	u32 rail_id;
 	u32 link_speed;
 	u32 link_width;
@@ -164,6 +167,7 @@ struct tbv_rail {
 	u32 native_ready_attempts;
 	int native_last_error;
 	bool active;
+	bool removing;
 	bool native_negotiated;
 	bool native_ready_sent;
 	bool native_remote_ready;
@@ -346,6 +350,7 @@ void tbv_peer_put(struct tbv_state *state, struct tbv_peer *peer);
 struct tbv_rail *tbv_peer_add_rail(struct tbv_peer *peer,
 				   const struct tbv_rail_key *key);
 void tbv_peer_remove_rail(struct tbv_rail *rail);
+void tbv_rail_put(struct tbv_rail *rail);
 void tbv_path_default_config(enum tbv_backend_type backend,
 			     struct tbv_path_config *cfg);
 void tbv_path_init(struct tbv_path *path,

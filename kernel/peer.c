@@ -97,6 +97,8 @@ struct tbv_rail *tbv_peer_add_rail(struct tbv_peer *peer,
 
 	rail->key = *key;
 	rail->rail_id = tbv_rail_key_hash(key);
+	refcount_set(&rail->refcnt, 1);
+	init_completion(&rail->refs_zero);
 	rail->active = true;
 	rail->remote_transmit_path = -1;
 	rail->remote_tx_hop = -1;
@@ -145,6 +147,7 @@ void tbv_peer_remove_rail(struct tbv_rail *rail)
 
 	peer = rail->peer;
 	mutex_lock(&peer->state->lock);
+	rail->removing = true;
 	if (!list_empty(&rail->node)) {
 		list_del_init(&rail->node);
 		if (peer->nr_rails)
@@ -153,6 +156,14 @@ void tbv_peer_remove_rail(struct tbv_rail *rail)
 	mutex_unlock(&peer->state->lock);
 
 	tbv_native_control_cancel_rail(rail);
+	tbv_rail_put(rail);
+	wait_for_completion(&rail->refs_zero);
 	tbv_path_destroy(&rail->path, peer->xd);
 	kfree(rail);
+}
+
+void tbv_rail_put(struct tbv_rail *rail)
+{
+	if (refcount_dec_and_test(&rail->refcnt))
+		complete(&rail->refs_zero);
 }
