@@ -30,6 +30,7 @@
 #include <linux/list.h>
 #include <linux/kthread.h>
 #include <linux/completion.h>
+#include <linux/workqueue.h>
 #include <linux/atomic.h>
 #include <linux/sched.h>
 #include <linux/err.h>
@@ -336,6 +337,11 @@ module_param(mr_dereg_timeout_ms, uint, 0644);
 MODULE_PARM_DESC(mr_dereg_timeout_ms,
 		 "Milliseconds to wait for MR refs before forcing TX drain; 0 waits forever (default: 5000)");
 
+static unsigned int rx_partial_timeout_ms = 1000;
+module_param(rx_partial_timeout_ms, uint, 0644);
+MODULE_PARM_DESC(rx_partial_timeout_ms,
+		 "Milliseconds before a partial RX WR is flushed and the QP is moved to ERR; 0 disables (default: 1000)");
+
 static bool enable_paths_on_setup = true;
 module_param(enable_paths_on_setup, bool, 0444);
 MODULE_PARM_DESC(enable_paths_on_setup,
@@ -453,6 +459,7 @@ struct ardma_qp {
 	bool registered;
 	bool peer_qp_active;
 	bool sq_sig_all;
+	bool closing;
 
 	spinlock_t recv_lock;
 	struct list_head recv_q;
@@ -460,12 +467,15 @@ struct ardma_qp {
 	struct ardma_recv_wr *rx_wr;
 	u32 rx_piece;
 	u32 rx_byte_len;
+	u64 rx_last_progress_ns;
 	bool rx_truncated;
+	bool rx_copy_active;
 	struct ardma_pending_rx rx_pending[ARDMA_PENDING_RX_SLOTS];
 	u8 rx_pending_head;
 	u8 rx_pending_tail;
 	u8 rx_pending_ready_count;
 	int rx_pending_active;
+	struct delayed_work rx_timeout_work;
 
 	spinlock_t send_lock;
 	u64 last_post_send_ns;
@@ -609,6 +619,7 @@ enum ardma_rx_event_type {
 	ARDMA_RX_EVT_MSG_DONE,
 	ARDMA_RX_EVT_RECV_CQE,
 	ARDMA_RX_EVT_RAW_COPY,
+	ARDMA_RX_EVT_QP_ERROR,
 };
 
 struct ardma_rx_event_entry {
@@ -690,6 +701,8 @@ struct ardma_peer {
 	atomic64_t rx_drops;
 	atomic64_t rx_bad_shape;
 	atomic64_t rx_no_qp;
+	atomic64_t rx_partial_timeouts;
+	atomic64_t rx_flush_cqes;
 	atomic64_t tx_frames;
 	atomic64_t tx_completions;
 	atomic64_t tx_errors;
@@ -727,6 +740,7 @@ static LIST_HEAD(ardma_ctrl_list);
 
 static int ardma_ctrl_callback(const void *buf, size_t size, void *data);
 static void ardma_peer_put(struct ardma_peer *peer);
+static void ardma_qp_unregister(struct ardma_qp *qp);
 static int ardma_peer_qp_activate(struct ardma_qp *qp, struct ardma_peer *peer);
 
 static bool ardma_xdomain_is_apple(const struct tb_xdomain *xd)
@@ -828,6 +842,8 @@ static const char *ardma_rx_event_name(u8 type)
 		return "recv_cqe";
 	case ARDMA_RX_EVT_RAW_COPY:
 		return "raw_copy";
+	case ARDMA_RX_EVT_QP_ERROR:
+		return "qp_error";
 	default:
 		return "unknown";
 	}
@@ -1538,6 +1554,20 @@ static void ardma_qp_put(struct ardma_qp *qp)
 		wake_up(&qp->ref_wait);
 }
 
+static void ardma_qp_unregister(struct ardma_qp *qp)
+{
+	unsigned long flags;
+
+	if (!qp || !qp->registered)
+		return;
+
+	spin_lock_irqsave(&ardma_qp_lock, flags);
+	if (!list_empty(&qp->qps_link))
+		list_del_init(&qp->qps_link);
+	spin_unlock_irqrestore(&ardma_qp_lock, flags);
+	qp->registered = false;
+}
+
 static void ardma_stop_tx_ring(struct ardma_peer *peer)
 {
 	if (!peer || !peer->tx_ring)
@@ -1819,6 +1849,139 @@ static void ardma_push_rx_wc(struct ardma_qp *qp, struct ardma_recv_wr *r,
 	ardma_recv_wr_release(qp, r);
 }
 
+static void ardma_qp_schedule_rx_timeout(struct ardma_qp *qp)
+{
+	unsigned int timeout_ms = READ_ONCE(rx_partial_timeout_ms);
+
+	if (!timeout_ms || !qp || READ_ONCE(qp->closing))
+		return;
+	mod_delayed_work(system_wq, &qp->rx_timeout_work,
+			 msecs_to_jiffies(timeout_ms));
+}
+
+static void ardma_qp_cancel_rx_timeout(struct ardma_qp *qp)
+{
+	if (qp)
+		cancel_delayed_work_sync(&qp->rx_timeout_work);
+}
+
+static void ardma_qp_flush_rx(struct ardma_qp *qp,
+			      enum ib_wc_status status,
+			      bool include_active)
+{
+	LIST_HEAD(flush_list);
+	struct ardma_recv_wr *active = NULL;
+	struct ardma_recv_wr *r, *tmp;
+	struct ardma_peer *peer;
+	unsigned long flags;
+	u32 flushed = 0;
+	int i;
+
+	if (!qp)
+		return;
+
+	peer = qp->peer;
+	spin_lock_irqsave(&qp->recv_lock, flags);
+	if (include_active && qp->rx_wr && !qp->rx_copy_active) {
+		active = qp->rx_wr;
+		qp->rx_wr = NULL;
+		qp->rx_piece = 0;
+		qp->rx_byte_len = 0;
+		qp->rx_truncated = false;
+	}
+	list_splice_init(&qp->recv_q, &flush_list);
+	qp->recv_q_depth = 0;
+	for (i = 0; i < ARDMA_PENDING_RX_SLOTS; i++) {
+		qp->rx_pending[i].len = 0;
+		qp->rx_pending[i].active = false;
+		qp->rx_pending[i].ready = false;
+		qp->rx_pending[i].truncated = false;
+	}
+	qp->rx_pending_head = 0;
+	qp->rx_pending_tail = 0;
+	qp->rx_pending_ready_count = 0;
+	qp->rx_pending_active = -1;
+	spin_unlock_irqrestore(&qp->recv_lock, flags);
+
+	if (active) {
+		ardma_push_rx_wc(qp, active, 0, status);
+		flushed++;
+	}
+	list_for_each_entry_safe(r, tmp, &flush_list, list) {
+		list_del_init(&r->list);
+		ardma_push_rx_wc(qp, r, 0, status);
+		flushed++;
+	}
+	if (peer && flushed)
+		atomic64_add(flushed, &peer->rx_flush_cqes);
+}
+
+static void ardma_rx_timeout_work(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct ardma_qp *qp =
+		container_of(dwork, struct ardma_qp, rx_timeout_work);
+	struct ardma_peer *peer = qp->peer;
+	unsigned int timeout_ms = READ_ONCE(rx_partial_timeout_ms);
+	unsigned long flags;
+	u64 now, last, timeout_ns, elapsed_ns, delay_ns = 0;
+	bool timed_out = false;
+	bool reschedule = false;
+	enum ib_qp_state old_state;
+
+	if (!timeout_ms)
+		return;
+
+	timeout_ns = (u64)timeout_ms * NSEC_PER_MSEC;
+	spin_lock_irqsave(&qp->recv_lock, flags);
+	old_state = qp->state;
+	if (qp->closing || qp->state == IB_QPS_ERR || !qp->rx_wr) {
+		spin_unlock_irqrestore(&qp->recv_lock, flags);
+		return;
+	}
+	if (qp->rx_copy_active) {
+		reschedule = true;
+		delay_ns = timeout_ns;
+	} else {
+		now = ktime_get_ns();
+		last = qp->rx_last_progress_ns;
+		elapsed_ns = last ? now - last : timeout_ns;
+		if (elapsed_ns >= timeout_ns) {
+			qp->state = IB_QPS_ERR;
+			timed_out = true;
+		} else {
+			reschedule = true;
+			delay_ns = timeout_ns - elapsed_ns;
+		}
+	}
+	spin_unlock_irqrestore(&qp->recv_lock, flags);
+
+	if (reschedule) {
+		u64 delay_ms = DIV_ROUND_UP_ULL(delay_ns, NSEC_PER_MSEC);
+
+		mod_delayed_work(system_wq, &qp->rx_timeout_work,
+				 msecs_to_jiffies(max_t(u64, 1, delay_ms)));
+		return;
+	}
+	if (!timed_out)
+		return;
+
+	ardma_qp_unregister(qp);
+	if (peer) {
+		atomic64_inc(&peer->rx_partial_timeouts);
+		pr_warn_ratelimited("QP 0x%x partial RX timed out after %u ms; moving QP to ERR and flushing receives\n",
+				    qp->base.qp_num, timeout_ms);
+	}
+	ardma_log_rx_event(peer, ARDMA_RX_EVT_QP_ERROR, qp->base.qp_num,
+			   qp->attr.dest_qp_num, 0, refcount_read(&qp->refs),
+			   qp->rx_byte_len, 0, 0, 0, IB_WC_WR_FLUSH_ERR,
+			   old_state, IB_QPS_ERR, qp->registered,
+			   qp->recv_q_depth, qp->rx_pending_ready_count,
+			   qp->rx_pending_active, qp->rx_piece,
+			   -ETIMEDOUT);
+	ardma_qp_flush_rx(qp, IB_WC_WR_FLUSH_ERR, true);
+}
+
 static struct ardma_recv_wr *
 ardma_flush_pending_locked(struct ardma_qp *qp, u32 *byte_len,
 			   enum ib_wc_status *status)
@@ -1924,6 +2087,12 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 	pd = container_of(qp->base.pd, struct ardma_pd, base);
 
 	spin_lock_irqsave(&qp->recv_lock, flags);
+	if (qp->closing || qp->state == IB_QPS_ERR) {
+		spin_unlock_irqrestore(&qp->recv_lock, flags);
+		atomic64_inc(&peer->rx_drops);
+		ardma_qp_put(qp);
+		return;
+	}
 	if (!qp->rx_wr) {
 		bool buffer_pending = false;
 
@@ -2016,6 +2185,7 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 		qp->rx_wr = r;
 		qp->rx_piece = 0;
 		qp->rx_byte_len = 0;
+		qp->rx_last_progress_ns = ktime_get_ns();
 		qp->rx_truncated = false;
 		if (!ardma_recv_wr_total_len(r, &dst_off))
 			ardma_log_rx_event(peer, ARDMA_RX_EVT_WR_START, qpn,
@@ -2049,6 +2219,7 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 		 * the user portion (252 user + 4 CRC per 256-byte slot). */
 	}
 	r = qp->rx_wr;
+	qp->rx_copy_active = true;
 	spin_unlock_irqrestore(&qp->recv_lock, flags);
 
 	if (ardma_peer_rx_raw(peer)) {
@@ -2074,11 +2245,13 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 	}
 
 	spin_lock_irqsave(&qp->recv_lock, flags);
+	qp->rx_copy_active = false;
 	if (ret == -ERANGE)
 		qp->rx_truncated = true;
 	else if (ret)
 		qp->rx_truncated = true;
 	qp->rx_byte_len = max(qp->rx_byte_len, dst_off + copy_len);
+	qp->rx_last_progress_ns = ktime_get_ns();
 	/* The posted receive length is capacity. A shorter SEND completes
 	 * successfully; only overflow is a local length error. */
 	{
@@ -2111,6 +2284,7 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 				atomic64_inc(&peer->rx_bad_shape);
 			} else if (qp->rx_byte_len < expected_len && eof != 3) {
 				spin_unlock_irqrestore(&qp->recv_lock, flags);
+				ardma_qp_schedule_rx_timeout(qp);
 				ardma_qp_put(qp);
 				return;
 			}
@@ -2125,6 +2299,7 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 	spin_unlock_irqrestore(&qp->recv_lock, flags);
 
 	atomic64_inc(&peer->rx_messages);
+	cancel_delayed_work(&qp->rx_timeout_work);
 	ardma_complete_rx_wr(qp, complete_status);
 	ardma_qp_put(qp);
 	if (split_len)
@@ -3502,6 +3677,7 @@ static int ardma_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 	INIT_LIST_HEAD(&qp->recv_q);
 	INIT_LIST_HEAD(&qp->qps_link);
 	INIT_LIST_HEAD(&qp->tx_pool_free);
+	INIT_DELAYED_WORK(&qp->rx_timeout_work, ardma_rx_timeout_work);
 	qp->rx_pending_active = -1;
 	if (attr->qp_type == IB_QPT_UC) {
 		int i;
@@ -3666,11 +3842,7 @@ static int ardma_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 	}
 	if (qp->registered &&
 	    (qp->state == IB_QPS_RESET || qp->state == IB_QPS_ERR)) {
-		spin_lock_irqsave(&ardma_qp_lock, flags);
-		if (!list_empty(&qp->qps_link))
-			list_del_init(&qp->qps_link);
-		spin_unlock_irqrestore(&ardma_qp_lock, flags);
-		qp->registered = false;
+		ardma_qp_unregister(qp);
 	}
 
 	pr_info("modify_qp[0x%x]: %d -> %d dest=0x%x\n", ibqp->qp_num, old,
@@ -3697,9 +3869,14 @@ static int ardma_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 static int ardma_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 {
 	struct ardma_qp *qp = container_of(ibqp, struct ardma_qp, base);
-	struct ardma_recv_wr *r, *tmp;
 	unsigned long flags;
 	int i;
+
+	spin_lock_irqsave(&qp->recv_lock, flags);
+	qp->closing = true;
+	if (qp->state != IB_QPS_RESET)
+		qp->state = IB_QPS_ERR;
+	spin_unlock_irqrestore(&qp->recv_lock, flags);
 
 	ardma_log_rx_event(qp->peer, ARDMA_RX_EVT_QP_DESTROY, ibqp->qp_num,
 			   qp->attr.dest_qp_num, 0, refcount_read(&qp->refs),
@@ -3708,13 +3885,9 @@ static int ardma_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 			   qp->rx_pending_ready_count, qp->rx_pending_active,
 			   qp->rx_piece, 0);
 
-	if (qp->registered) {
-		spin_lock_irqsave(&ardma_qp_lock, flags);
-		if (!list_empty(&qp->qps_link))
-			list_del_init(&qp->qps_link);
-		spin_unlock_irqrestore(&ardma_qp_lock, flags);
-		qp->registered = false;
-	}
+	ardma_qp_unregister(qp);
+	ardma_qp_cancel_rx_timeout(qp);
+	ardma_qp_flush_rx(qp, IB_WC_WR_FLUSH_ERR, true);
 
 	if (refcount_read(&qp->refs) > 1 && qp->peer) {
 		/* Don't stop the peer's TX ring -- it is shared across all
@@ -3774,14 +3947,7 @@ static int ardma_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 			ibqp->qp_num);
 	}
 
-	spin_lock_irqsave(&qp->recv_lock, flags);
-	list_for_each_entry_safe(r, tmp, &qp->recv_q, list) {
-		list_del(&r->list);
-		ardma_recv_wr_release(qp, r);
-	}
-	ardma_recv_wr_release(qp, qp->rx_wr);
-	qp->rx_wr = NULL;
-	spin_unlock_irqrestore(&qp->recv_lock, flags);
+	ardma_qp_flush_rx(qp, IB_WC_WR_FLUSH_ERR, true);
 	ardma_tx_pool_destroy(qp);
 	for (i = 0; i < ARDMA_PENDING_RX_SLOTS; i++) {
 		kfree(qp->rx_pending[i].buf);
@@ -4947,6 +5113,10 @@ static int ardma_stats_show(struct seq_file *m, void *unused)
 		   (long long)atomic64_read(&peer->rx_bad_shape));
 	seq_printf(m, "rx_no_qp: %lld\n",
 		   (long long)atomic64_read(&peer->rx_no_qp));
+	seq_printf(m, "rx_partial_timeouts: %lld\n",
+		   (long long)atomic64_read(&peer->rx_partial_timeouts));
+	seq_printf(m, "rx_flush_cqes: %lld\n",
+		   (long long)atomic64_read(&peer->rx_flush_cqes));
 	seq_printf(m, "tx_frames: %lld\n",
 		   (long long)atomic64_read(&peer->tx_frames));
 	seq_printf(m, "tx_completions: %lld\n",
