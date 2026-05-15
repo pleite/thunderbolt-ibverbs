@@ -2,6 +2,7 @@
 #ifndef TBV_H
 #define TBV_H
 
+#include <linux/atomic.h>
 #include <linux/bitops.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
@@ -196,6 +197,11 @@ struct tbv_state {
 	bool register_verbs;
 	bool services_registered;
 	bool verbs_registered;
+	atomic_t verbs_ucontexts;
+	atomic_t verbs_pds;
+	atomic_t verbs_cqs;
+	atomic_t verbs_qps;
+	atomic_t verbs_mrs;
 	struct tbv_ibdev *ibdev;
 };
 

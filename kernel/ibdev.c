@@ -26,19 +26,23 @@
 
 struct tbv_ucontext {
 	struct ib_ucontext base;
+	struct tbv_state *owner;
 };
 
 struct tbv_pd {
 	struct ib_pd base;
+	struct tbv_state *owner;
 };
 
 struct tbv_cq {
 	struct ib_cq base;
+	struct tbv_state *owner;
 	u32 cqe;
 };
 
 struct tbv_qp {
 	struct ib_qp base;
+	struct tbv_state *owner;
 	struct ib_qp_init_attr init_attr;
 	struct ib_qp_attr attr;
 	enum ib_qp_state state;
@@ -48,6 +52,7 @@ struct tbv_qp {
 
 struct tbv_mr {
 	struct ib_mr base;
+	struct tbv_state *owner;
 	u64 start;
 	u64 length;
 	u64 virt_addr;
@@ -61,6 +66,13 @@ struct tbv_ibdev {
 
 static DEFINE_IDA(tbv_qpn_ida);
 static atomic_t tbv_mr_key = ATOMIC_INIT(1);
+
+static struct tbv_state *tbv_ibdev_state(struct ib_device *ibdev)
+{
+	struct tbv_ibdev *dev = container_of(ibdev, struct tbv_ibdev, base);
+
+	return dev->state;
+}
 
 static bool tbv_ibdev_port_active(struct tbv_state *state)
 {
@@ -188,20 +200,38 @@ static int tbv_query_pkey(struct ib_device *ibdev, u32 port_num, u16 index,
 static int tbv_alloc_ucontext(struct ib_ucontext *context,
 			      struct ib_udata *udata)
 {
+	struct tbv_ucontext *ctx = container_of(context, struct tbv_ucontext,
+						base);
+
+	ctx->owner = tbv_ibdev_state(context->device);
+	atomic_inc(&ctx->owner->verbs_ucontexts);
 	return 0;
 }
 
 static void tbv_dealloc_ucontext(struct ib_ucontext *context)
 {
+	struct tbv_ucontext *ctx = container_of(context, struct tbv_ucontext,
+						base);
+
+	if (ctx->owner)
+		atomic_dec(&ctx->owner->verbs_ucontexts);
 }
 
 static int tbv_alloc_pd(struct ib_pd *pd, struct ib_udata *udata)
 {
+	struct tbv_pd *tpd = container_of(pd, struct tbv_pd, base);
+
+	tpd->owner = tbv_ibdev_state(pd->device);
+	atomic_inc(&tpd->owner->verbs_pds);
 	return 0;
 }
 
 static int tbv_dealloc_pd(struct ib_pd *pd, struct ib_udata *udata)
 {
+	struct tbv_pd *tpd = container_of(pd, struct tbv_pd, base);
+
+	if (tpd->owner)
+		atomic_dec(&tpd->owner->verbs_pds);
 	return 0;
 }
 
@@ -212,12 +242,18 @@ static int tbv_create_cq(struct ib_cq *cq, const struct ib_cq_init_attr *attr,
 
 	if (!attr || attr->cqe <= 0 || attr->cqe > TBV_IBDEV_MAX_CQE)
 		return -EINVAL;
+	tcq->owner = tbv_ibdev_state(cq->device);
 	tcq->cqe = attr->cqe;
+	atomic_inc(&tcq->owner->verbs_cqs);
 	return 0;
 }
 
 static int tbv_destroy_cq(struct ib_cq *cq, struct ib_udata *udata)
 {
+	struct tbv_cq *tcq = container_of(cq, struct tbv_cq, base);
+
+	if (tcq->owner)
+		atomic_dec(&tcq->owner->verbs_cqs);
 	return 0;
 }
 
@@ -243,11 +279,13 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 		return qpn;
 
 	tqp->init_attr = *init_attr;
+	tqp->owner = tbv_ibdev_state(qp->device);
 	tqp->state = IB_QPS_RESET;
 	tqp->type = init_attr->qp_type;
 	tqp->qpn_allocated = true;
 	qp->qp_num = qpn;
 	init_attr->cap.max_inline_data = 0;
+	atomic_inc(&tqp->owner->verbs_qps);
 	return 0;
 }
 
@@ -259,6 +297,8 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 		ida_free(&tbv_qpn_ida, qp->qp_num);
 		tqp->qpn_allocated = false;
 	}
+	if (tqp->owner)
+		atomic_dec(&tqp->owner->verbs_qps);
 	return 0;
 }
 
@@ -334,10 +374,12 @@ static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	key = atomic_inc_return(&tbv_mr_key);
 	mr->base.lkey = key;
 	mr->base.rkey = key;
+	mr->owner = tbv_ibdev_state(pd->device);
 	mr->start = start;
 	mr->length = length;
 	mr->virt_addr = virt_addr;
 	mr->access = access;
+	atomic_inc(&mr->owner->verbs_mrs);
 	return &mr->base;
 }
 
@@ -345,6 +387,8 @@ static int tbv_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
 {
 	struct tbv_mr *mr = container_of(ibmr, struct tbv_mr, base);
 
+	if (mr->owner)
+		atomic_dec(&mr->owner->verbs_mrs);
 	kfree(mr);
 	return 0;
 }

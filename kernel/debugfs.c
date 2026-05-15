@@ -24,6 +24,12 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 	seq_printf(s, "enable_tunnels: %u\n", state->enable_tunnels);
 	seq_printf(s, "register_verbs: %u\n", state->register_verbs);
 	seq_printf(s, "verbs_registered: %u\n", state->verbs_registered);
+	seq_printf(s, "verbs_ucontexts: %d\n",
+		   atomic_read(&state->verbs_ucontexts));
+	seq_printf(s, "verbs_pds: %d\n", atomic_read(&state->verbs_pds));
+	seq_printf(s, "verbs_cqs: %d\n", atomic_read(&state->verbs_cqs));
+	seq_printf(s, "verbs_qps: %d\n", atomic_read(&state->verbs_qps));
+	seq_printf(s, "verbs_mrs: %d\n", atomic_read(&state->verbs_mrs));
 	return 0;
 }
 
