@@ -10,10 +10,10 @@
 #define pr_fmt(fmt) "thunderbolt_ibverbs: " fmt
 
 #include <linux/errno.h>
-#include <linux/if_arp.h>
-#include <linux/if_ether.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
+#include <linux/types.h>
+#include <linux/byteorder/generic.h>
 
 #include "tbv.h"
 
@@ -21,6 +21,11 @@
 #define TBV_TBIP_HDR_LENGTH_MASK	GENMASK(5, 0)
 #define TBV_TBIP_HDR_SN_MASK		GENMASK(28, 27)
 #define TBV_TBIP_HDR_SN_SHIFT		27
+#define TBV_ETH_P_IP			0x0800
+#define TBV_ETH_P_ARP			0x0806
+#define TBV_ARPHRD_ETHER		1
+#define TBV_ARPOP_REQUEST		1
+#define TBV_ARPOP_REPLY		2
 
 enum tbv_tbip_type {
 	TBV_TBIP_LOGIN,
@@ -54,6 +59,20 @@ struct tbv_tbip_login_response {
 	u32 receiver_mac_len;
 	u32 reserved[4];
 };
+
+struct tbv_ethhdr {
+	u8 h_dest[TBV_ETH_ALEN];
+	u8 h_source[TBV_ETH_ALEN];
+	__be16 h_proto;
+} __packed;
+
+struct tbv_arphdr {
+	__be16 ar_hrd;
+	__be16 ar_pro;
+	u8 ar_hln;
+	u8 ar_pln;
+	__be16 ar_op;
+} __packed;
 
 struct tbv_arp_ipv4_payload {
 	u8 sender_mac[TBV_ETH_ALEN];
@@ -153,10 +172,10 @@ int tbv_tbip_parse_login(const void *buf, size_t size,
 	return 0;
 }
 
-static bool tbv_arp_is_ipv4_ethernet(const struct arphdr *arp)
+static bool tbv_arp_is_ipv4_ethernet(const struct tbv_arphdr *arp)
 {
-	return arp->ar_hrd == htons(ARPHRD_ETHER) &&
-	       arp->ar_pro == htons(ETH_P_IP) &&
+	return arp->ar_hrd == cpu_to_be16(TBV_ARPHRD_ETHER) &&
+	       arp->ar_pro == cpu_to_be16(TBV_ETH_P_IP) &&
 	       arp->ar_hln == TBV_ETH_ALEN &&
 	       arp->ar_pln == sizeof(__be32);
 }
@@ -167,29 +186,29 @@ int tbv_tbnet_arp_reply_for_request(void *reply, size_t reply_size,
 {
 	const struct tbv_arp_ipv4_payload *req_payload;
 	struct tbv_arp_ipv4_payload *reply_payload;
-	const struct ethhdr *req_eth = request;
-	struct ethhdr *reply_eth = reply;
-	const struct arphdr *req_arp;
-	struct arphdr *reply_arp;
+	const struct tbv_ethhdr *req_eth = request;
+	struct tbv_ethhdr *reply_eth = reply;
+	const struct tbv_arphdr *req_arp;
+	struct tbv_arphdr *reply_arp;
 	size_t frame_len;
 
 	if (!reply || !request || !proxy)
 		return -EINVAL;
 
-	frame_len = sizeof(struct ethhdr) + sizeof(struct arphdr) +
+	frame_len = sizeof(struct tbv_ethhdr) + sizeof(struct tbv_arphdr) +
 		    sizeof(struct tbv_arp_ipv4_payload);
 	if (reply_size < frame_len)
 		return -ENOSPC;
 	if (request_size < frame_len)
 		return -EINVAL;
 
-	if (req_eth->h_proto != htons(ETH_P_ARP))
+	if (req_eth->h_proto != cpu_to_be16(TBV_ETH_P_ARP))
 		return -ENOENT;
 
-	req_arp = (const struct arphdr *)(req_eth + 1);
+	req_arp = (const struct tbv_arphdr *)(req_eth + 1);
 	if (!tbv_arp_is_ipv4_ethernet(req_arp))
 		return -ENOENT;
-	if (req_arp->ar_op != htons(ARPOP_REQUEST))
+	if (req_arp->ar_op != cpu_to_be16(TBV_ARPOP_REQUEST))
 		return -ENOENT;
 
 	req_payload = (const struct tbv_arp_ipv4_payload *)(req_arp + 1);
@@ -200,14 +219,14 @@ int tbv_tbnet_arp_reply_for_request(void *reply, size_t reply_size,
 
 	memcpy(reply_eth->h_dest, req_payload->sender_mac, TBV_ETH_ALEN);
 	memcpy(reply_eth->h_source, proxy->mac, TBV_ETH_ALEN);
-	reply_eth->h_proto = htons(ETH_P_ARP);
+	reply_eth->h_proto = cpu_to_be16(TBV_ETH_P_ARP);
 
-	reply_arp = (struct arphdr *)(reply_eth + 1);
-	reply_arp->ar_hrd = htons(ARPHRD_ETHER);
-	reply_arp->ar_pro = htons(ETH_P_IP);
+	reply_arp = (struct tbv_arphdr *)(reply_eth + 1);
+	reply_arp->ar_hrd = cpu_to_be16(TBV_ARPHRD_ETHER);
+	reply_arp->ar_pro = cpu_to_be16(TBV_ETH_P_IP);
 	reply_arp->ar_hln = TBV_ETH_ALEN;
 	reply_arp->ar_pln = sizeof(__be32);
-	reply_arp->ar_op = htons(ARPOP_REPLY);
+	reply_arp->ar_op = cpu_to_be16(TBV_ARPOP_REPLY);
 
 	reply_payload = (struct tbv_arp_ipv4_payload *)(reply_arp + 1);
 	memcpy(reply_payload->sender_mac, proxy->mac, TBV_ETH_ALEN);
