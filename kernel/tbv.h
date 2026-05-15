@@ -7,8 +7,10 @@
 #include <linux/mutex.h>
 #include <linux/refcount.h>
 #include <linux/types.h>
+#include <linux/uuid.h>
 
 #define TBV_DRV_NAME "thunderbolt_ibverbs"
+#define TBV_ETH_ALEN 6
 
 #define TBV_TBNET_ID_STATE_CARRIER		BIT(0)
 #define TBV_TBNET_ID_STATE_NEIGHBOR_READY	BIT(1)
@@ -104,6 +106,25 @@ struct tbv_tbnet_identity {
 	unsigned long state;
 };
 
+struct tbv_tbip_control {
+	u64 route;
+	u8 sequence;
+	uuid_t initiator_uuid;
+	uuid_t target_uuid;
+	u32 command_id;
+};
+
+struct tbv_tbip_login_params {
+	struct tbv_tbip_control ctrl;
+	u32 transmit_path;
+};
+
+struct tbv_tbip_login_response_params {
+	struct tbv_tbip_control ctrl;
+	u32 status;
+	u8 receiver_mac[TBV_ETH_ALEN];
+};
+
 struct tbv_state {
 	struct tbv_resolved_config cfg;
 	struct mutex lock;
@@ -128,6 +149,12 @@ int tbv_tbnet_identity_check_config(const struct tbv_resolved_config *cfg);
 int tbv_tbnet_identity_prepare(struct tbv_tbnet_identity *identity,
 			       const struct tbv_resolved_config *cfg);
 void tbv_tbnet_identity_stop(struct tbv_tbnet_identity *identity);
+int tbv_tbip_build_login(void *buf, size_t size,
+			 const struct tbv_tbip_login_params *params);
+int tbv_tbip_build_login_response(void *buf, size_t size,
+				  const struct tbv_tbip_login_response_params *params);
+int tbv_tbip_parse_login(const void *buf, size_t size,
+			 struct tbv_tbip_login_params *params);
 
 const struct tbv_backend_ops *tbv_backend_get(enum tbv_backend_type type);
 

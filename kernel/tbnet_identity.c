@@ -15,6 +15,135 @@
 
 #include "tbv.h"
 
+#define TBV_TBIP_LOGIN_PROTO_VERSION	1
+#define TBV_TBIP_HDR_LENGTH_MASK	GENMASK(5, 0)
+#define TBV_TBIP_HDR_SN_MASK		GENMASK(28, 27)
+#define TBV_TBIP_HDR_SN_SHIFT		27
+
+enum tbv_tbip_type {
+	TBV_TBIP_LOGIN,
+	TBV_TBIP_LOGIN_RESPONSE,
+	TBV_TBIP_LOGOUT,
+	TBV_TBIP_STATUS,
+};
+
+struct tbv_tbip_header {
+	u32 route_hi;
+	u32 route_lo;
+	u32 length_sn;
+	uuid_t uuid;
+	uuid_t initiator_uuid;
+	uuid_t target_uuid;
+	u32 type;
+	u32 command_id;
+};
+
+struct tbv_tbip_login {
+	struct tbv_tbip_header hdr;
+	u32 proto_version;
+	u32 transmit_path;
+	u32 reserved[4];
+};
+
+struct tbv_tbip_login_response {
+	struct tbv_tbip_header hdr;
+	u32 status;
+	u32 receiver_mac[2];
+	u32 receiver_mac_len;
+	u32 reserved[4];
+};
+
+/* ThunderboltIP protocol UUID: 798f589e-3616-8a47-97c6-5664a920c8dd */
+static const uuid_t tbv_tbip_uuid =
+	UUID_INIT(0x798f589e, 0x3616, 0x8a47, 0x97, 0xc6,
+		  0x56, 0x64, 0xa9, 0x20, 0xc8, 0xdd);
+
+static void tbv_tbip_fill_header(struct tbv_tbip_header *hdr,
+				 const struct tbv_tbip_control *ctrl,
+				 enum tbv_tbip_type type, size_t size)
+{
+	u32 length_sn;
+
+	length_sn = (size - 3 * sizeof(u32)) / sizeof(u32);
+	length_sn |= (ctrl->sequence << TBV_TBIP_HDR_SN_SHIFT) &
+		     TBV_TBIP_HDR_SN_MASK;
+
+	hdr->route_hi = upper_32_bits(ctrl->route);
+	hdr->route_lo = lower_32_bits(ctrl->route);
+	hdr->length_sn = length_sn;
+	uuid_copy(&hdr->uuid, &tbv_tbip_uuid);
+	uuid_copy(&hdr->initiator_uuid, &ctrl->initiator_uuid);
+	uuid_copy(&hdr->target_uuid, &ctrl->target_uuid);
+	hdr->type = type;
+	hdr->command_id = ctrl->command_id;
+}
+
+int tbv_tbip_build_login(void *buf, size_t size,
+			 const struct tbv_tbip_login_params *params)
+{
+	struct tbv_tbip_login *msg = buf;
+
+	if (!buf || !params)
+		return -EINVAL;
+	if (size < sizeof(*msg))
+		return -ENOSPC;
+
+	memset(msg, 0, sizeof(*msg));
+	tbv_tbip_fill_header(&msg->hdr, &params->ctrl, TBV_TBIP_LOGIN,
+			     sizeof(*msg));
+	msg->proto_version = TBV_TBIP_LOGIN_PROTO_VERSION;
+	msg->transmit_path = params->transmit_path;
+	return sizeof(*msg);
+}
+
+int tbv_tbip_build_login_response(void *buf, size_t size,
+				  const struct tbv_tbip_login_response_params *params)
+{
+	struct tbv_tbip_login_response *msg = buf;
+
+	if (!buf || !params)
+		return -EINVAL;
+	if (size < sizeof(*msg))
+		return -ENOSPC;
+
+	memset(msg, 0, sizeof(*msg));
+	tbv_tbip_fill_header(&msg->hdr, &params->ctrl,
+			     TBV_TBIP_LOGIN_RESPONSE, sizeof(*msg));
+	msg->status = params->status;
+	memcpy(msg->receiver_mac, params->receiver_mac, TBV_ETH_ALEN);
+	msg->receiver_mac_len = TBV_ETH_ALEN;
+	return sizeof(*msg);
+}
+
+int tbv_tbip_parse_login(const void *buf, size_t size,
+			 struct tbv_tbip_login_params *params)
+{
+	const struct tbv_tbip_login *msg = buf;
+
+	if (!buf || !params)
+		return -EINVAL;
+	if (size < sizeof(*msg))
+		return -EINVAL;
+	if (!uuid_equal(&msg->hdr.uuid, &tbv_tbip_uuid))
+		return -EPROTO;
+	if (msg->hdr.type != TBV_TBIP_LOGIN)
+		return -EPROTO;
+	if (msg->proto_version != TBV_TBIP_LOGIN_PROTO_VERSION)
+		return -EPROTONOSUPPORT;
+
+	memset(params, 0, sizeof(*params));
+	params->ctrl.route = ((u64)msg->hdr.route_hi << 32) |
+			     msg->hdr.route_lo;
+	params->ctrl.route &= ~BIT_ULL(63);
+	params->ctrl.sequence = (msg->hdr.length_sn & TBV_TBIP_HDR_SN_MASK) >>
+				TBV_TBIP_HDR_SN_SHIFT;
+	uuid_copy(&params->ctrl.initiator_uuid, &msg->hdr.initiator_uuid);
+	uuid_copy(&params->ctrl.target_uuid, &msg->hdr.target_uuid);
+	params->ctrl.command_id = msg->hdr.command_id;
+	params->transmit_path = msg->transmit_path;
+	return 0;
+}
+
 int tbv_tbnet_identity_check_config(const struct tbv_resolved_config *cfg)
 {
 	const struct tbv_config *requested = &cfg->requested;
