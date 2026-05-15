@@ -104,7 +104,9 @@ static int tbv_service_probe(struct tb_service *svc,
 {
 	enum tbv_backend_type backend = tbv_service_backend_from_id(id);
 	struct tb_xdomain *xd = tb_service_parent(svc);
+	struct tbv_rail_key key;
 	struct tbv_peer *peer;
+	int ret;
 
 	if (!tbv_service_state)
 		return -ENODEV;
@@ -116,10 +118,17 @@ static int tbv_service_probe(struct tb_service *svc,
 	if (IS_ERR(peer))
 		return PTR_ERR(peer);
 
+	tbv_rail_key_init(&key, xd->route, xd->link, xd->depth, svc->prtcid);
+	ret = tbv_peer_add_rail(peer, &key);
+	if (ret) {
+		tbv_peer_destroy(tbv_service_state, peer);
+		return ret;
+	}
+
 	tb_service_set_drvdata(svc, peer);
-	pr_info("bound %s service id=%d route=0x%llx link_speed=%uGb/s width=0x%x\n",
+	pr_info("bound %s service id=%d route=0x%llx link_speed=%uGb/s width=0x%x rail=0x%x\n",
 		tbv_backend_name(backend), svc->id, xd->route, xd->link_speed,
-		xd->link_width);
+		xd->link_width, tbv_rail_key_hash(&key));
 	return 0;
 }
 
