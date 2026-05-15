@@ -22,6 +22,9 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 	seq_printf(s, "start_rings: %u\n", state->start_rings);
 	seq_printf(s, "negotiate_native: %u\n", state->negotiate_native);
 	seq_printf(s, "enable_tunnels: %u\n", state->enable_tunnels);
+	seq_printf(s, "native_wr_striping: %u\n", state->native_wr_striping);
+	seq_printf(s, "native_fragment_striping: %u\n",
+		   state->native_fragment_striping);
 	seq_printf(s, "register_verbs: %u\n", state->register_verbs);
 	seq_printf(s, "verbs_registered: %u\n", state->verbs_registered);
 	seq_printf(s, "verbs_ucontexts: %d\n",
@@ -72,6 +75,14 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_no_recv));
 	seq_printf(s, "data_rx_copy_error: %lld\n",
 		   atomic64_read(&state->data_rx_copy_error));
+	seq_printf(s, "data_rx_reorder_buffered: %lld\n",
+		   atomic64_read(&state->data_rx_reorder_buffered));
+	seq_printf(s, "data_rx_reorder_delivered: %lld\n",
+		   atomic64_read(&state->data_rx_reorder_delivered));
+	seq_printf(s, "data_rx_reorder_dropped: %lld\n",
+		   atomic64_read(&state->data_rx_reorder_dropped));
+	seq_printf(s, "data_rx_reorder_window: %lld\n",
+		   atomic64_read(&state->data_rx_reorder_window));
 	seq_printf(s, "data_cq_overflow: %lld\n",
 		   atomic64_read(&state->data_cq_overflow));
 	return 0;

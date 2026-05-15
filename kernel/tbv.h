@@ -221,6 +221,8 @@ struct tbv_state {
 	bool start_rings;
 	bool negotiate_native;
 	bool enable_tunnels;
+	bool native_wr_striping;
+	bool native_fragment_striping;
 	bool register_verbs;
 	bool services_registered;
 	bool verbs_registered;
@@ -250,6 +252,10 @@ struct tbv_state {
 	atomic64_t data_rx_no_qp;
 	atomic64_t data_rx_no_recv;
 	atomic64_t data_rx_copy_error;
+	atomic64_t data_rx_reorder_buffered;
+	atomic64_t data_rx_reorder_delivered;
+	atomic64_t data_rx_reorder_dropped;
+	atomic64_t data_rx_reorder_window;
 	atomic64_t data_cq_overflow;
 	struct xarray verbs_mrs_xa;
 	struct xarray verbs_qps_xa;

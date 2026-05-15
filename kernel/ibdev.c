@@ -13,6 +13,7 @@
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/vmalloc.h>
 #include <linux/wait.h>
 #include <rdma/ib_mad.h>
 #include <rdma/ib_umem.h>
@@ -32,6 +33,10 @@
 #define TBV_IBDEV_QPN_MIN 0x900
 #define TBV_IBDEV_QPN_MAX 0x00ffffff
 #define TBV_IBDEV_PAGE_SIZE_CAP (SZ_4K | SZ_2M | SZ_1G)
+#define TBV_PSN_MASK 0x00ffffffu
+#define TBV_RX_REORDER_MAX_MESSAGES 64
+#define TBV_RX_REORDER_MAX_BYTES (64u * 1024u * 1024u)
+#define TBV_RX_REORDER_MAX_FRAGS 256
 
 struct tbv_ucontext {
 	struct ib_ucontext base;
@@ -79,6 +84,20 @@ struct tbv_rx_message {
 	bool solicited;
 };
 
+struct tbv_rx_reorder_msg {
+	struct list_head node;
+	u32 src_qp;
+	u32 psn;
+	u32 total_len;
+	u32 received;
+	u16 frag_count;
+	u16 frags_received;
+	DECLARE_BITMAP(frag_seen, TBV_RX_REORDER_MAX_FRAGS);
+	bool complete;
+	bool solicited;
+	void *buf;
+};
+
 struct tbv_qp {
 	struct ib_qp base;
 	struct tbv_state *owner;
@@ -100,7 +119,11 @@ struct tbv_qp {
 	u32 recv_credits_advertised;
 	u32 remote_recv_credits;
 	u32 send_psn;
+	u32 rx_expected_psn;
 	struct tbv_rx_message rx_msg;
+	struct list_head rx_reorder;
+	u32 rx_reorder_count;
+	u32 rx_reorder_bytes;
 	bool qpn_allocated;
 	bool closing;
 };
@@ -140,9 +163,26 @@ static atomic_t tbv_mr_key = ATOMIC_INIT(1);
 static int tbv_cq_push(struct tbv_cq *tcq, const struct ib_wc *wc);
 static void tbv_send_ctx_put(struct tbv_send_ctx *send);
 static bool tbv_send_complete(struct tbv_send_ctx *send, int status);
+static void tbv_qp_flush_reorder(struct tbv_qp *tqp);
+static void tbv_rx_drain_reorder_locked(struct tbv_state *state,
+					struct tbv_qp *tqp);
 static void tbv_qp_advertise_recv_credits(struct tbv_qp *tqp);
 static int tbv_qp_consume_remote_recv_credit(struct tbv_qp *tqp);
 static void tbv_qp_return_remote_recv_credit(struct tbv_qp *tqp);
+
+static u32 tbv_psn_next(u32 psn)
+{
+	return (psn + 1) & TBV_PSN_MASK;
+}
+
+static s32 tbv_psn_delta(u32 a, u32 b)
+{
+	u32 delta = (a - b) & TBV_PSN_MASK;
+
+	if (delta & 0x00800000u)
+		return (s32)(delta | 0xff000000u);
+	return (s32)delta;
+}
 
 static struct tbv_state *tbv_ibdev_state(struct ib_device *ibdev)
 {
@@ -278,10 +318,7 @@ static struct tbv_path *tbv_first_active_native_path_locked(struct tbv_state *st
 	return NULL;
 }
 
-/*
- * Keep one QP on one rail. The current receiver reassembles an ordered SEND
- * stream per QP, so per-WR rail striping would require a reorder layer.
- */
+/* The selector is either the QPN for stable-QP routing or the PSN for WR striping. */
 static struct tbv_path *tbv_select_native_data_path_locked(struct tbv_state *state,
 							  u32 selector)
 {
@@ -320,6 +357,43 @@ static struct tbv_path *tbv_select_native_data_path_locked(struct tbv_state *sta
 	}
 
 	return NULL;
+}
+
+static u32 tbv_collect_native_data_paths_locked(struct tbv_state *state,
+						struct tbv_path **paths,
+						u32 max_paths)
+{
+	struct tbv_peer *peer;
+	u32 count = 0;
+
+	list_for_each_entry(peer, &state->peers, node) {
+		struct tbv_rail *rail;
+
+		if (peer->backend != TBV_BACKEND_NATIVE)
+			continue;
+		list_for_each_entry(rail, &peer->rails, node) {
+			if (rail->path.state != TBV_PATH_TUNNEL_ENABLED)
+				continue;
+			if (count < max_paths)
+				paths[count] = &rail->path;
+			count++;
+		}
+	}
+
+	return min(count, max_paths);
+}
+
+static void tbv_release_path_reservations(struct tbv_path **paths,
+					  const u32 *reservations,
+					  u32 path_count)
+{
+	u32 i;
+
+	for (i = 0; i < path_count; i++) {
+		if (reservations[i])
+			tbv_path_release_data_reservation(paths[i],
+							  reservations[i]);
+	}
 }
 
 static bool tbv_ibdev_port_active(struct tbv_state *state)
@@ -553,6 +627,7 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	refcount_set(&tqp->refs, 1);
 	init_completion(&tqp->refs_zero);
 	INIT_LIST_HEAD(&tqp->pending_sends);
+	INIT_LIST_HEAD(&tqp->rx_reorder);
 	tqp->state = IB_QPS_RESET;
 	tqp->type = init_attr->qp_type;
 	tqp->qpn_allocated = true;
@@ -602,6 +677,7 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 
 	tbv_qp_put(tqp);
 	wait_for_completion(&tqp->refs_zero);
+	tbv_qp_flush_reorder(tqp);
 
 	pending = tqp->recv_count;
 	if (tqp->owner && pending)
@@ -643,15 +719,17 @@ static int tbv_modify_qp(struct ib_qp *qp, struct ib_qp_attr *attr,
 		tqp->attr.path_mtu = attr->path_mtu;
 	if (attr_mask & IB_QP_DEST_QPN)
 		tqp->attr.dest_qp_num = attr->dest_qp_num;
-	if (attr_mask & IB_QP_RQ_PSN)
-		tqp->attr.rq_psn = attr->rq_psn;
+	if (attr_mask & IB_QP_RQ_PSN) {
+		tqp->rx_expected_psn = attr->rq_psn & TBV_PSN_MASK;
+		tqp->attr.rq_psn = attr->rq_psn & TBV_PSN_MASK;
+	}
 	if (attr_mask & IB_QP_MAX_DEST_RD_ATOMIC)
 		tqp->attr.max_dest_rd_atomic = attr->max_dest_rd_atomic;
 	if (attr_mask & IB_QP_MIN_RNR_TIMER)
 		tqp->attr.min_rnr_timer = attr->min_rnr_timer;
 	if (attr_mask & IB_QP_SQ_PSN) {
-		tqp->send_psn = attr->sq_psn;
-		tqp->attr.sq_psn = attr->sq_psn;
+		tqp->send_psn = attr->sq_psn & TBV_PSN_MASK;
+		tqp->attr.sq_psn = attr->sq_psn & TBV_PSN_MASK;
 	}
 	if (attr_mask & IB_QP_TIMEOUT)
 		tqp->attr.timeout = attr->timeout;
@@ -857,12 +935,15 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	struct tbv_native_data_header hdr = {};
 	struct tbv_send_ctx *ctx;
 	struct tbv_path *path = NULL;
+	struct tbv_path *paths[TBV_NATIVE_MAX_LANES] = {};
+	u32 reservations[TBV_NATIVE_MAX_LANES] = {};
 	unsigned long flags;
 	u32 total_len = 0;
 	u32 offset = 0;
 	u32 psn;
 	u32 nfrags;
-	u32 reserved_frames = 0;
+	u32 frag_idx = 0;
+	u32 path_count = 0;
 	int nsegs = 0;
 	bool credit_consumed = false;
 	bool sent_any = false;
@@ -918,26 +999,65 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	INIT_LIST_HEAD(&ctx->node);
 
 	spin_lock_irqsave(&tqp->lock, flags);
-	psn = tqp->send_psn++;
+	psn = tqp->send_psn & TBV_PSN_MASK;
+	tqp->send_psn = tbv_psn_next(psn);
 	spin_unlock_irqrestore(&tqp->lock, flags);
 	ctx->psn = psn;
 
 	tbv_qp_queue_send(tqp, ctx);
 	mutex_lock(&tqp->owner->lock);
-	path = tbv_select_native_data_path_locked(tqp->owner,
-						  tqp->base.qp_num);
-	ret = path ? tbv_path_reserve_data(path, nfrags) : -ENOTCONN;
+	if (tqp->owner->native_fragment_striping) {
+		u32 i;
+
+		path_count = tbv_collect_native_data_paths_locked(tqp->owner,
+								 paths,
+								 ARRAY_SIZE(paths));
+		if (!path_count) {
+			ret = -ENOTCONN;
+			goto err_no_path_locked;
+		}
+		for (i = 0; i < nfrags; i++)
+			reservations[(psn + i) % path_count]++;
+	} else {
+		path = tbv_select_native_data_path_locked(tqp->owner,
+							  tqp->owner->native_wr_striping ?
+							  psn :
+							  tqp->base.qp_num);
+		if (!path) {
+			ret = -ENOTCONN;
+			goto err_no_path_locked;
+		}
+		paths[0] = path;
+		path_count = 1;
+		reservations[0] = nfrags;
+	}
+
+	for (frag_idx = 0; frag_idx < path_count; frag_idx++) {
+		u32 count = reservations[frag_idx];
+
+		reservations[frag_idx] = 0;
+		if (!count)
+			continue;
+		ret = tbv_path_reserve_data(paths[frag_idx], count);
+		if (ret)
+			goto err_unlock_unqueue_ctx;
+		reservations[frag_idx] = count;
+	}
+	frag_idx = 0;
+
+err_no_path_locked:
 	if (ret) {
 		mutex_unlock(&tqp->owner->lock);
 		atomic64_inc(&tqp->owner->data_wr_no_path);
 		goto err_unqueue_ctx;
 	}
-	reserved_frames = nfrags;
 
 	do {
 		u32 payload_len = min_t(u32, total_len - offset,
 					TBV_NATIVE_DATA_MAX_PAYLOAD);
 		bool last = offset + payload_len == total_len;
+		u32 path_idx = tqp->owner->native_fragment_striping ?
+			       (psn + frag_idx) % path_count : 0;
 
 		ret = tbv_copy_send_range(segs, nsegs, offset,
 					  frame + TBV_NATIVE_DATA_HDR_SIZE,
@@ -966,7 +1086,7 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 
 		atomic64_inc(&tqp->owner->data_wr_path_send);
 		tbv_send_ctx_get(ctx);
-		ret = tbv_path_send(path, frame,
+		ret = tbv_path_send(paths[path_idx], frame,
 				    TBV_NATIVE_DATA_HDR_SIZE + payload_len,
 				    0, tbv_send_tx_done, ctx);
 		if (ret)
@@ -976,9 +1096,10 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 			goto err_unlock_unqueue_ctx;
 		}
 
-		reserved_frames--;
+		reservations[path_idx]--;
 		sent_any = true;
 		offset += payload_len;
+		frag_idx++;
 	} while (offset < total_len);
 	mutex_unlock(&tqp->owner->lock);
 
@@ -988,18 +1109,14 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	return 0;
 
 err_unlock_unqueue_ctx:
-	if (path)
-		tbv_path_release_data_reservation(path, reserved_frames);
+	tbv_release_path_reservations(paths, reservations, path_count);
 	mutex_unlock(&tqp->owner->lock);
-	path = NULL;
 err_unqueue_ctx:
 	tbv_qp_unqueue_send(tqp, ctx);
 	if (!sent_any)
 		tbv_qp_return_remote_recv_credit(tqp);
 	tbv_send_ctx_put(ctx);
 	kfree(frame);
-	if (path)
-		tbv_path_release_data_reservation(path, reserved_frames);
 	tbv_release_send_segments(segs, nsegs);
 	return ret;
 err_free_frame:
@@ -1122,6 +1239,11 @@ static int tbv_post_recv(struct ib_qp *qp, const struct ib_recv_wr *wr,
 
 	if (posted)
 		tbv_qp_advertise_recv_credits(tqp);
+	if (posted) {
+		mutex_lock(&tqp->rx_lock);
+		tbv_rx_drain_reorder_locked(tqp->owner, tqp);
+		mutex_unlock(&tqp->rx_lock);
+	}
 	return 0;
 
 err_bad:
@@ -1369,6 +1491,105 @@ static int tbv_umem_copy_to(struct tbv_mr *mr, u64 addr, const void *src,
 	return -EFAULT;
 }
 
+static int tbv_rx_copy_to_wqe(struct tbv_state *state,
+			      const struct tbv_recv_wqe *wqe, u32 offset,
+			      const void *payload, u32 len, u32 *delivered)
+{
+	struct tbv_mr *mr;
+	u32 copy_len = 0;
+	int ret;
+
+	if (offset < wqe->length)
+		copy_len = min_t(u32, len, wqe->length - offset);
+	if (!copy_len)
+		return 0;
+
+	mr = tbv_mr_get(state, wqe->lkey);
+	if (!mr) {
+		atomic64_inc(&state->data_rx_copy_error);
+		return -EINVAL;
+	}
+
+	ret = tbv_umem_copy_to(mr, wqe->addr + offset, payload, copy_len);
+	tbv_mr_put(mr);
+	if (ret) {
+		atomic64_inc(&state->data_rx_copy_error);
+		return ret;
+	}
+
+	*delivered += copy_len;
+	return 0;
+}
+
+static void tbv_rx_reorder_free_msg(struct tbv_rx_reorder_msg *msg)
+{
+	if (!msg)
+		return;
+	kvfree(msg->buf);
+	kfree(msg);
+}
+
+static void tbv_qp_flush_reorder(struct tbv_qp *tqp)
+{
+	struct tbv_rx_reorder_msg *msg;
+	struct tbv_rx_reorder_msg *tmp;
+
+	list_for_each_entry_safe(msg, tmp, &tqp->rx_reorder, node) {
+		list_del(&msg->node);
+		tbv_rx_reorder_free_msg(msg);
+	}
+	tqp->rx_reorder_count = 0;
+	tqp->rx_reorder_bytes = 0;
+}
+
+static struct tbv_rx_reorder_msg *
+tbv_rx_reorder_find(struct tbv_qp *tqp, u32 psn)
+{
+	struct tbv_rx_reorder_msg *msg;
+
+	list_for_each_entry(msg, &tqp->rx_reorder, node) {
+		if (msg->psn == psn)
+			return msg;
+	}
+
+	return NULL;
+}
+
+static bool tbv_rx_fragment_shape(u32 total_len, u32 offset, u32 len,
+				  bool last, u32 *frag_idx, u32 *frag_count)
+{
+	u32 idx;
+	u32 count;
+	u32 expected_len;
+
+	if (!total_len) {
+		if (offset || len || !last)
+			return false;
+		*frag_idx = 0;
+		*frag_count = 1;
+		return true;
+	}
+
+	if (offset % TBV_NATIVE_DATA_MAX_PAYLOAD)
+		return false;
+	idx = offset / TBV_NATIVE_DATA_MAX_PAYLOAD;
+	count = DIV_ROUND_UP(total_len, TBV_NATIVE_DATA_MAX_PAYLOAD);
+	if (idx >= count || count > TBV_RX_REORDER_MAX_FRAGS)
+		return false;
+
+	expected_len = idx == count - 1 ?
+			      total_len - idx * TBV_NATIVE_DATA_MAX_PAYLOAD :
+			      TBV_NATIVE_DATA_MAX_PAYLOAD;
+	if (len != expected_len)
+		return false;
+	if (last != (idx == count - 1))
+		return false;
+
+	*frag_idx = idx;
+	*frag_count = count;
+	return true;
+}
+
 static void tbv_rx_finish_send(struct tbv_state *state, struct tbv_qp *tqp)
 {
 	struct tbv_rx_message *msg = &tqp->rx_msg;
@@ -1391,6 +1612,7 @@ static void tbv_rx_finish_send(struct tbv_state *state, struct tbv_qp *tqp)
 		ack_status = 1;
 
 	memset(msg, 0, sizeof(*msg));
+	tqp->rx_expected_psn = tbv_psn_next(psn);
 	tbv_send_ack(state, src_qp, tqp->base.qp_num, psn, ack_status);
 }
 
@@ -1403,6 +1625,162 @@ static void tbv_rx_fail_active_send(struct tbv_state *state, struct tbv_qp *tqp,
 	tbv_rx_finish_send(state, tqp);
 }
 
+static bool tbv_rx_deliver_reorder_msg_locked(struct tbv_state *state,
+					      struct tbv_qp *tqp,
+					      struct tbv_rx_reorder_msg *msg)
+{
+	struct tbv_cq *recv_cq = container_of(tqp->base.recv_cq,
+					      struct tbv_cq, base);
+	struct tbv_recv_wqe wqe;
+	struct ib_wc wc = {};
+	u32 delivered = 0;
+	int ack_status = 0;
+	int status;
+
+	if (!tbv_qp_pop_recv(tqp, &wqe)) {
+		atomic64_inc(&state->data_rx_no_recv);
+		return false;
+	}
+
+	list_del(&msg->node);
+	tqp->rx_reorder_count--;
+	tqp->rx_reorder_bytes -= msg->total_len;
+
+	status = msg->total_len > wqe.length ? IB_WC_LOC_LEN_ERR :
+					       IB_WC_SUCCESS;
+	if (msg->total_len && tbv_rx_copy_to_wqe(state, &wqe, 0, msg->buf,
+						 msg->total_len, &delivered))
+		status = IB_WC_LOC_PROT_ERR;
+
+	wc.wr_id = wqe.wr_id;
+	wc.status = status;
+	wc.opcode = IB_WC_RECV;
+	wc.qp = &tqp->base;
+	wc.byte_len = delivered;
+	wc.src_qp = msg->src_qp;
+	wc.pkey_index = 0;
+	wc.port_num = 1;
+	if (tbv_cq_push(recv_cq, &wc))
+		ack_status = 1;
+	if (status != IB_WC_SUCCESS)
+		ack_status = 1;
+
+	tqp->rx_expected_psn = tbv_psn_next(msg->psn);
+	tbv_send_ack(state, msg->src_qp, tqp->base.qp_num, msg->psn,
+		     ack_status);
+	atomic64_inc(&state->data_rx_reorder_delivered);
+	tbv_rx_reorder_free_msg(msg);
+	return true;
+}
+
+static void tbv_rx_drain_reorder_locked(struct tbv_state *state,
+					struct tbv_qp *tqp)
+{
+	struct tbv_rx_reorder_msg *msg;
+
+	while (!tqp->rx_msg.active) {
+		msg = tbv_rx_reorder_find(tqp, tqp->rx_expected_psn);
+		if (!msg || !msg->complete)
+			return;
+		if (!tbv_rx_deliver_reorder_msg_locked(state, tqp, msg))
+			return;
+	}
+}
+
+static void tbv_rx_drop_reorder_msg_locked(struct tbv_state *state,
+					   struct tbv_qp *tqp,
+					   struct tbv_rx_reorder_msg *msg)
+{
+	list_del(&msg->node);
+	tqp->rx_reorder_count--;
+	tqp->rx_reorder_bytes -= msg->total_len;
+	atomic64_inc(&state->data_rx_reorder_dropped);
+	tbv_rx_reorder_free_msg(msg);
+}
+
+static void tbv_rx_buffer_fragment_locked(struct tbv_state *state,
+					  struct tbv_qp *tqp,
+					  const struct tbv_native_data_header *hdr,
+					  u32 psn, u32 total_len, u32 offset,
+					  bool last, const void *payload)
+{
+	struct tbv_rx_reorder_msg *msg;
+	s32 delta = tbv_psn_delta(psn, tqp->rx_expected_psn);
+	u32 frag_idx;
+	u32 frag_count;
+
+	if (delta < 0) {
+		tbv_send_ack(state, hdr->src_qp, hdr->dest_qp, psn, 1);
+		return;
+	}
+	if (delta >= TBV_RX_REORDER_MAX_MESSAGES) {
+		atomic64_inc(&state->data_rx_reorder_window);
+		tbv_send_ack(state, hdr->src_qp, hdr->dest_qp, psn, 1);
+		return;
+	}
+	if (!tbv_rx_fragment_shape(total_len, offset, hdr->length, last,
+				   &frag_idx, &frag_count)) {
+		tbv_send_ack(state, hdr->src_qp, hdr->dest_qp, psn, 1);
+		return;
+	}
+
+	msg = tbv_rx_reorder_find(tqp, psn);
+	if (!msg) {
+		u32 new_bytes = tqp->rx_reorder_bytes;
+
+		if (tqp->rx_reorder_count >= TBV_RX_REORDER_MAX_MESSAGES ||
+		    check_add_overflow(tqp->rx_reorder_bytes, total_len,
+				       &new_bytes) ||
+		    new_bytes > TBV_RX_REORDER_MAX_BYTES) {
+			atomic64_inc(&state->data_rx_reorder_window);
+			tbv_send_ack(state, hdr->src_qp, hdr->dest_qp, psn, 1);
+			return;
+		}
+
+		msg = kzalloc(sizeof(*msg), GFP_KERNEL);
+		if (!msg) {
+			tbv_send_ack(state, hdr->src_qp, hdr->dest_qp, psn, 1);
+			return;
+		}
+		if (total_len) {
+			msg->buf = kvzalloc(total_len, GFP_KERNEL);
+			if (!msg->buf) {
+				kfree(msg);
+				tbv_send_ack(state, hdr->src_qp, hdr->dest_qp,
+					     psn, 1);
+				return;
+			}
+		}
+
+		msg->src_qp = hdr->src_qp;
+		msg->psn = psn;
+		msg->total_len = total_len;
+		msg->frag_count = frag_count;
+		msg->solicited = hdr->flags & TBV_NATIVE_DATA_F_SOLICITED;
+		list_add_tail(&msg->node, &tqp->rx_reorder);
+		tqp->rx_reorder_count++;
+		tqp->rx_reorder_bytes = new_bytes;
+		atomic64_inc(&state->data_rx_reorder_buffered);
+	} else if (msg->src_qp != hdr->src_qp ||
+		   msg->total_len != total_len ||
+		   msg->frag_count != frag_count ||
+		   test_bit(frag_idx, msg->frag_seen)) {
+		tbv_rx_drop_reorder_msg_locked(state, tqp, msg);
+		tbv_send_ack(state, hdr->src_qp, hdr->dest_qp, psn, 1);
+		return;
+	}
+
+	if (hdr->length && msg->buf)
+		memcpy((u8 *)msg->buf + offset, payload, hdr->length);
+	set_bit(frag_idx, msg->frag_seen);
+	msg->frags_received++;
+	msg->received += hdr->length;
+	if (msg->frags_received == msg->frag_count)
+		msg->complete = true;
+	if (msg->complete)
+		tbv_rx_drain_reorder_locked(state, tqp);
+}
+
 static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 					struct tbv_qp *tqp,
 					const struct tbv_native_data_header *hdr,
@@ -1410,11 +1788,10 @@ static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 {
 	struct tbv_rx_message *msg = &tqp->rx_msg;
 	u32 total_len = hdr->imm_data;
+	u32 psn = hdr->psn & TBV_PSN_MASK;
 	u64 frag_end64;
 	u32 offset;
-	u32 copy_len;
 	bool last = hdr->flags & TBV_NATIVE_DATA_F_LAST;
-	int ret;
 
 	if (hdr->remote_addr > U32_MAX ||
 	    check_add_overflow(hdr->remote_addr, (u64)hdr->length,
@@ -1425,68 +1802,77 @@ static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 	    (hdr->flags & ~(TBV_NATIVE_DATA_F_LAST |
 			    TBV_NATIVE_DATA_F_SOLICITED)) ||
 	    last != (frag_end64 == total_len)) {
-		tbv_send_ack(state, hdr->src_qp, hdr->dest_qp, hdr->psn, 1);
+		tbv_send_ack(state, hdr->src_qp, hdr->dest_qp, psn, 1);
 		return;
 	}
 	offset = (u32)hdr->remote_addr;
 
 	mutex_lock(&tqp->rx_lock);
-	if (!msg->active) {
+	if (state->native_fragment_striping) {
+		tbv_rx_buffer_fragment_locked(state, tqp, hdr, psn, total_len,
+					      offset, last, payload);
+		mutex_unlock(&tqp->rx_lock);
+		return;
+	}
+
+	if (msg->active) {
+		if (msg->src_qp != hdr->src_qp || msg->psn != psn ||
+		    msg->total_len != total_len || msg->received != offset) {
+			if (tbv_psn_delta(psn, tqp->rx_expected_psn) > 0) {
+				tbv_rx_buffer_fragment_locked(state, tqp, hdr,
+							      psn, total_len,
+							      offset, last,
+							      payload);
+				mutex_unlock(&tqp->rx_lock);
+				return;
+			}
+
+			tbv_rx_fail_active_send(state, tqp,
+						IB_WC_LOC_PROT_ERR);
+			mutex_unlock(&tqp->rx_lock);
+			tbv_send_ack(state, hdr->src_qp, hdr->dest_qp, psn, 1);
+			return;
+		}
+	} else if (tbv_rx_reorder_find(tqp, psn) ||
+		   psn != tqp->rx_expected_psn) {
+		tbv_rx_buffer_fragment_locked(state, tqp, hdr, psn, total_len,
+					      offset, last, payload);
+		mutex_unlock(&tqp->rx_lock);
+		return;
+	} else {
 		if (offset) {
 			mutex_unlock(&tqp->rx_lock);
-			tbv_send_ack(state, hdr->src_qp, hdr->dest_qp,
-				     hdr->psn, 1);
+			tbv_send_ack(state, hdr->src_qp, hdr->dest_qp, psn, 1);
 			return;
 		}
 		if (!tbv_qp_pop_recv(tqp, &msg->wqe)) {
 			atomic64_inc(&state->data_rx_no_recv);
+			tbv_rx_buffer_fragment_locked(state, tqp, hdr, psn,
+						      total_len, offset, last,
+						      payload);
 			mutex_unlock(&tqp->rx_lock);
-			tbv_send_ack(state, hdr->src_qp, hdr->dest_qp,
-				     hdr->psn, 1);
 			return;
 		}
 
 		msg->active = true;
 		msg->src_qp = hdr->src_qp;
-		msg->psn = hdr->psn;
+		msg->psn = psn;
 		msg->total_len = total_len;
 		msg->status = total_len > msg->wqe.length ?
 				      IB_WC_LOC_LEN_ERR :
 				      IB_WC_SUCCESS;
 		msg->solicited = hdr->flags & TBV_NATIVE_DATA_F_SOLICITED;
-	} else if (msg->src_qp != hdr->src_qp || msg->psn != hdr->psn ||
-		   msg->total_len != total_len || msg->received != offset) {
-		tbv_rx_fail_active_send(state, tqp, IB_WC_LOC_PROT_ERR);
-		mutex_unlock(&tqp->rx_lock);
-		tbv_send_ack(state, hdr->src_qp, hdr->dest_qp, hdr->psn, 1);
-		return;
 	}
 
-	copy_len = 0;
-	if (offset < msg->wqe.length)
-		copy_len = min_t(u32, hdr->length, msg->wqe.length - offset);
-	if (copy_len) {
-		struct tbv_mr *mr = tbv_mr_get(state, msg->wqe.lkey);
-
-		if (!mr) {
-			msg->status = IB_WC_LOC_PROT_ERR;
-			atomic64_inc(&state->data_rx_copy_error);
-		} else {
-			ret = tbv_umem_copy_to(mr, msg->wqe.addr + offset,
-					       payload, copy_len);
-			if (ret) {
-				msg->status = IB_WC_LOC_PROT_ERR;
-				atomic64_inc(&state->data_rx_copy_error);
-			} else {
-				msg->delivered += copy_len;
-			}
-			tbv_mr_put(mr);
-		}
-	}
+	if (tbv_rx_copy_to_wqe(state, &msg->wqe, offset, payload, hdr->length,
+			       &msg->delivered))
+		msg->status = IB_WC_LOC_PROT_ERR;
 
 	msg->received += hdr->length;
-	if (last)
+	if (last) {
 		tbv_rx_finish_send(state, tqp);
+		tbv_rx_drain_reorder_locked(state, tqp);
+	}
 	mutex_unlock(&tqp->rx_lock);
 }
 
