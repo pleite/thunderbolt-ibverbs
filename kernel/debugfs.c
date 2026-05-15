@@ -19,6 +19,7 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 	seq_printf(s, "services_registered: %u\n",
 		   state->services_registered);
 	seq_printf(s, "allocate_rings: %u\n", state->allocate_rings);
+	seq_printf(s, "start_rings: %u\n", state->start_rings);
 	return 0;
 }
 

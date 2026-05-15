@@ -37,5 +37,6 @@ help:
 	@echo "  tbnet_identity=auto|stock|stock_proxy|minimal_packet|off"
 	@echo "  bind_services=0|1"
 	@echo "  allocate_rings=0|1"
+	@echo "  start_rings=0|1"
 	@echo "  native_prtcstns=<u32>"
 	@echo "  apple_prtcstns=<u32>"

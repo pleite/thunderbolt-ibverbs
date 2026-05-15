@@ -176,6 +176,7 @@ struct tbv_state {
 	struct tb_property_dir *apple_dir;
 	struct dentry *debugfs_dir;
 	bool allocate_rings;
+	bool start_rings;
 	bool services_registered;
 };
 
@@ -184,6 +185,7 @@ struct tbv_service_config {
 	u32 native_prtcstns;
 	u32 apple_prtcstns;
 	bool allocate_rings;
+	bool start_rings;
 };
 
 struct tb_property_dir;
