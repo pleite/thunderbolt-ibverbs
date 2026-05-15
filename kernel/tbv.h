@@ -11,6 +11,13 @@
 
 #define TBV_DRV_NAME "thunderbolt_ibverbs"
 #define TBV_ETH_ALEN 6
+#define TBV_NATIVE_PROTOCOL_KEY "tbverbs"
+#define TBV_NATIVE_PRTCID 1
+#define TBV_NATIVE_PRTCVERS 1
+#define TBV_NATIVE_PRTCREVS 0
+#define TBV_APPLE_PRTCID 0xfa57
+#define TBV_APPLE_PRTCVERS 1
+#define TBV_APPLE_PRTCREVS 0
 
 #define TBV_TBNET_ID_STATE_CARRIER		BIT(0)
 #define TBV_TBNET_ID_STATE_NEIGHBOR_READY	BIT(1)
@@ -138,6 +145,8 @@ struct tbv_state {
 	struct tbv_tbnet_identity tbnet_identity;
 };
 
+struct tb_property_dir;
+
 int tbv_config_parse(struct tbv_config *cfg, const char *compat,
 		     const char *profile, const char *tbnet,
 		     const char *tbnet_identity, const char *lanes);
@@ -163,6 +172,8 @@ int tbv_tbip_parse_login(const void *buf, size_t size,
 int tbv_tbnet_arp_reply_for_request(void *reply, size_t reply_size,
 				    const void *request, size_t request_size,
 				    const struct tbv_tbnet_arp_proxy *proxy);
+struct tb_property_dir *tbv_service_create_native_dir(void);
+struct tb_property_dir *tbv_service_create_apple_dir(u32 prtcstns);
 void tbv_rail_key_init(struct tbv_rail_key *key, u64 route,
 		       u32 local_adapter, u32 remote_adapter, u32 path_id);
 int tbv_rail_key_cmp(const struct tbv_rail_key *a,
