@@ -10,7 +10,7 @@
 
 #include "tbv.h"
 
-static const uuid_t tbv_native_service_uuid =
+const uuid_t tbv_native_service_uuid =
 	UUID_INIT(0x7c2c8f1e, 0x5b4d, 0x4a01, 0x9f, 0x3a,
 		  0x2b, 0x8e, 0x6d, 0x4c, 0x1a, 0x07);
 
@@ -258,6 +258,10 @@ int tbv_services_start(struct tbv_state *state, bool bind_services,
 
 	tbv_service_state = state;
 
+	ret = tbv_native_control_start(state);
+	if (ret)
+		goto err_clear;
+
 	if (state->cfg.native_enabled) {
 		ret = tbv_register_native_dir(state,
 					      service_cfg->native_prtcstns);
@@ -295,6 +299,7 @@ err_unregister_native:
 		state->native_dir = NULL;
 	}
 err_clear:
+	tbv_native_control_stop();
 	tbv_service_state = NULL;
 	return ret;
 }
@@ -305,6 +310,8 @@ void tbv_services_stop(struct tbv_state *state)
 		tb_unregister_service_driver(&tbv_service_driver);
 		state->services_registered = false;
 	}
+
+	tbv_native_control_stop();
 
 	if (state->apple_dir) {
 		tb_unregister_property_dir(tbv_apple_protocol_key,

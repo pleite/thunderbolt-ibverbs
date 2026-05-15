@@ -191,6 +191,7 @@ struct tbv_service_config {
 struct tb_property_dir;
 struct tb_ring;
 struct tb_xdomain;
+extern const uuid_t tbv_native_service_uuid;
 
 int tbv_config_parse(struct tbv_config *cfg, const char *compat,
 		     const char *profile, const char *tbnet,
@@ -222,6 +223,8 @@ struct tb_property_dir *tbv_service_create_apple_dir(u32 prtcstns);
 int tbv_services_start(struct tbv_state *state, bool bind_services,
 		       const struct tbv_service_config *service_cfg);
 void tbv_services_stop(struct tbv_state *state);
+int tbv_native_control_start(struct tbv_state *state);
+void tbv_native_control_stop(void);
 void tbv_rail_key_init(struct tbv_rail_key *key, u64 route,
 		       u32 local_adapter, u32 remote_adapter, u32 path_id);
 int tbv_rail_key_cmp(const struct tbv_rail_key *a,
