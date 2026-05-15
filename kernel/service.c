@@ -170,11 +170,15 @@ static struct tb_service_driver tbv_service_driver = {
 	.id_table = tbv_service_ids,
 };
 
-static int tbv_register_native_dir(struct tbv_state *state)
+static int tbv_register_native_dir(struct tbv_state *state, u32 prtcstns)
 {
 	int ret;
 
-	state->native_dir = tbv_service_create_native_dir();
+	state->native_dir = tbv_service_create_dir_common(&tbv_native_service_uuid,
+							  TBV_NATIVE_PRTCID,
+							  TBV_NATIVE_PRTCVERS,
+							  TBV_NATIVE_PRTCREVS,
+							  prtcstns);
 	if (IS_ERR(state->native_dir)) {
 		ret = PTR_ERR(state->native_dir);
 		state->native_dir = NULL;
@@ -191,11 +195,11 @@ static int tbv_register_native_dir(struct tbv_state *state)
 	return ret;
 }
 
-static int tbv_register_apple_dir(struct tbv_state *state)
+static int tbv_register_apple_dir(struct tbv_state *state, u32 prtcstns)
 {
 	int ret;
 
-	state->apple_dir = tbv_service_create_apple_dir(0);
+	state->apple_dir = tbv_service_create_apple_dir(prtcstns);
 	if (IS_ERR(state->apple_dir)) {
 		ret = PTR_ERR(state->apple_dir);
 		state->apple_dir = NULL;
@@ -212,7 +216,8 @@ static int tbv_register_apple_dir(struct tbv_state *state)
 	return ret;
 }
 
-int tbv_services_start(struct tbv_state *state, bool bind_services)
+int tbv_services_start(struct tbv_state *state, bool bind_services,
+		       const struct tbv_service_config *service_cfg)
 {
 	int ret;
 
@@ -224,13 +229,15 @@ int tbv_services_start(struct tbv_state *state, bool bind_services)
 	tbv_service_state = state;
 
 	if (state->cfg.native_enabled) {
-		ret = tbv_register_native_dir(state);
+		ret = tbv_register_native_dir(state,
+					      service_cfg->native_prtcstns);
 		if (ret)
 			goto err_clear;
 	}
 
 	if (state->cfg.apple_enabled) {
-		ret = tbv_register_apple_dir(state);
+		ret = tbv_register_apple_dir(state,
+					     service_cfg->apple_prtcstns);
 		if (ret)
 			goto err_unregister_native;
 	}

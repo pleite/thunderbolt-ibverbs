@@ -148,6 +148,11 @@ struct tbv_state {
 	bool services_registered;
 };
 
+struct tbv_service_config {
+	u32 native_prtcstns;
+	u32 apple_prtcstns;
+};
+
 struct tb_property_dir;
 
 int tbv_config_parse(struct tbv_config *cfg, const char *compat,
@@ -177,7 +182,8 @@ int tbv_tbnet_arp_reply_for_request(void *reply, size_t reply_size,
 				    const struct tbv_tbnet_arp_proxy *proxy);
 struct tb_property_dir *tbv_service_create_native_dir(void);
 struct tb_property_dir *tbv_service_create_apple_dir(u32 prtcstns);
-int tbv_services_start(struct tbv_state *state, bool bind_services);
+int tbv_services_start(struct tbv_state *state, bool bind_services,
+		       const struct tbv_service_config *service_cfg);
 void tbv_services_stop(struct tbv_state *state);
 void tbv_rail_key_init(struct tbv_rail_key *key, u64 route,
 		       u32 local_adapter, u32 remote_adapter, u32 path_id);

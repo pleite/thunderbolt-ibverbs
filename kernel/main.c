@@ -42,12 +42,23 @@ module_param(bind_services, bool, 0444);
 MODULE_PARM_DESC(bind_services,
 		 "Register Thunderbolt service drivers and advertise services");
 
+static uint native_prtcstns;
+module_param(native_prtcstns, uint, 0444);
+MODULE_PARM_DESC(native_prtcstns,
+		 "Protocol settings advertised by the native Linux service");
+
+static uint apple_prtcstns;
+module_param(apple_prtcstns, uint, 0444);
+MODULE_PARM_DESC(apple_prtcstns,
+		 "Protocol settings advertised by the Apple AD/FA57 service");
+
 static struct tbv_state tbv_driver_state;
 
 static int __init tbv_init(void)
 {
 	char lanes_desc[32];
 	struct tbv_resolved_config resolved;
+	struct tbv_service_config service_cfg;
 	struct tbv_config cfg;
 	int ret;
 
@@ -68,7 +79,11 @@ static int __init tbv_init(void)
 	if (ret)
 		return ret;
 
-	ret = tbv_services_start(&tbv_driver_state, bind_services);
+	service_cfg.native_prtcstns = native_prtcstns;
+	service_cfg.apple_prtcstns = apple_prtcstns;
+
+	ret = tbv_services_start(&tbv_driver_state, bind_services,
+				 &service_cfg);
 	if (ret) {
 		tbv_core_exit(&tbv_driver_state);
 		return ret;
