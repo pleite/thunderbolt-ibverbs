@@ -32,6 +32,7 @@ int tbv_core_init(struct tbv_state *state,
 	mutex_init(&state->lock);
 	INIT_LIST_HEAD(&state->peers);
 	xa_init(&state->verbs_mrs_xa);
+	xa_init(&state->verbs_qps_xa);
 	state->next_peer_id = 1;
 
 	if (!cfg->native_enabled && !cfg->apple_enabled)
@@ -70,7 +71,10 @@ void tbv_core_exit(struct tbv_state *state)
 	tbv_debugfs_exit(state);
 	if (!xa_empty(&state->verbs_mrs_xa))
 		pr_warn("unloading with live MR registry entries\n");
+	if (!xa_empty(&state->verbs_qps_xa))
+		pr_warn("unloading with live QP registry entries\n");
 	xa_destroy(&state->verbs_mrs_xa);
+	xa_destroy(&state->verbs_qps_xa);
 	tbv_tbnet_identity_stop(&state->tbnet_identity);
 	mutex_destroy(&state->lock);
 }

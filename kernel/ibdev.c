@@ -291,6 +291,7 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 {
 	struct tbv_qp *tqp = container_of(qp, struct tbv_qp, base);
 	int qpn;
+	int ret;
 
 	if (!init_attr || init_attr->srq)
 		return -EOPNOTSUPP;
@@ -325,6 +326,13 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	tqp->qpn_allocated = true;
 	qp->qp_num = qpn;
 	init_attr->cap.max_inline_data = 0;
+	ret = xa_insert(&tqp->owner->verbs_qps_xa, qpn, tqp, GFP_KERNEL);
+	if (ret) {
+		kfree(tqp->recvq);
+		ida_free(&tbv_qpn_ida, qpn);
+		tqp->qpn_allocated = false;
+		return ret;
+	}
 	atomic_inc(&tqp->owner->verbs_qps);
 	return 0;
 }
@@ -335,6 +343,8 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 
 	if (tqp->owner && tqp->recv_count)
 		atomic_sub(tqp->recv_count, &tqp->owner->verbs_recv_wqes);
+	if (tqp->owner)
+		xa_erase(&tqp->owner->verbs_qps_xa, qp->qp_num);
 	kfree(tqp->recvq);
 	if (tqp->qpn_allocated) {
 		ida_free(&tbv_qpn_ida, qp->qp_num);
