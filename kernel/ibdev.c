@@ -6,6 +6,7 @@
 #include <linux/errno.h>
 #include <linux/idr.h>
 #include <linux/module.h>
+#include <linux/overflow.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <rdma/ib_mad.h>
@@ -47,13 +48,26 @@ struct tbv_cq {
 	u32 count;
 };
 
+struct tbv_recv_wqe {
+	u64 wr_id;
+	u64 addr;
+	u32 length;
+	u32 lkey;
+};
+
 struct tbv_qp {
 	struct ib_qp base;
 	struct tbv_state *owner;
+	spinlock_t lock;
 	struct ib_qp_init_attr init_attr;
 	struct ib_qp_attr attr;
+	struct tbv_recv_wqe *recvq;
 	enum ib_qp_state state;
 	enum ib_qp_type type;
+	u32 recvq_size;
+	u32 recv_head;
+	u32 recv_tail;
+	u32 recv_count;
 	bool qpn_allocated;
 };
 
@@ -293,8 +307,19 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	if (qpn < 0)
 		return qpn;
 
+	if (init_attr->cap.max_recv_wr) {
+		tqp->recvq = kcalloc(init_attr->cap.max_recv_wr,
+				     sizeof(*tqp->recvq), GFP_KERNEL);
+		if (!tqp->recvq) {
+			ida_free(&tbv_qpn_ida, qpn);
+			return -ENOMEM;
+		}
+		tqp->recvq_size = init_attr->cap.max_recv_wr;
+	}
+
 	tqp->init_attr = *init_attr;
 	tqp->owner = tbv_ibdev_state(qp->device);
+	spin_lock_init(&tqp->lock);
 	tqp->state = IB_QPS_RESET;
 	tqp->type = init_attr->qp_type;
 	tqp->qpn_allocated = true;
@@ -308,6 +333,9 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 {
 	struct tbv_qp *tqp = container_of(qp, struct tbv_qp, base);
 
+	if (tqp->owner && tqp->recv_count)
+		atomic_sub(tqp->recv_count, &tqp->owner->verbs_recv_wqes);
+	kfree(tqp->recvq);
 	if (tqp->qpn_allocated) {
 		ida_free(&tbv_qpn_ida, qp->qp_num);
 		tqp->qpn_allocated = false;
@@ -353,12 +381,79 @@ static int tbv_post_send(struct ib_qp *qp, const struct ib_send_wr *wr,
 	return -EOPNOTSUPP;
 }
 
+static int tbv_validate_recv_sge(struct tbv_qp *tqp, const struct ib_sge *sge)
+{
+	struct tbv_mr *mr;
+	u64 mr_end;
+	u64 end;
+
+	if (!sge->length)
+		return 0;
+	if (check_add_overflow(sge->addr, (u64)sge->length, &end))
+		return -EINVAL;
+
+	mr = xa_load(&tqp->owner->verbs_mrs_xa, sge->lkey);
+	if (!mr)
+		return -EINVAL;
+	if (!(mr->access & IB_ACCESS_LOCAL_WRITE))
+		return -EACCES;
+	if (check_add_overflow(mr->start, mr->length, &mr_end))
+		return -EINVAL;
+	if (sge->addr < mr->start || end > mr_end)
+		return -EFAULT;
+
+	return 0;
+}
+
 static int tbv_post_recv(struct ib_qp *qp, const struct ib_recv_wr *wr,
 			 const struct ib_recv_wr **bad_wr)
 {
+	struct tbv_qp *tqp = container_of(qp, struct tbv_qp, base);
+	unsigned long flags;
+	const struct ib_recv_wr *cur;
+	int ret;
+
+	for (cur = wr; cur; cur = cur->next) {
+		const struct ib_sge *sge = NULL;
+
+		if (cur->num_sge > 1) {
+			ret = -EINVAL;
+			goto err_bad;
+		}
+		if (cur->num_sge == 1) {
+			sge = cur->sg_list;
+			if (!sge) {
+				ret = -EINVAL;
+				goto err_bad;
+			}
+			ret = tbv_validate_recv_sge(tqp, sge);
+			if (ret)
+				goto err_bad;
+		}
+
+		spin_lock_irqsave(&tqp->lock, flags);
+		if (tqp->recv_count == tqp->recvq_size) {
+			spin_unlock_irqrestore(&tqp->lock, flags);
+			ret = -ENOMEM;
+			goto err_bad;
+		}
+
+		tqp->recvq[tqp->recv_tail].wr_id = cur->wr_id;
+		tqp->recvq[tqp->recv_tail].addr = sge ? sge->addr : 0;
+		tqp->recvq[tqp->recv_tail].length = sge ? sge->length : 0;
+		tqp->recvq[tqp->recv_tail].lkey = sge ? sge->lkey : 0;
+		tqp->recv_tail = (tqp->recv_tail + 1) % tqp->recvq_size;
+		tqp->recv_count++;
+		atomic_inc(&tqp->owner->verbs_recv_wqes);
+		spin_unlock_irqrestore(&tqp->lock, flags);
+	}
+
+	return 0;
+
+err_bad:
 	if (bad_wr)
-		*bad_wr = wr;
-	return -EOPNOTSUPP;
+		*bad_wr = cur;
+	return ret;
 }
 
 static int tbv_poll_cq(struct ib_cq *cq, int num_entries, struct ib_wc *wc)

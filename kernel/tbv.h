@@ -203,6 +203,7 @@ struct tbv_state {
 	atomic_t verbs_cqs;
 	atomic_t verbs_qps;
 	atomic_t verbs_mrs;
+	atomic_t verbs_recv_wqes;
 	struct xarray verbs_mrs_xa;
 	struct tbv_ibdev *ibdev;
 };

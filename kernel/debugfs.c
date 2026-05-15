@@ -30,6 +30,8 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 	seq_printf(s, "verbs_cqs: %d\n", atomic_read(&state->verbs_cqs));
 	seq_printf(s, "verbs_qps: %d\n", atomic_read(&state->verbs_qps));
 	seq_printf(s, "verbs_mrs: %d\n", atomic_read(&state->verbs_mrs));
+	seq_printf(s, "verbs_recv_wqes: %d\n",
+		   atomic_read(&state->verbs_recv_wqes));
 	return 0;
 }
 
