@@ -37,36 +37,47 @@ static char *lanes = "auto";
 module_param(lanes, charp, 0444);
 MODULE_PARM_DESC(lanes, "Lane request: auto, N, or MIN-MAX");
 
-static struct tbv_config tbv_cfg;
+static struct tbv_state tbv_driver_state;
 
 static int __init tbv_init(void)
 {
 	char lanes_desc[32];
+	struct tbv_resolved_config resolved;
+	struct tbv_config cfg;
 	int ret;
 
-	ret = tbv_config_parse(&tbv_cfg, compat, profile, tbnet,
+	ret = tbv_config_parse(&cfg, compat, profile, tbnet,
 			       tbnet_identity, lanes);
 	if (ret)
 		return ret;
 
-	ret = tbv_tbnet_identity_check_config(&tbv_cfg);
+	ret = tbv_config_resolve(&resolved, &cfg);
 	if (ret)
 		return ret;
 
-	if (tbv_cfg.lanes_auto)
+	ret = tbv_tbnet_identity_check_config(&resolved);
+	if (ret)
+		return ret;
+
+	ret = tbv_core_init(&tbv_driver_state, &resolved);
+	if (ret)
+		return ret;
+
+	if (cfg.lanes_auto)
 		strscpy(lanes_desc, "auto", sizeof(lanes_desc));
-	else if (tbv_cfg.lanes_min == tbv_cfg.lanes_max)
+	else if (cfg.lanes_min == cfg.lanes_max)
 		snprintf(lanes_desc, sizeof(lanes_desc), "%u",
-			 tbv_cfg.lanes_min);
+			 cfg.lanes_min);
 	else
 		snprintf(lanes_desc, sizeof(lanes_desc), "%u-%u",
-			 tbv_cfg.lanes_min, tbv_cfg.lanes_max);
+			 cfg.lanes_min, cfg.lanes_max);
 
-	pr_info("loaded compat=%s profile=%s tbnet=%s tbnet_identity=%s lanes=%s\n",
-		tbv_compat_name(tbv_cfg.compat),
-		tbv_profile_name(tbv_cfg.profile),
-		tbv_tbnet_policy_name(tbv_cfg.tbnet),
-		tbv_tbnet_identity_name(tbv_cfg.tbnet_identity),
+	pr_info("loaded compat=%s profile=%s resolved_profile=%s tbnet=%s tbnet_identity=%s lanes=%s\n",
+		tbv_compat_name(cfg.compat),
+		tbv_profile_name(cfg.profile),
+		tbv_profile_name(resolved.profile),
+		tbv_tbnet_policy_name(cfg.tbnet),
+		tbv_tbnet_identity_name(resolved.tbnet_identity),
 		lanes_desc);
 
 	return 0;
@@ -74,6 +85,7 @@ static int __init tbv_init(void)
 
 static void __exit tbv_exit(void)
 {
+	tbv_core_exit(&tbv_driver_state);
 	pr_info("unloaded\n");
 }
 

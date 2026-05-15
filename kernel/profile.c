@@ -128,6 +128,70 @@ int tbv_config_parse(struct tbv_config *cfg, const char *compat,
 	return 0;
 }
 
+static enum tbv_profile tbv_resolve_profile(const struct tbv_config *cfg)
+{
+	if (cfg->profile != TBV_PROFILE_AUTO)
+		return cfg->profile;
+
+	switch (cfg->compat) {
+	case TBV_COMPAT_FORCE:
+		return TBV_PROFILE_MAC_COMPAT;
+	case TBV_COMPAT_OFF:
+		return TBV_PROFILE_LINUX_PERF;
+	case TBV_COMPAT_AUTO:
+	default:
+		return TBV_PROFILE_MIXED;
+	}
+}
+
+static enum tbv_tbnet_identity_mode
+tbv_resolve_tbnet_identity(const struct tbv_config *cfg,
+			   enum tbv_profile profile)
+{
+	if (cfg->tbnet_identity != TBV_TBNET_ID_AUTO)
+		return cfg->tbnet_identity;
+
+	if (profile == TBV_PROFILE_MAC_COMPAT || profile == TBV_PROFILE_MIXED)
+		return TBV_TBNET_ID_STOCK_PROXY;
+
+	return TBV_TBNET_ID_OFF;
+}
+
+int tbv_config_resolve(struct tbv_resolved_config *resolved,
+		       const struct tbv_config *cfg)
+{
+	enum tbv_profile profile;
+
+	memset(resolved, 0, sizeof(*resolved));
+	resolved->requested = *cfg;
+
+	profile = tbv_resolve_profile(cfg);
+
+	if (cfg->compat == TBV_COMPAT_FORCE &&
+	    profile == TBV_PROFILE_LINUX_PERF) {
+		pr_err("compat=force conflicts with profile=linux_perf\n");
+		return -EINVAL;
+	}
+
+	if (cfg->compat == TBV_COMPAT_OFF &&
+	    profile == TBV_PROFILE_MAC_COMPAT) {
+		pr_err("compat=off conflicts with profile=mac_compat\n");
+		return -EINVAL;
+	}
+
+	resolved->profile = profile;
+	resolved->tbnet_identity = tbv_resolve_tbnet_identity(cfg, profile);
+	resolved->native_enabled = profile == TBV_PROFILE_LINUX_PERF ||
+				   profile == TBV_PROFILE_MIXED;
+	resolved->apple_enabled = profile == TBV_PROFILE_MAC_COMPAT ||
+				  profile == TBV_PROFILE_MIXED;
+	resolved->rc_supported = resolved->native_enabled;
+	resolved->uc_supported = resolved->native_enabled ||
+				 resolved->apple_enabled;
+
+	return 0;
+}
+
 const char *tbv_compat_name(enum tbv_compat_mode mode)
 {
 	switch (mode) {
@@ -187,6 +251,18 @@ const char *tbv_tbnet_identity_name(enum tbv_tbnet_identity_mode mode)
 		return "minimal_packet";
 	case TBV_TBNET_ID_OFF:
 		return "off";
+	default:
+		return "unknown";
+	}
+}
+
+const char *tbv_backend_name(enum tbv_backend_type type)
+{
+	switch (type) {
+	case TBV_BACKEND_NATIVE:
+		return "native";
+	case TBV_BACKEND_APPLE:
+		return "apple";
 	default:
 		return "unknown";
 	}

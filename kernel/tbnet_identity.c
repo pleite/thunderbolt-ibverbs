@@ -14,15 +14,17 @@
 
 #include "tbv.h"
 
-int tbv_tbnet_identity_check_config(const struct tbv_config *cfg)
+int tbv_tbnet_identity_check_config(const struct tbv_resolved_config *cfg)
 {
-	if (cfg->profile == TBV_PROFILE_MAC_COMPAT &&
+	const struct tbv_config *requested = &cfg->requested;
+
+	if (cfg->apple_enabled &&
 	    cfg->tbnet_identity == TBV_TBNET_ID_OFF) {
-		pr_err("profile=mac_compat requires TBnet identity\n");
+		pr_err("Apple-compatible backend requires TBnet identity\n");
 		return -EINVAL;
 	}
 
-	if (cfg->tbnet == TBV_TBNET_BLOCK &&
+	if (requested->tbnet == TBV_TBNET_BLOCK &&
 	    (cfg->tbnet_identity == TBV_TBNET_ID_STOCK ||
 	     cfg->tbnet_identity == TBV_TBNET_ID_STOCK_PROXY)) {
 		pr_err("tbnet=block conflicts with tbnet_identity=%s\n",
@@ -31,7 +33,7 @@ int tbv_tbnet_identity_check_config(const struct tbv_config *cfg)
 	}
 
 	if (cfg->profile == TBV_PROFILE_LINUX_PERF &&
-	    cfg->tbnet_identity != TBV_TBNET_ID_AUTO &&
+	    requested->tbnet_identity != TBV_TBNET_ID_AUTO &&
 	    cfg->tbnet_identity != TBV_TBNET_ID_OFF) {
 		pr_warn("linux_perf ignores Apple TBnet identity unless an Apple peer is selected\n");
 	}
