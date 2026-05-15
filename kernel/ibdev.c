@@ -8,6 +8,7 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <rdma/ib_mad.h>
+#include <rdma/ib_umem.h>
 #include <rdma/ib_user_verbs.h>
 #include <rdma/ib_verbs.h>
 
@@ -53,6 +54,7 @@ struct tbv_qp {
 struct tbv_mr {
 	struct ib_mr base;
 	struct tbv_state *owner;
+	struct ib_umem *umem;
 	u64 start;
 	u64 length;
 	u64 virt_addr;
@@ -371,6 +373,14 @@ static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	if (!mr)
 		return ERR_PTR(-ENOMEM);
 
+	mr->umem = ib_umem_get(pd->device, start, length, access);
+	if (IS_ERR(mr->umem)) {
+		struct ib_umem *umem = mr->umem;
+
+		kfree(mr);
+		return ERR_CAST(umem);
+	}
+
 	key = atomic_inc_return(&tbv_mr_key);
 	mr->base.lkey = key;
 	mr->base.rkey = key;
@@ -389,6 +399,7 @@ static int tbv_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
 
 	if (mr->owner)
 		atomic_dec(&mr->owner->verbs_mrs);
+	ib_umem_release(mr->umem);
 	kfree(mr);
 	return 0;
 }
