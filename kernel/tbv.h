@@ -173,9 +173,11 @@ struct tbv_state {
 	struct tbv_tbnet_identity tbnet_identity;
 	struct tb_property_dir *native_dir;
 	struct tb_property_dir *apple_dir;
+	struct dentry *debugfs_dir;
 	bool services_registered;
 };
 
+struct dentry;
 struct tbv_service_config {
 	u32 native_prtcstns;
 	u32 apple_prtcstns;
@@ -231,6 +233,8 @@ void tbv_path_reset(struct tbv_path *path);
 const char *tbv_path_state_name(enum tbv_path_state state);
 
 const struct tbv_backend_ops *tbv_backend_get(enum tbv_backend_type type);
+int tbv_debugfs_init(struct tbv_state *state);
+void tbv_debugfs_exit(struct tbv_state *state);
 
 int tbv_core_init(struct tbv_state *state,
 		  const struct tbv_resolved_config *cfg);

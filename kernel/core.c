@@ -42,6 +42,13 @@ int tbv_core_init(struct tbv_state *state,
 		return ret;
 	}
 
+	ret = tbv_debugfs_init(state);
+	if (ret) {
+		tbv_tbnet_identity_stop(&state->tbnet_identity);
+		mutex_destroy(&state->lock);
+		return ret;
+	}
+
 	if (cfg->native_enabled)
 		tbv_core_log_backend(TBV_BACKEND_NATIVE);
 
@@ -59,6 +66,7 @@ void tbv_core_exit(struct tbv_state *state)
 	if (!list_empty(&state->peers))
 		pr_warn("unloading with live peers; hardware binding is not implemented yet\n");
 
+	tbv_debugfs_exit(state);
 	tbv_tbnet_identity_stop(&state->tbnet_identity);
 	mutex_destroy(&state->lock);
 }
