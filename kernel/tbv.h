@@ -111,6 +111,10 @@ struct tbv_path_config {
 	u32 rx_ring_size;
 	u32 tx_flags;
 	u32 rx_flags;
+	int tx_hop;
+	int rx_hop;
+	int transmit_path;
+	int receive_path;
 	u16 sof_mask;
 	u16 eof_mask;
 	bool e2e;
@@ -144,6 +148,8 @@ struct tbv_path {
 	atomic64_t data_rx_completed;
 	bool tx_scheduling;
 	int local_transmit_path;
+	int local_tx_hop;
+	int local_rx_hop;
 	int remote_transmit_path;
 };
 

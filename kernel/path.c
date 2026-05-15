@@ -94,6 +94,10 @@ void tbv_path_default_config(enum tbv_backend_type backend,
 			     struct tbv_path_config *cfg)
 {
 	memset(cfg, 0, sizeof(*cfg));
+	cfg->tx_hop = -1;
+	cfg->rx_hop = -1;
+	cfg->transmit_path = -1;
+	cfg->receive_path = -1;
 
 	switch (backend) {
 	case TBV_BACKEND_APPLE:
@@ -101,6 +105,10 @@ void tbv_path_default_config(enum tbv_backend_type backend,
 		cfg->rx_ring_size = TBV_APPLE_RING_SIZE;
 		cfg->tx_flags = RING_FLAG_FRAME;
 		cfg->rx_flags = RING_FLAG_FRAME | RING_FLAG_E2E;
+		cfg->tx_hop = 2;
+		cfg->rx_hop = 2;
+		cfg->transmit_path = 9;
+		cfg->receive_path = 9;
 		cfg->sof_mask = BIT(1);
 		cfg->eof_mask = BIT(2) | BIT(3);
 		cfg->e2e = true;
@@ -133,6 +141,8 @@ void tbv_path_init(struct tbv_path *path,
 	INIT_LIST_HEAD(&path->tx_data_queue);
 	atomic_set(&path->tx_inflight, 0);
 	path->local_transmit_path = -1;
+	path->local_tx_hop = -1;
+	path->local_rx_hop = -1;
 	path->remote_transmit_path = -1;
 }
 
@@ -149,6 +159,8 @@ void tbv_path_reset(struct tbv_path *path)
 	INIT_LIST_HEAD(&path->tx_data_queue);
 	atomic_set(&path->tx_inflight, 0);
 	path->local_transmit_path = -1;
+	path->local_tx_hop = -1;
+	path->local_rx_hop = -1;
 	path->remote_transmit_path = -1;
 }
 
@@ -392,11 +404,18 @@ int tbv_path_alloc_rings(struct tbv_path *path, struct tb_xdomain *xd,
 {
 	int e2e_tx_hop = 0;
 	int transmit_path;
+	int tx_hop;
+	int rx_hop;
 
 	if (path->state != TBV_PATH_NEW && path->state != TBV_PATH_STOPPED)
 		return -EBUSY;
 
-	path->tx_ring = tb_ring_alloc_tx(xd->tb->nhi, -1,
+	tx_hop = path->cfg.tx_hop;
+	rx_hop = path->cfg.rx_hop;
+	if (requested_transmit_path < 0)
+		requested_transmit_path = path->cfg.transmit_path;
+
+	path->tx_ring = tb_ring_alloc_tx(xd->tb->nhi, tx_hop,
 					 path->cfg.tx_ring_size,
 					 path->cfg.tx_flags);
 	if (!path->tx_ring)
@@ -410,11 +429,12 @@ int tbv_path_alloc_rings(struct tbv_path *path, struct tb_xdomain *xd,
 		return transmit_path;
 	}
 	path->local_transmit_path = transmit_path;
+	path->local_tx_hop = path->tx_ring->hop;
 
 	if (path->cfg.e2e)
 		e2e_tx_hop = path->tx_ring->hop;
 
-	path->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, -1,
+	path->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, rx_hop,
 					 path->cfg.rx_ring_size,
 					 path->cfg.rx_flags, e2e_tx_hop,
 					 path->cfg.sof_mask,
@@ -424,8 +444,10 @@ int tbv_path_alloc_rings(struct tbv_path *path, struct tb_xdomain *xd,
 		path->local_transmit_path = -1;
 		tb_ring_free(path->tx_ring);
 		path->tx_ring = NULL;
+		path->local_tx_hop = -1;
 		return -ENOMEM;
 	}
+	path->local_rx_hop = path->rx_ring->hop;
 
 	if (tbv_path_alloc_frames(path, true))
 		goto err_rx_ring;
@@ -444,10 +466,12 @@ err_tx_frames:
 err_rx_ring:
 	tb_ring_free(path->rx_ring);
 	path->rx_ring = NULL;
+	path->local_rx_hop = -1;
 	tb_xdomain_release_out_hopid(xd, path->local_transmit_path);
 	path->local_transmit_path = -1;
 	tb_ring_free(path->tx_ring);
 	path->tx_ring = NULL;
+	path->local_tx_hop = -1;
 	return -ENOMEM;
 }
 
@@ -486,9 +510,9 @@ int tbv_path_enable_tunnel(struct tbv_path *path, struct tb_xdomain *xd,
 		return ret < 0 ? ret : -EBUSY;
 
 	ret = tb_xdomain_enable_paths(xd, path->local_transmit_path,
-				      path->tx_ring->hop,
+				      path->local_tx_hop,
 				      remote_transmit_path,
-				      path->rx_ring->hop);
+				      path->local_rx_hop);
 	if (ret) {
 		tb_xdomain_release_in_hopid(xd, remote_transmit_path);
 		return ret;
@@ -918,9 +942,9 @@ void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd)
 {
 	if (path->state == TBV_PATH_TUNNEL_ENABLED) {
 		tb_xdomain_disable_paths(xd, path->local_transmit_path,
-					 path->tx_ring ? path->tx_ring->hop : -1,
+					 path->local_tx_hop,
 					 path->remote_transmit_path,
-					 path->rx_ring ? path->rx_ring->hop : -1);
+					 path->local_rx_hop);
 		tb_xdomain_release_in_hopid(xd, path->remote_transmit_path);
 		path->remote_transmit_path = -1;
 		path->state = TBV_PATH_RING_STARTED;
@@ -940,6 +964,7 @@ void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd)
 		tbv_path_free_frames(path, false);
 		tb_ring_free(path->rx_ring);
 		path->rx_ring = NULL;
+		path->local_rx_hop = -1;
 	}
 
 	if (path->local_transmit_path >= 0) {
@@ -951,6 +976,7 @@ void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd)
 		tbv_path_free_frames(path, true);
 		tb_ring_free(path->tx_ring);
 		path->tx_ring = NULL;
+		path->local_tx_hop = -1;
 	}
 	tbv_path_free_control_packets(path);
 
