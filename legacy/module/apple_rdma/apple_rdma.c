@@ -87,6 +87,7 @@
 #define ARDMA_APPLE_RAW_FRAMES_PER_CHUNK	17
 #define ARDMA_APPLE_RAW_MAX_RECV_BYTES	SZ_512K
 #define ARDMA_APPLE_RAW_RX_WINDOW_BYTES	SZ_2M
+#define ARDMA_APPLE_MAX_SEND_BYTES	SZ_2M
 #define ARDMA_RAW_RX_CREDIT_HEADROOM	64
 #define ARDMA_RX_MARKER_LOG_ENTRIES	8192
 #define ARDMA_RX_MARKER_PREFIX	128
@@ -359,6 +360,11 @@ static unsigned int raw_rx_window_bytes = ARDMA_APPLE_RAW_RX_WINDOW_BYTES;
 module_param(raw_rx_window_bytes, uint, 0644);
 MODULE_PARM_DESC(raw_rx_window_bytes,
 		 "Maximum total bytes of posted Apple RAW receive WRs per peer; 0 disables (default: 2097152)");
+
+static unsigned int apple_tx_max_send_bytes = ARDMA_APPLE_MAX_SEND_BYTES;
+module_param(apple_tx_max_send_bytes, uint, 0644);
+MODULE_PARM_DESC(apple_tx_max_send_bytes,
+		 "Maximum single SEND size allowed to an Apple peer; 0 disables (default: 2097152)");
 
 static unsigned int apple_max_uc_qps = 1;
 module_param(apple_max_uc_qps, uint, 0644);
@@ -2982,6 +2988,15 @@ static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
 			qp->base.qp_num, total, ARDMA_MAX_MSG_SIZE);
 		return -EMSGSIZE;
 	}
+	if (peer->remote_is_apple) {
+		u32 max_send = READ_ONCE(apple_tx_max_send_bytes);
+
+		if (max_send && total > max_send) {
+			pr_warn_ratelimited("send_apple[qp=0x%x]: rejecting Apple SEND len=%u max=%u\n",
+					    qp->base.qp_num, total, max_send);
+			return -EMSGSIZE;
+		}
+	}
 
 	path_mtu = ardma_qp_path_mtu_bytes(qp);
 	if ((int)path_mtu <= 0 ||
@@ -4063,6 +4078,10 @@ static int ardma_query_port(struct ib_device *ibdev, u32 port_num,
 	attr->max_mtu = IB_MTU_4096;
 	attr->active_mtu = ardma_active_mtu_enum();
 	attr->max_msg_sz = ARDMA_MAX_MSG_SIZE;
+	if (dev->peer && dev->peer->remote_is_apple &&
+	    READ_ONCE(apple_tx_max_send_bytes))
+		attr->max_msg_sz = min_t(u32, attr->max_msg_sz,
+					 READ_ONCE(apple_tx_max_send_bytes));
 	attr->gid_tbl_len = 32;
 	attr->pkey_tbl_len = 1;
 	attr->max_vl_num = 1;
@@ -4900,6 +4919,8 @@ static int ardma_stats_show(struct seq_file *m, void *unused)
 		   (long long)atomic64_read(&peer->raw_rx_bytes_reserved));
 	seq_printf(m, "raw_rx_window_bytes: %u\n",
 		   READ_ONCE(raw_rx_window_bytes));
+	seq_printf(m, "apple_tx_max_send_bytes: %u\n",
+		   READ_ONCE(apple_tx_max_send_bytes));
 	seq_printf(m, "local_in_hop: %d\n", peer->local_in_hop);
 	seq_printf(m, "rx_hop: %d\n", peer->rx_ring ? peer->rx_ring->hop : -1);
 	seq_printf(m, "local_out_hop: %d\n", peer->local_out_hop);
@@ -5178,6 +5199,8 @@ static int ardma_nhi_stall_dump_show(struct seq_file *m, void *unused)
 		   (long long)atomic64_read(&peer->raw_rx_bytes_reserved));
 	seq_printf(m, "raw_rx_window_bytes: %u\n",
 		   READ_ONCE(raw_rx_window_bytes));
+	seq_printf(m, "apple_tx_max_send_bytes: %u\n",
+		   READ_ONCE(apple_tx_max_send_bytes));
 	seq_printf(m, "local_in_hop: %d\n", peer->local_in_hop);
 	seq_printf(m, "local_out_hop: %d\n", peer->local_out_hop);
 	seq_printf(m, "remote_is_apple: %u\n", peer->remote_is_apple);
