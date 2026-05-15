@@ -7,7 +7,7 @@ KDIR ?= /lib/modules/$(KVER)/build
 PWD := $(shell pwd)
 
 obj-m := thunderbolt_ibverbs.o
-thunderbolt_ibverbs-y := main.o profile.o backend.o core.o debugfs.o native_control.o path.o peer.o rail.o service.o tbnet_identity.o
+thunderbolt_ibverbs-y := main.o profile.o backend.o core.o debugfs.o ibdev.o native_control.o path.o peer.o rail.o service.o tbnet_identity.o
 
 ccflags-y := -Wall -Wextra -Wno-unused-parameter
 
@@ -40,5 +40,6 @@ help:
 	@echo "  start_rings=0|1"
 	@echo "  negotiate_native=0|1"
 	@echo "  enable_tunnels=0|1"
+	@echo "  register_verbs=0|1"
 	@echo "  native_prtcstns=<u32>"
 	@echo "  apple_prtcstns=<u32>"

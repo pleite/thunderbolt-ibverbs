@@ -193,7 +193,10 @@ struct tbv_state {
 	bool start_rings;
 	bool negotiate_native;
 	bool enable_tunnels;
+	bool register_verbs;
 	bool services_registered;
+	bool verbs_registered;
+	struct tbv_ibdev *ibdev;
 };
 
 struct dentry;
@@ -222,6 +225,9 @@ const char *tbv_profile_name(enum tbv_profile profile);
 const char *tbv_tbnet_policy_name(enum tbv_tbnet_policy policy);
 const char *tbv_tbnet_identity_name(enum tbv_tbnet_identity_mode mode);
 const char *tbv_backend_name(enum tbv_backend_type type);
+
+int tbv_ibdev_start(struct tbv_state *state, bool register_verbs);
+void tbv_ibdev_stop(struct tbv_state *state);
 
 int tbv_tbnet_identity_check_config(const struct tbv_resolved_config *cfg);
 int tbv_tbnet_identity_prepare(struct tbv_tbnet_identity *identity,

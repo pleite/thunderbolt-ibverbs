@@ -22,6 +22,8 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 	seq_printf(s, "start_rings: %u\n", state->start_rings);
 	seq_printf(s, "negotiate_native: %u\n", state->negotiate_native);
 	seq_printf(s, "enable_tunnels: %u\n", state->enable_tunnels);
+	seq_printf(s, "register_verbs: %u\n", state->register_verbs);
+	seq_printf(s, "verbs_registered: %u\n", state->verbs_registered);
 	return 0;
 }
 

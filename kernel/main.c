@@ -72,6 +72,11 @@ module_param(enable_tunnels, bool, 0444);
 MODULE_PARM_DESC(enable_tunnels,
 		 "Enable negotiated Thunderbolt paths after native HELLO");
 
+static bool register_verbs;
+module_param(register_verbs, bool, 0444);
+MODULE_PARM_DESC(register_verbs,
+		 "Register a guarded libibverbs device skeleton");
+
 static struct tbv_state tbv_driver_state;
 
 static int __init tbv_init(void)
@@ -128,6 +133,13 @@ static int __init tbv_init(void)
 		return ret;
 	}
 
+	ret = tbv_ibdev_start(&tbv_driver_state, register_verbs);
+	if (ret) {
+		tbv_services_stop(&tbv_driver_state);
+		tbv_core_exit(&tbv_driver_state);
+		return ret;
+	}
+
 	if (cfg.lanes_auto)
 		strscpy(lanes_desc, "auto", sizeof(lanes_desc));
 	else if (cfg.lanes_min == cfg.lanes_max)
@@ -150,6 +162,7 @@ static int __init tbv_init(void)
 
 static void __exit tbv_exit(void)
 {
+	tbv_ibdev_stop(&tbv_driver_state);
 	tbv_services_stop(&tbv_driver_state);
 	tbv_core_exit(&tbv_driver_state);
 	pr_info("unloaded\n");
@@ -161,3 +174,4 @@ module_exit(tbv_exit);
 MODULE_AUTHOR("thunderbolt-ibverbs contributors");
 MODULE_DESCRIPTION("Thunderbolt/USB4 host-to-host RDMA verbs");
 MODULE_LICENSE("GPL");
+MODULE_SOFTDEP("pre: ib_core ib_uverbs");
