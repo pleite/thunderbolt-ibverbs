@@ -509,11 +509,13 @@ struct ardma_ibdev {
 	struct net_device *netdev;
 	struct net_device *tbnet_arp_dev;
 	struct notifier_block netdev_nb;
+	struct notifier_block inetaddr_nb;
 	struct mutex netdev_lock;
 	char netdev_name[IFNAMSIZ];
 	char tbnet_arp_name[IFNAMSIZ];
 	__be32 tbnet_arp_addr;
 	bool netdev_nb_registered;
+	bool inetaddr_nb_registered;
 	bool tbnet_arp_registered;
 	bool shutting_down;
 };
@@ -1619,7 +1621,8 @@ static rx_handler_result_t ardma_tbnet_arp_rx(struct sk_buff **pskb)
 	return RX_HANDLER_PASS;
 }
 
-static int ardma_start_tbnet_arp_proxy(struct ardma_ibdev *dev)
+static int ardma_start_tbnet_arp_proxy_locked(struct ardma_ibdev *dev,
+					      bool rtnl_held)
 {
 	struct net_device *netdev;
 	__be32 addr;
@@ -1629,6 +1632,8 @@ static int ardma_start_tbnet_arp_proxy(struct ardma_ibdev *dev)
 		return 0;
 	if (!dev || !dev->peer || !dev->netdev)
 		return -EINVAL;
+	if (dev->tbnet_arp_registered)
+		return 0;
 
 	if (!ardma_netdev_first_ipv4(dev->netdev, &addr)) {
 		pr_err("tbnet_arp_proxy requested but GID netdev %s has no IPv4 address\n",
@@ -1661,9 +1666,11 @@ static int ardma_start_tbnet_arp_proxy(struct ardma_ibdev *dev)
 
 	WRITE_ONCE(dev->tbnet_arp_addr, addr);
 
-	rtnl_lock();
+	if (!rtnl_held)
+		rtnl_lock();
 	ret = netdev_rx_handler_register(netdev, ardma_tbnet_arp_rx, dev);
-	rtnl_unlock();
+	if (!rtnl_held)
+		rtnl_unlock();
 	if (ret) {
 		pr_err("tbnet_arp_proxy failed to register RX handler on %s: %d\n",
 		       dev->tbnet_arp_name, ret);
@@ -1677,6 +1684,11 @@ static int ardma_start_tbnet_arp_proxy(struct ardma_ibdev *dev)
 		&dev->tbnet_arp_addr, dev->tbnet_arp_name,
 		netdev->dev_addr, dev->netdev_name);
 	return 0;
+}
+
+static int ardma_start_tbnet_arp_proxy(struct ardma_ibdev *dev)
+{
+	return ardma_start_tbnet_arp_proxy_locked(dev, false);
 }
 
 static void ardma_stop_tbnet_arp_proxy_locked(struct ardma_ibdev *dev,
@@ -1701,6 +1713,7 @@ static void ardma_stop_tbnet_arp_proxy_locked(struct ardma_ibdev *dev,
 	}
 
 	dev->tbnet_arp_dev = NULL;
+	WRITE_ONCE(dev->tbnet_arp_addr, 0);
 	dev_put(netdev);
 }
 
@@ -4579,6 +4592,9 @@ static int ardma_netdev_event(struct notifier_block *nb,
 	struct ardma_ibdev *dev =
 		container_of(nb, struct ardma_ibdev, netdev_nb);
 	struct net_device *netdev = netdev_notifier_info_to_dev(ptr);
+	char tbnet_name[IFNAMSIZ];
+	bool cm_match;
+	bool tbnet_match;
 	int ret;
 
 	switch (event) {
@@ -4592,6 +4608,7 @@ static int ardma_netdev_event(struct notifier_block *nb,
 		if (dev->netdev == netdev) {
 			pr_info("CM netdev %s unregistering; detaching GID netdev\n",
 				netdev_name(netdev));
+			ardma_stop_tbnet_arp_proxy_locked(dev, true);
 			ardma_detach_netdev_locked(dev);
 			mutex_unlock(&dev->netdev_lock);
 			return NOTIFY_OK;
@@ -4599,10 +4616,13 @@ static int ardma_netdev_event(struct notifier_block *nb,
 		mutex_unlock(&dev->netdev_lock);
 		break;
 	case NETDEV_REGISTER:
-		if (strcmp(netdev_name(netdev), dev->netdev_name))
-			break;
 		mutex_lock(&dev->netdev_lock);
-		if (!dev->netdev && !dev->shutting_down) {
+		cm_match = !strcmp(netdev_name(netdev), dev->netdev_name);
+		ardma_peer_tbnet_arp_name(dev->peer, tbnet_name,
+					  sizeof(tbnet_name));
+		tbnet_match = !strcmp(netdev_name(netdev), tbnet_name);
+
+		if (cm_match && !dev->netdev && !dev->shutting_down) {
 			ret = ardma_attach_netdev_locked(dev, netdev);
 			if (ret)
 				pr_warn("reattach CM netdev %s failed: %d\n",
@@ -4611,12 +4631,62 @@ static int ardma_netdev_event(struct notifier_block *nb,
 				pr_info("reattached CM netdev %s\n",
 					netdev_name(netdev));
 		}
+		if (tbnet_arp_proxy && !dev->shutting_down && dev->netdev &&
+		    !dev->tbnet_arp_registered && (cm_match || tbnet_match)) {
+			ret = ardma_start_tbnet_arp_proxy_locked(dev, true);
+			if (ret)
+				pr_warn("rearm TBnet ARP proxy after %s register failed: %d\n",
+					netdev_name(netdev), ret);
+		}
 		mutex_unlock(&dev->netdev_lock);
 		break;
 	default:
 		break;
 	}
 
+	return NOTIFY_DONE;
+}
+
+static int ardma_inetaddr_event(struct notifier_block *nb,
+				unsigned long event, void *ptr)
+{
+	struct ardma_ibdev *dev =
+		container_of(nb, struct ardma_ibdev, inetaddr_nb);
+	struct in_ifaddr *ifa = ptr;
+	struct net_device *netdev;
+	int ret;
+
+	if (!ifa || !ifa->ifa_dev)
+		return NOTIFY_DONE;
+	netdev = ifa->ifa_dev->dev;
+
+	mutex_lock(&dev->netdev_lock);
+	if (!tbnet_arp_proxy || dev->shutting_down || dev->netdev != netdev)
+		goto out;
+
+	switch (event) {
+	case NETDEV_UP:
+		if (dev->tbnet_arp_registered &&
+		    READ_ONCE(dev->tbnet_arp_addr) != ifa->ifa_address)
+			ardma_stop_tbnet_arp_proxy_locked(dev, true);
+		if (!dev->tbnet_arp_registered) {
+			ret = ardma_start_tbnet_arp_proxy_locked(dev, true);
+			if (ret)
+				pr_warn("rearm TBnet ARP proxy after IPv4 add on %s failed: %d\n",
+					netdev_name(netdev), ret);
+		}
+		break;
+	case NETDEV_DOWN:
+		if (dev->tbnet_arp_registered &&
+		    READ_ONCE(dev->tbnet_arp_addr) == ifa->ifa_address)
+			ardma_stop_tbnet_arp_proxy_locked(dev, true);
+		break;
+	default:
+		break;
+	}
+
+out:
+	mutex_unlock(&dev->netdev_lock);
 	return NOTIFY_DONE;
 }
 
@@ -4633,6 +4703,7 @@ static int ardma_register_ibdev(struct ardma_peer *peer)
 	dev->peer = peer;
 	mutex_init(&dev->netdev_lock);
 	dev->netdev_nb.notifier_call = ardma_netdev_event;
+	dev->inetaddr_nb.notifier_call = ardma_inetaddr_event;
 	ardma_peer_netdev_name(peer, dev->netdev_name,
 			       sizeof(dev->netdev_name));
 	dev->base.phys_port_cnt = 1;
@@ -4671,9 +4742,14 @@ static int ardma_register_ibdev(struct ardma_peer *peer)
 		goto err_unregister_ibdev;
 	dev->netdev_nb_registered = true;
 
+	ret = register_inetaddr_notifier(&dev->inetaddr_nb);
+	if (ret)
+		goto err_unregister_netdev_notifier;
+	dev->inetaddr_nb_registered = true;
+
 	ret = ardma_start_tbnet_arp_proxy(dev);
 	if (ret)
-		goto err_unregister_notifier;
+		goto err_unregister_inetaddr_notifier;
 
 	peer->ibdev = dev;
 	pr_info("registered ib_device %s for peer %s route=%d-%llx using GID netdev %s\n",
@@ -4682,7 +4758,10 @@ static int ardma_register_ibdev(struct ardma_peer *peer)
 		dev->netdev_name);
 	return 0;
 
-err_unregister_notifier:
+err_unregister_inetaddr_notifier:
+	unregister_inetaddr_notifier(&dev->inetaddr_nb);
+	dev->inetaddr_nb_registered = false;
+err_unregister_netdev_notifier:
 	unregister_netdevice_notifier(&dev->netdev_nb);
 	dev->netdev_nb_registered = false;
 err_unregister_ibdev:
@@ -4718,6 +4797,10 @@ static void ardma_unregister_ibdev(struct ardma_peer *peer)
 	if (dev->netdev_nb_registered) {
 		unregister_netdevice_notifier(&dev->netdev_nb);
 		dev->netdev_nb_registered = false;
+	}
+	if (dev->inetaddr_nb_registered) {
+		unregister_inetaddr_notifier(&dev->inetaddr_nb);
+		dev->inetaddr_nb_registered = false;
 	}
 	ib_unregister_device(&dev->base);
 	ib_dealloc_device(&dev->base);
