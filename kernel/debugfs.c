@@ -18,6 +18,7 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   tbv_tbnet_identity_name(state->cfg.tbnet_identity));
 	seq_printf(s, "services_registered: %u\n",
 		   state->services_registered);
+	seq_printf(s, "allocate_rings: %u\n", state->allocate_rings);
 	return 0;
 }
 

@@ -4,6 +4,7 @@
 
 #include <linux/errno.h>
 #include <linux/slab.h>
+#include <linux/thunderbolt.h>
 
 #include "tbv.h"
 
@@ -13,6 +14,7 @@ static void tbv_peer_free_rails(struct tbv_peer *peer)
 	struct tbv_rail *tmp;
 
 	list_for_each_entry_safe(rail, tmp, &peer->rails, node) {
+		tbv_path_destroy(&rail->path, peer->xd);
 		list_del(&rail->node);
 		kfree(rail);
 	}
@@ -20,7 +22,8 @@ static void tbv_peer_free_rails(struct tbv_peer *peer)
 }
 
 struct tbv_peer *tbv_peer_create(struct tbv_state *state,
-				 enum tbv_backend_type backend)
+				 enum tbv_backend_type backend,
+				 struct tb_xdomain *xd)
 {
 	struct tbv_peer *peer;
 
@@ -33,6 +36,7 @@ struct tbv_peer *tbv_peer_create(struct tbv_state *state,
 
 	refcount_set(&peer->refcnt, 1);
 	peer->backend = backend;
+	peer->xd = tb_xdomain_get(xd);
 	INIT_LIST_HEAD(&peer->rails);
 
 	mutex_lock(&state->lock);
@@ -56,6 +60,7 @@ void tbv_peer_destroy(struct tbv_state *state, struct tbv_peer *peer)
 
 	tbv_peer_free_rails(peer);
 	pr_info("peer %u destroyed\n", peer->peer_id);
+	tb_xdomain_put(peer->xd);
 	kfree(peer);
 }
 

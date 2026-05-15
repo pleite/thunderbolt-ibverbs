@@ -114,7 +114,7 @@ static int tbv_service_probe(struct tb_service *svc,
 	if (!tbv_service_backend_enabled(tbv_service_state, backend))
 		return -ENODEV;
 
-	peer = tbv_peer_create(tbv_service_state, backend);
+	peer = tbv_peer_create(tbv_service_state, backend, xd);
 	if (IS_ERR(peer))
 		return PTR_ERR(peer);
 
@@ -123,6 +123,22 @@ static int tbv_service_probe(struct tb_service *svc,
 	if (ret) {
 		tbv_peer_destroy(tbv_service_state, peer);
 		return ret;
+	}
+
+	if (tbv_service_state->allocate_rings) {
+		struct tbv_rail *rail = list_first_entry(&peer->rails,
+							 struct tbv_rail,
+							 node);
+
+		ret = tbv_path_alloc_rings(&rail->path, xd, -1);
+		if (ret) {
+			tbv_peer_destroy(tbv_service_state, peer);
+			return ret;
+		}
+		pr_info("allocated rings service id=%d tx_hop=%d rx_hop=%d out_hop=%d\n",
+			svc->id, rail->path.tx_ring->hop,
+			rail->path.rx_ring->hop,
+			rail->path.local_transmit_path);
 	}
 
 	tb_service_set_drvdata(svc, peer);
@@ -220,6 +236,8 @@ int tbv_services_start(struct tbv_state *state, bool bind_services,
 		       const struct tbv_service_config *service_cfg)
 {
 	int ret;
+
+	state->allocate_rings = service_cfg->allocate_rings;
 
 	if (!bind_services) {
 		pr_info("Thunderbolt service binding disabled\n");

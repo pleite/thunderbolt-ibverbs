@@ -64,7 +64,7 @@ int tbv_core_init(struct tbv_state *state,
 void tbv_core_exit(struct tbv_state *state)
 {
 	if (!list_empty(&state->peers))
-		pr_warn("unloading with live peers; hardware binding is not implemented yet\n");
+		pr_warn("unloading with live peers after service teardown\n");
 
 	tbv_debugfs_exit(state);
 	tbv_tbnet_identity_stop(&state->tbnet_identity);

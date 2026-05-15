@@ -132,6 +132,7 @@ struct tbv_peer {
 	refcount_t refcnt;
 	u32 peer_id;
 	enum tbv_backend_type backend;
+	struct tb_xdomain *xd;
 	struct list_head rails;
 	u32 nr_rails;
 };
@@ -174,6 +175,7 @@ struct tbv_state {
 	struct tb_property_dir *native_dir;
 	struct tb_property_dir *apple_dir;
 	struct dentry *debugfs_dir;
+	bool allocate_rings;
 	bool services_registered;
 };
 
@@ -181,6 +183,7 @@ struct dentry;
 struct tbv_service_config {
 	u32 native_prtcstns;
 	u32 apple_prtcstns;
+	bool allocate_rings;
 };
 
 struct tb_property_dir;
@@ -223,7 +226,8 @@ int tbv_rail_key_cmp(const struct tbv_rail_key *a,
 		     const struct tbv_rail_key *b);
 u32 tbv_rail_key_hash(const struct tbv_rail_key *key);
 struct tbv_peer *tbv_peer_create(struct tbv_state *state,
-				 enum tbv_backend_type backend);
+				 enum tbv_backend_type backend,
+				 struct tb_xdomain *xd);
 void tbv_peer_destroy(struct tbv_state *state, struct tbv_peer *peer);
 int tbv_peer_add_rail(struct tbv_peer *peer, const struct tbv_rail_key *key);
 void tbv_path_default_config(enum tbv_backend_type backend,
