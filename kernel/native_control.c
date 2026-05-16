@@ -18,9 +18,6 @@
 #define TBV_NATIVE_HELLO_RETRY_DELAY_MS 200
 #define TBV_NATIVE_HELLO_INITIAL_DELAY_MS 100
 
-static struct tb_protocol_handler tbv_native_handler;
-static bool tbv_native_handler_registered;
-
 static void tbv_native_control_work(struct work_struct *work);
 
 static u32 tbv_native_control_caps(const struct tbv_state *state,
@@ -70,13 +67,10 @@ static void tbv_native_control_fill_hello(const struct tbv_state *state,
 	hello->path_flags = tbv_native_control_path_flags(&rail->path);
 }
 
-static bool tbv_native_control_ready_initiator(const struct tb_xdomain *xd)
+static bool tbv_native_control_peer_matches_source(
+	const struct tbv_peer *peer, const struct tb_xdomain *source_xd)
 {
-	if (!xd || !xd->local_uuid || !xd->remote_uuid)
-		return true;
-
-	return memcmp(xd->local_uuid, xd->remote_uuid,
-		      sizeof(*xd->local_uuid)) < 0;
+	return !source_xd || peer->xd == source_xd;
 }
 
 static u8 tbv_native_control_sequence(const struct tbv_rail *rail)
@@ -124,6 +118,7 @@ void tbv_native_control_cancel_rail(struct tbv_rail *rail)
 }
 
 static int tbv_native_control_snapshot(struct tbv_state *state,
+				       const struct tb_xdomain *source_xd,
 				       const struct tbv_native_wire_info *info,
 				       u32 rail_id,
 				       bool require_matching_rail,
@@ -139,6 +134,8 @@ static int tbv_native_control_snapshot(struct tbv_state *state,
 		struct tbv_rail *rail;
 
 		if (peer->backend != TBV_BACKEND_NATIVE)
+			continue;
+		if (!tbv_native_control_peer_matches_source(peer, source_xd))
 			continue;
 
 		list_for_each_entry(rail, &peer->rails, node) {
@@ -164,6 +161,7 @@ out:
 }
 
 static int tbv_native_control_apply_remote(struct tbv_state *state,
+					   const struct tb_xdomain *source_xd,
 					   const struct tbv_native_wire_info *info,
 					   const struct tbv_native_wire_hello *remote,
 					   bool require_matching_rail)
@@ -176,6 +174,8 @@ static int tbv_native_control_apply_remote(struct tbv_state *state,
 		struct tbv_rail *rail;
 
 		if (peer->backend != TBV_BACKEND_NATIVE)
+			continue;
+		if (!tbv_native_control_peer_matches_source(peer, source_xd))
 			continue;
 
 		list_for_each_entry(rail, &peer->rails, node) {
@@ -201,13 +201,16 @@ out:
 }
 
 static int tbv_native_control_apply_ack(struct tbv_state *state,
+					const struct tb_xdomain *source_xd,
 					const struct tbv_native_wire_info *info,
 					const struct tbv_native_wire_hello *remote)
 {
-	return tbv_native_control_apply_remote(state, info, remote, true);
+	return tbv_native_control_apply_remote(state, source_xd, info, remote,
+					       true);
 }
 
 static int tbv_native_control_mark_remote_ready(struct tbv_state *state,
+						const struct tb_xdomain *source_xd,
 						const struct tbv_native_wire_info *info,
 						const struct tbv_native_wire_hello *remote)
 {
@@ -219,6 +222,8 @@ static int tbv_native_control_mark_remote_ready(struct tbv_state *state,
 		struct tbv_rail *rail;
 
 		if (peer->backend != TBV_BACKEND_NATIVE)
+			continue;
+		if (!tbv_native_control_peer_matches_source(peer, source_xd))
 			continue;
 
 		list_for_each_entry(rail, &peer->rails, node) {
@@ -237,9 +242,10 @@ out:
 	return ret;
 }
 
-static int tbv_native_control_handle(const void *buf, size_t size, void *data)
+int tbv_native_control_handle_packet(struct tbv_state *state,
+				     struct tb_xdomain *source_xd,
+				     const void *buf, size_t size)
 {
-	struct tbv_state *state = data;
 	struct tbv_native_wire_hello remote;
 	struct tbv_native_wire_hello local;
 	struct tbv_native_wire_info info;
@@ -252,7 +258,8 @@ static int tbv_native_control_handle(const void *buf, size_t size, void *data)
 		return 0;
 
 	if (info.op == TBV_NATIVE_WIRE_OP_HELLO_ACK) {
-		ret = tbv_native_control_apply_ack(state, &info, &remote);
+		ret = tbv_native_control_apply_ack(state, source_xd, &info,
+						   &remote);
 		if (!ret)
 			pr_info("native HELLO_ACK received route=0x%llx rail=0x%x remote_out=%u remote_tx=%u remote_rx=%u\n",
 				info.route, remote.rail_id,
@@ -272,7 +279,7 @@ static int tbv_native_control_handle(const void *buf, size_t size, void *data)
 
 	if (info.op == TBV_NATIVE_WIRE_OP_READY) {
 		memset(&local, 0, sizeof(local));
-		ret = tbv_native_control_snapshot(state, &info,
+		ret = tbv_native_control_snapshot(state, source_xd, &info,
 						  remote.rail_id, true,
 						  true,
 						  &local, &xd);
@@ -282,8 +289,8 @@ static int tbv_native_control_handle(const void *buf, size_t size, void *data)
 			return 1;
 		}
 
-		ret = tbv_native_control_mark_remote_ready(state, &info,
-							  &remote);
+		ret = tbv_native_control_mark_remote_ready(state, source_xd,
+							  &info, &remote);
 		if (!ret)
 			pr_info("native READY received route=0x%llx rail=0x%x\n",
 				info.route, remote.rail_id);
@@ -309,15 +316,17 @@ static int tbv_native_control_handle(const void *buf, size_t size, void *data)
 		return 0;
 
 	memset(&local, 0, sizeof(local));
-	ret = tbv_native_control_snapshot(state, &info, remote.rail_id, true,
-					  false, &local, &xd);
+	ret = tbv_native_control_snapshot(state, source_xd, &info,
+					  remote.rail_id, true, false, &local,
+					  &xd);
 	if (ret) {
 		pr_warn("native HELLO route=0x%llx rail=0x%x has no matching peer rail\n",
 			info.route, remote.rail_id);
 		return 1;
 	}
 
-	ret = tbv_native_control_apply_remote(state, &info, &remote, true);
+	ret = tbv_native_control_apply_remote(state, source_xd, &info,
+					      &remote, true);
 	if (!ret)
 		pr_info("native HELLO received route=0x%llx rail=0x%x remote_out=%u remote_tx=%u remote_rx=%u\n",
 			info.route, remote.rail_id, remote.transmit_path,
@@ -384,7 +393,7 @@ static int tbv_native_control_exchange_once(struct tbv_state *state,
 		return ret;
 	if (info.op != TBV_NATIVE_WIRE_OP_HELLO_ACK)
 		return -EPROTO;
-	ret = tbv_native_control_apply_ack(state, &info, &remote);
+	ret = tbv_native_control_apply_ack(state, peer->xd, &info, &remote);
 	if (ret)
 		return ret;
 
@@ -436,7 +445,8 @@ static int tbv_native_control_ready_once(struct tbv_state *state,
 	    remote.rail_id != rail->rail_id)
 		return -EPROTO;
 
-	ret = tbv_native_control_mark_remote_ready(state, &info, &remote);
+	ret = tbv_native_control_mark_remote_ready(state, peer->xd, &info,
+						  &remote);
 	if (ret)
 		return ret;
 
@@ -532,8 +542,7 @@ static void tbv_native_control_work(struct work_struct *work)
 
 	if (state->enable_tunnels &&
 	    rail->path.state == TBV_PATH_TUNNEL_ENABLED &&
-	    !rail->native_remote_ready &&
-	    tbv_native_control_ready_initiator(peer->xd)) {
+	    !rail->native_remote_ready) {
 		attempt = ++rail->native_ready_attempts;
 		ret = tbv_native_control_ready_once(state, peer, rail);
 		rail->native_last_error = ret;
@@ -562,29 +571,21 @@ out:
 
 int tbv_native_control_start(struct tbv_state *state)
 {
-	int ret;
-
 	if (!state->cfg.native_enabled)
 		return 0;
 
-	memset(&tbv_native_handler, 0, sizeof(tbv_native_handler));
-	tbv_native_handler.uuid = &tbv_native_service_uuid;
-	tbv_native_handler.callback = tbv_native_control_handle;
-	tbv_native_handler.data = state;
-
-	ret = tb_register_protocol_handler(&tbv_native_handler);
-	if (ret)
-		return ret;
-
-	tbv_native_handler_registered = true;
-	return 0;
+#ifdef TB_PROTOCOL_HANDLER_HAS_XDOMAIN
+	return tbv_native_control_xdomain_start(state);
+#else
+	return tbv_native_control_legacy_start(state);
+#endif
 }
 
 void tbv_native_control_stop(void)
 {
-	if (!tbv_native_handler_registered)
-		return;
-
-	tb_unregister_protocol_handler(&tbv_native_handler);
-	tbv_native_handler_registered = false;
+#ifdef TB_PROTOCOL_HANDLER_HAS_XDOMAIN
+	tbv_native_control_xdomain_stop();
+#else
+	tbv_native_control_legacy_stop();
+#endif
 }

@@ -349,6 +349,13 @@ int tbv_services_start(struct tbv_state *state, bool bind_services,
 void tbv_services_stop(struct tbv_state *state);
 int tbv_native_control_start(struct tbv_state *state);
 void tbv_native_control_stop(void);
+int tbv_native_control_xdomain_start(struct tbv_state *state);
+void tbv_native_control_xdomain_stop(void);
+int tbv_native_control_legacy_start(struct tbv_state *state);
+void tbv_native_control_legacy_stop(void);
+int tbv_native_control_handle_packet(struct tbv_state *state,
+				     struct tb_xdomain *source_xd,
+				     const void *buf, size_t size);
 void tbv_native_control_init_rail(struct tbv_rail *rail,
 				  struct tbv_peer *peer);
 void tbv_native_control_queue_rail(struct tbv_state *state,

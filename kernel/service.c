@@ -117,8 +117,8 @@ static bool tbv_service_backend_enabled(const struct tbv_state *state,
 					enum tbv_backend_type backend)
 {
 	if (backend == TBV_BACKEND_APPLE)
-		return state->cfg.apple_enabled;
-	return state->cfg.native_enabled;
+		return state->cfg.apple_enabled && state->apple_data;
+	return state->cfg.native_enabled && state->native_data;
 }
 
 static bool tbv_service_backend_data_enabled(const struct tbv_state *state,
@@ -337,7 +337,7 @@ static int tbv_register_native_dirs(struct tbv_state *state, u32 prtcstns)
 	u32 lane;
 	int ret;
 
-	if (!state->cfg.native_enabled)
+	if (!state->cfg.native_enabled || !state->native_data)
 		return 0;
 
 	if (state->cfg.requested.lanes_auto)
@@ -411,7 +411,7 @@ int tbv_services_start(struct tbv_state *state, bool bind_services,
 	if (ret)
 		goto err_clear;
 
-	if (state->cfg.apple_enabled) {
+	if (state->cfg.apple_enabled && state->apple_data) {
 		ret = tbv_register_apple_dir(state,
 					     service_cfg->apple_prtcstns);
 		if (ret)
