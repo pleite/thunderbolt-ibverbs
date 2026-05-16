@@ -6,6 +6,7 @@
 #include <linux/string.h>
 #include <linux/thunderbolt.h>
 
+#include "../proto/native_data.h"
 #include "tbv.h"
 
 #define TBV_NATIVE_RING_SIZE 1024
@@ -16,6 +17,7 @@
 #define TBV_CONTROL_FRAME_SIZE 256
 #define TBV_CONTROL_QUEUE_MULTIPLIER 4
 #define TBV_DATA_QUEUE_MULTIPLIER 4
+#define TBV_TX_POLL_DELAY msecs_to_jiffies(1)
 
 struct tbv_data_frame {
 	struct ring_frame frame;
@@ -34,11 +36,17 @@ struct tbv_tx_packet {
 	struct tbv_path *path;
 	u8 *buf;
 	u32 len;
+	struct ring_frame frame;
+	dma_addr_t dma;
 	tbv_path_tx_done_fn done;
 	void *done_ctx;
+	u8 sof;
+	u8 eof;
 	bool control;
 	bool pooled;
 	bool queued;
+	bool zcopy;
+	bool unmap_dma;
 	u8 control_buf[TBV_CONTROL_FRAME_SIZE];
 };
 
@@ -64,6 +72,10 @@ static void tbv_path_tx_packet_release(struct tbv_tx_packet *packet, int status)
 	struct tbv_path *path = packet->path;
 	unsigned long flags;
 
+	if (packet->zcopy && packet->unmap_dma)
+		dma_unmap_page(tb_ring_dma_device(path->tx_ring), packet->dma,
+			       packet->len, DMA_TO_DEVICE);
+
 	if (packet->done)
 		packet->done(packet->done_ctx, status);
 
@@ -71,6 +83,11 @@ static void tbv_path_tx_packet_release(struct tbv_tx_packet *packet, int status)
 	packet->done_ctx = NULL;
 	packet->len = 0;
 	packet->queued = false;
+
+	if (packet->zcopy) {
+		kfree(packet);
+		return;
+	}
 
 	if (!packet->control) {
 		kfree(packet->buf);
@@ -89,6 +106,14 @@ static void tbv_path_tx_packet_release(struct tbv_tx_packet *packet, int status)
 }
 
 static void tbv_path_schedule_tx(struct tbv_path *path);
+static void tbv_path_tx_poll_work(struct work_struct *work);
+
+static void tbv_path_schedule_tx_poll(struct tbv_path *path)
+{
+	if (atomic_read(&path->tx_inflight) > 0 &&
+	    path->state == TBV_PATH_TUNNEL_ENABLED)
+		schedule_delayed_work(&path->tx_poll_work, TBV_TX_POLL_DELAY);
+}
 
 void tbv_path_default_config(enum tbv_backend_type backend,
 			     struct tbv_path_config *cfg)
@@ -139,6 +164,7 @@ void tbv_path_init(struct tbv_path *path,
 	INIT_LIST_HEAD(&path->tx_control_free);
 	INIT_LIST_HEAD(&path->tx_control_queue);
 	INIT_LIST_HEAD(&path->tx_data_queue);
+	INIT_DELAYED_WORK(&path->tx_poll_work, tbv_path_tx_poll_work);
 	atomic_set(&path->tx_inflight, 0);
 	path->local_transmit_path = -1;
 	path->local_tx_hop = -1;
@@ -157,6 +183,7 @@ void tbv_path_reset(struct tbv_path *path)
 	INIT_LIST_HEAD(&path->tx_control_free);
 	INIT_LIST_HEAD(&path->tx_control_queue);
 	INIT_LIST_HEAD(&path->tx_data_queue);
+	INIT_DELAYED_WORK(&path->tx_poll_work, tbv_path_tx_poll_work);
 	atomic_set(&path->tx_inflight, 0);
 	path->local_transmit_path = -1;
 	path->local_tx_hop = -1;
@@ -207,6 +234,106 @@ static void tbv_path_tx_complete(struct tb_ring *ring, struct ring_frame *frame,
 
 static int tbv_path_post_rx_frame(struct tbv_data_frame *f);
 
+static void tbv_path_rx_start_raw(struct tbv_path *path,
+				  const struct tbv_native_data_header *hdr)
+{
+	path->rx_raw_opcode = hdr->opcode;
+	path->rx_raw_flags = hdr->flags & ~TBV_NATIVE_DATA_F_RAW_STREAM;
+	path->rx_raw_dest_qp = hdr->dest_qp;
+	path->rx_raw_src_qp = hdr->src_qp;
+	path->rx_raw_psn = hdr->psn;
+	path->rx_raw_imm_data = hdr->imm_data;
+	path->rx_raw_rkey = hdr->rkey;
+	path->rx_raw_base = hdr->remote_addr;
+	path->rx_raw_done = 0;
+	path->rx_raw_remaining = hdr->length;
+	path->rx_raw_pending = hdr->length != 0;
+}
+
+static void tbv_path_rx_raw_payload(struct tbv_path *path,
+				    struct tbv_state *state,
+				    const void *payload, u32 len)
+{
+	struct tbv_native_data_header hdr = {};
+
+	if (!path->rx_raw_pending || !len || len > path->rx_raw_remaining) {
+		if (state)
+			atomic64_inc(&state->data_rx_bad_frame);
+		path->rx_raw_pending = false;
+		path->rx_raw_remaining = 0;
+		return;
+	}
+
+	hdr.opcode = path->rx_raw_opcode;
+	hdr.flags = path->rx_raw_flags;
+	if (len == path->rx_raw_remaining) {
+		hdr.flags |= TBV_NATIVE_DATA_F_LAST;
+		path->rx_raw_pending = false;
+	}
+	hdr.dest_qp = path->rx_raw_dest_qp;
+	hdr.src_qp = path->rx_raw_src_qp;
+	hdr.psn = path->rx_raw_psn;
+	hdr.length = len;
+	hdr.imm_data = path->rx_raw_imm_data;
+	hdr.remote_addr = path->rx_raw_base + path->rx_raw_done;
+	hdr.rkey = path->rx_raw_rkey;
+
+	path->rx_raw_done += len;
+	path->rx_raw_remaining -= len;
+	if (state)
+		tbv_ibdev_rx_native_frame(state, &hdr, payload);
+}
+
+static void tbv_path_zcopy_tx_complete(struct tb_ring *ring,
+				       struct ring_frame *frame,
+				       bool canceled)
+{
+	struct tbv_tx_packet *packet = container_of(frame,
+						   struct tbv_tx_packet,
+						   frame);
+	struct tbv_path *path = packet->path;
+	struct tbv_state *state = tbv_path_state(path);
+
+	if (state) {
+		if (canceled)
+			atomic64_inc(&state->data_tx_canceled);
+		else
+			atomic64_inc(&state->data_tx_completed);
+	}
+	if (!canceled)
+		atomic64_inc(&path->data_tx_completed);
+
+	tbv_path_tx_packet_release(packet, canceled ? -ECANCELED : 0);
+	atomic_dec(&path->tx_inflight);
+	tbv_path_schedule_tx(path);
+	tbv_path_schedule_tx_poll(path);
+}
+
+static void tbv_path_tx_poll_work(struct work_struct *work)
+{
+	struct tbv_path *path =
+		container_of(to_delayed_work(work), struct tbv_path,
+			     tx_poll_work);
+	struct ring_frame *frame;
+	u32 completed = 0;
+
+	if (!path->tx_ring || path->state != TBV_PATH_TUNNEL_ENABLED)
+		return;
+
+	while ((frame = tb_ring_poll(path->tx_ring))) {
+		void (*callback)(struct tb_ring *, struct ring_frame *, bool);
+
+		callback = frame->callback;
+		if (callback)
+			callback(path->tx_ring, frame, false);
+		completed++;
+	}
+
+	if (completed)
+		tbv_path_schedule_tx(path);
+	tbv_path_schedule_tx_poll(path);
+}
+
 static void tbv_path_rx_complete(struct tb_ring *ring, struct ring_frame *frame,
 				 bool canceled)
 {
@@ -224,10 +351,32 @@ static void tbv_path_rx_complete(struct tb_ring *ring, struct ring_frame *frame,
 
 	dma_sync_single_for_cpu(tb_ring_dma_device(ring), f->dma,
 				TBV_DATA_FRAME_SIZE, DMA_FROM_DEVICE);
-	if (len <= TBV_DATA_FRAME_SIZE && state)
-		tbv_ibdev_rx_frame(state, f->buf, len);
-	else if (state)
+	if (len <= TBV_DATA_FRAME_SIZE && state) {
+		struct tbv_native_data_header hdr;
+
+		if (path->rail && path->rail->peer &&
+		    path->rail->peer->backend == TBV_BACKEND_APPLE) {
+			tbv_ibdev_rx_apple_frame(state, path, f->buf, len,
+						 frame->eof);
+		} else if (path->rx_raw_pending) {
+			tbv_path_rx_raw_payload(path, state, f->buf, len);
+		} else if (!tbv_native_data_parse_header(f->buf, len, &hdr) &&
+			   (hdr.flags & TBV_NATIVE_DATA_F_RAW_STREAM)) {
+			if (len != TBV_NATIVE_DATA_HDR_SIZE ||
+			    !hdr.length ||
+			    (hdr.flags & ~(TBV_NATIVE_DATA_F_LAST |
+					   TBV_NATIVE_DATA_F_SOLICITED |
+					   TBV_NATIVE_DATA_F_RAW_STREAM))) {
+				atomic64_inc(&state->data_rx_bad_frame);
+			} else {
+				tbv_path_rx_start_raw(path, &hdr);
+			}
+		} else {
+			tbv_ibdev_rx_frame(state, f->buf, len);
+		}
+	} else if (state) {
 		atomic64_inc(&state->data_rx_bad_frame);
+	}
 
 	if (path->state == TBV_PATH_RING_STARTED ||
 	    path->state == TBV_PATH_TUNNEL_ENABLED) {
@@ -540,6 +689,8 @@ tbv_path_alloc_data_packet_owned(struct tbv_path *path, u8 *buf, u32 len,
 	packet->len = len;
 	packet->done = done;
 	packet->done_ctx = done_ctx;
+	packet->sof = TBV_DATA_PDF_FRAME_START;
+	packet->eof = TBV_DATA_PDF_FRAME_END;
 	return packet;
 }
 
@@ -558,6 +709,31 @@ tbv_path_alloc_data_packet(struct tbv_path *path, const void *data, u32 len,
 						  done_ctx);
 	if (!packet)
 		kfree(buf);
+	return packet;
+}
+
+static struct tbv_tx_packet *
+tbv_path_alloc_zcopy_packet(struct tbv_path *path, dma_addr_t dma, u32 len,
+			    bool unmap_dma, tbv_path_tx_done_fn done,
+			    void *done_ctx)
+{
+	struct tbv_tx_packet *packet;
+
+	packet = kzalloc(sizeof(*packet), GFP_KERNEL);
+	if (!packet)
+		return NULL;
+
+	INIT_LIST_HEAD(&packet->node);
+	INIT_LIST_HEAD(&packet->frame.list);
+	packet->path = path;
+	packet->len = len;
+	packet->dma = dma;
+	packet->done = done;
+	packet->done_ctx = done_ctx;
+	packet->sof = TBV_DATA_PDF_FRAME_START;
+	packet->eof = TBV_DATA_PDF_FRAME_END;
+	packet->zcopy = true;
+	packet->unmap_dma = unmap_dma;
 	return packet;
 }
 
@@ -601,6 +777,8 @@ static int tbv_path_enqueue_control(struct tbv_path *path, const void *data,
 	packet->len = len;
 	packet->done = NULL;
 	packet->done_ctx = NULL;
+	packet->sof = TBV_DATA_PDF_FRAME_START;
+	packet->eof = TBV_DATA_PDF_FRAME_END;
 	packet->pooled = pooled;
 	packet->queued = true;
 	memcpy(packet->buf, data, len);
@@ -634,6 +812,43 @@ static int tbv_path_enqueue_data(struct tbv_path *path,
 	list_add_tail(&packet->node, &path->tx_data_queue);
 	path->tx_data_queued++;
 	atomic64_inc(&path->data_tx_enqueued);
+	spin_unlock_irqrestore(&path->tx_lock, flags);
+
+	if (!defer_schedule)
+		tbv_path_schedule_tx(path);
+	return 0;
+}
+
+static int tbv_path_enqueue_data_list(struct tbv_path *path,
+				      struct list_head *packets, u32 count,
+				      bool defer_schedule)
+{
+	struct tbv_tx_packet *packet;
+	unsigned long flags;
+	u32 used;
+
+	if (!count)
+		return 0;
+
+	spin_lock_irqsave(&path->tx_lock, flags);
+	if (path->state != TBV_PATH_TUNNEL_ENABLED) {
+		spin_unlock_irqrestore(&path->tx_lock, flags);
+		return -ENOTCONN;
+	}
+
+	used = path->tx_data_queued + path->tx_data_reserved;
+	if (count > path->tx_data_queue_limit ||
+	    used > path->tx_data_queue_limit - count) {
+		spin_unlock_irqrestore(&path->tx_lock, flags);
+		return -ENOMEM;
+	}
+
+	list_for_each_entry(packet, packets, node) {
+		packet->queued = true;
+		path->tx_data_queued++;
+		atomic64_inc(&path->data_tx_enqueued);
+	}
+	list_splice_tail_init(packets, &path->tx_data_queue);
 	spin_unlock_irqrestore(&path->tx_lock, flags);
 
 	if (!defer_schedule)
@@ -698,13 +913,29 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 	for (;;) {
 		struct tbv_tx_packet *packet;
 		struct tbv_data_frame *f;
+		bool needs_staging;
 		int ret;
 
 		spin_lock_irqsave(&path->tx_lock, flags);
 		if (path->state != TBV_PATH_TUNNEL_ENABLED ||
-		    list_empty(&path->tx_free) ||
 		    (list_empty(&path->tx_control_queue) &&
 		     list_empty(&path->tx_data_queue))) {
+			path->tx_scheduling = false;
+			spin_unlock_irqrestore(&path->tx_lock, flags);
+			return;
+		}
+
+		if (!list_empty(&path->tx_control_queue)) {
+			packet = list_first_entry(&path->tx_control_queue,
+						  struct tbv_tx_packet, node);
+			needs_staging = true;
+		} else {
+			packet = list_first_entry(&path->tx_data_queue,
+						  struct tbv_tx_packet, node);
+			needs_staging = !packet->zcopy;
+		}
+
+		if (needs_staging && list_empty(&path->tx_free)) {
 			path->tx_scheduling = false;
 			spin_unlock_irqrestore(&path->tx_lock, flags);
 			return;
@@ -722,11 +953,55 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 		list_del_init(&packet->node);
 		packet->queued = false;
 
-		f = list_first_entry(&path->tx_free, struct tbv_data_frame,
-				     free_node);
-		list_del_init(&f->free_node);
+		if (needs_staging) {
+			f = list_first_entry(&path->tx_free,
+					     struct tbv_data_frame, free_node);
+			list_del_init(&f->free_node);
+		} else {
+			f = NULL;
+		}
 		atomic_inc(&path->tx_inflight);
 		spin_unlock_irqrestore(&path->tx_lock, flags);
+
+		if (packet->zcopy) {
+			packet->frame.buffer_phy = packet->dma;
+			packet->frame.callback = tbv_path_zcopy_tx_complete;
+			packet->frame.size = packet->len == TBV_DATA_FRAME_SIZE ?
+					     0 : packet->len;
+			packet->frame.flags = 0;
+			packet->frame.sof = packet->sof;
+			packet->frame.eof = packet->eof;
+
+			ret = tb_ring_tx(path->tx_ring, &packet->frame);
+			if (!ret) {
+				if (state)
+					atomic64_inc(&state->data_tx_posted);
+				atomic64_inc(&path->data_tx_posted);
+				tbv_path_schedule_tx_poll(path);
+				continue;
+			}
+
+			if (state)
+				atomic64_inc(&state->data_tx_errors);
+			spin_lock_irqsave(&path->tx_lock, flags);
+			if (ret == -ENOMEM &&
+			    path->state == TBV_PATH_TUNNEL_ENABLED) {
+				list_add(&packet->node, &path->tx_data_queue);
+				path->tx_data_queued++;
+				packet->queued = true;
+				path->tx_scheduling = false;
+				spin_unlock_irqrestore(&path->tx_lock, flags);
+				atomic_dec(&path->tx_inflight);
+				return;
+			}
+			spin_unlock_irqrestore(&path->tx_lock, flags);
+			atomic_dec(&path->tx_inflight);
+			tbv_path_tx_packet_release(packet, ret);
+			spin_lock_irqsave(&path->tx_lock, flags);
+			path->tx_scheduling = false;
+			spin_unlock_irqrestore(&path->tx_lock, flags);
+			return;
+		}
 
 		memcpy(f->buf, packet->buf, packet->len);
 		f->packet = packet;
@@ -736,8 +1011,8 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 		f->frame.size = packet->len == TBV_DATA_FRAME_SIZE ? 0 :
 							       packet->len;
 		f->frame.flags = 0;
-		f->frame.sof = TBV_DATA_PDF_FRAME_START;
-		f->frame.eof = TBV_DATA_PDF_FRAME_END;
+		f->frame.sof = packet->sof;
+		f->frame.eof = packet->eof;
 		dma_sync_single_for_device(tb_ring_dma_device(path->tx_ring),
 					   f->dma, TBV_DATA_FRAME_SIZE,
 					   DMA_TO_DEVICE);
@@ -826,6 +1101,16 @@ int tbv_path_send_owned(struct tbv_path *path, void *data, u32 len,
 			unsigned int send_flags,
 			tbv_path_tx_done_fn done, void *done_ctx)
 {
+	return tbv_path_send_marked_owned(path, data, len,
+					  TBV_DATA_PDF_FRAME_START,
+					  TBV_DATA_PDF_FRAME_END,
+					  send_flags, done, done_ctx);
+}
+
+int tbv_path_send_marked_owned(struct tbv_path *path, void *data, u32 len,
+			       u8 sof, u8 eof, unsigned int send_flags,
+			       tbv_path_tx_done_fn done, void *done_ctx)
+{
 	struct tbv_tx_packet *packet;
 	int ret;
 
@@ -844,6 +1129,8 @@ int tbv_path_send_owned(struct tbv_path *path, void *data, u32 len,
 		kfree(data);
 		return -ENOMEM;
 	}
+	packet->sof = sof;
+	packet->eof = eof;
 
 	ret = tbv_path_enqueue_data(path, packet,
 				    send_flags & TBV_PATH_SEND_DEFER);
@@ -853,6 +1140,138 @@ int tbv_path_send_owned(struct tbv_path *path, void *data, u32 len,
 		return ret;
 	}
 	return 0;
+}
+
+static void tbv_path_release_packet_list(struct list_head *packets, int status)
+{
+	while (!list_empty(packets)) {
+		struct tbv_tx_packet *packet =
+			list_first_entry(packets, struct tbv_tx_packet, node);
+
+		list_del_init(&packet->node);
+		tbv_path_tx_packet_release(packet, status);
+	}
+}
+
+int tbv_path_send_page_stream(struct tbv_path *path,
+			      const struct tbv_native_data_header *hdr,
+			      u32 total_length, unsigned int send_flags,
+			      tbv_path_tx_done_fn meta_done,
+			      void *meta_done_ctx,
+			      tbv_path_next_page_fn next, void *next_ctx)
+{
+	struct tbv_native_data_header stream_hdr;
+	struct device *dma_dev;
+	LIST_HEAD(packets);
+	u32 prepared = 0;
+	u32 packet_count = 0;
+	struct tbv_tx_packet *packet;
+	u8 *hdr_buf;
+	int ret;
+
+	if (!path || !hdr || !next || !total_length) {
+		ret = -EINVAL;
+		goto err_meta_done;
+	}
+	if (send_flags & ~(TBV_PATH_SEND_DEFER)) {
+		ret = -EINVAL;
+		goto err_meta_done;
+	}
+	if (total_length > TBV_NATIVE_DATA_MAX_MSG_SIZE) {
+		ret = -EMSGSIZE;
+		goto err_meta_done;
+	}
+	if (!path->tx_ring) {
+		ret = -ENOTCONN;
+		goto err_meta_done;
+	}
+
+	hdr_buf = kzalloc(TBV_NATIVE_DATA_HDR_SIZE, GFP_KERNEL);
+	if (!hdr_buf) {
+		ret = -ENOMEM;
+		goto err_meta_done;
+	}
+
+	stream_hdr = *hdr;
+	stream_hdr.length = total_length;
+	stream_hdr.remote_addr = hdr->remote_addr;
+	stream_hdr.flags |= TBV_NATIVE_DATA_F_RAW_STREAM;
+	ret = tbv_native_data_build_header(hdr_buf, TBV_NATIVE_DATA_HDR_SIZE,
+					   &stream_hdr);
+	if (ret < 0) {
+		kfree(hdr_buf);
+		goto err_meta_done;
+	}
+
+	packet = tbv_path_alloc_data_packet_owned(path, hdr_buf,
+						  TBV_NATIVE_DATA_HDR_SIZE,
+						  meta_done, meta_done_ctx);
+	if (!packet) {
+		kfree(hdr_buf);
+		ret = -ENOMEM;
+		goto err_meta_done;
+	}
+	list_add_tail(&packet->node, &packets);
+	packet_count++;
+	dma_dev = tb_ring_dma_device(path->tx_ring);
+
+	while (prepared < total_length) {
+		tbv_path_tx_done_fn done = NULL;
+		struct page *page = NULL;
+		void *done_ctx = NULL;
+		dma_addr_t dma;
+		u32 page_off = 0;
+		u32 len = 0;
+
+		ret = next(next_ctx, &page, &page_off, &len, &done, &done_ctx);
+		if (ret)
+			goto err_release;
+		if (!page || !len || len > TBV_DATA_FRAME_SIZE ||
+		    len > total_length - prepared ||
+		    page_off > PAGE_SIZE || len > PAGE_SIZE - page_off) {
+			if (done)
+				done(done_ctx, -EINVAL);
+			ret = -EINVAL;
+			goto err_release;
+		}
+
+		dma = dma_map_page(dma_dev, page, page_off, len,
+				   DMA_TO_DEVICE);
+		if (dma_mapping_error(dma_dev, dma)) {
+			if (done)
+				done(done_ctx, -EIO);
+			ret = -EIO;
+			goto err_release;
+		}
+
+		packet = tbv_path_alloc_zcopy_packet(path, dma, len, true,
+						     done, done_ctx);
+		if (!packet) {
+			dma_unmap_page(dma_dev, dma, len, DMA_TO_DEVICE);
+			if (done)
+				done(done_ctx, -ENOMEM);
+			ret = -ENOMEM;
+			goto err_release;
+		}
+		list_add_tail(&packet->node, &packets);
+		packet_count++;
+		prepared += len;
+	}
+
+	ret = tbv_path_enqueue_data_list(path, &packets, packet_count,
+					 send_flags & TBV_PATH_SEND_DEFER);
+	if (ret)
+		goto err_release;
+	return 0;
+
+err_release:
+	tbv_path_release_packet_list(&packets, ret);
+	return ret;
+
+err_meta_done:
+	if (meta_done)
+		meta_done(meta_done_ctx, ret);
+	return ret;
 }
 
 u32 tbv_path_cancel_data_done_ctx(struct tbv_path *path,
@@ -958,6 +1377,7 @@ void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd)
 		path->state = TBV_PATH_RING_ALLOCATED;
 	}
 
+	cancel_delayed_work_sync(&path->tx_poll_work);
 	tbv_path_flush_tx_queue(path, -ECANCELED);
 
 	if (path->rx_ring) {

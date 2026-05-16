@@ -16,6 +16,28 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 	seq_printf(s, "uc_supported: %u\n", state->cfg.uc_supported);
 	seq_printf(s, "tbnet_identity: %s\n",
 		   tbv_tbnet_identity_name(state->cfg.tbnet_identity));
+	mutex_lock(&state->tbnet_identity.lock);
+	seq_printf(s, "tbnet_identity_state: 0x%lx\n",
+		   state->tbnet_identity.state);
+	seq_printf(s, "tbnet_identity_tbnet: %s\n",
+		   state->tbnet_identity.tbnet_netdev_name[0] ?
+		   state->tbnet_identity.tbnet_netdev_name : "<unset>");
+	seq_printf(s, "tbnet_identity_gid: %s\n",
+		   state->tbnet_identity.gid_netdev_name[0] ?
+		   state->tbnet_identity.gid_netdev_name : "<unset>");
+	seq_printf(s, "tbnet_identity_proxy_ipv4: %pI4\n",
+		   &state->tbnet_identity.proxy_ipv4);
+	seq_printf(s, "tbnet_identity_rx_handler: %u\n",
+		   state->tbnet_identity.rx_handler_registered);
+	seq_printf(s, "tbnet_identity_arp_requests: %lld\n",
+		   atomic64_read(&state->tbnet_identity.arp_requests));
+	seq_printf(s, "tbnet_identity_arp_replies: %lld\n",
+		   atomic64_read(&state->tbnet_identity.arp_replies));
+	seq_printf(s, "tbnet_identity_arp_ignored: %lld\n",
+		   atomic64_read(&state->tbnet_identity.arp_ignored));
+	seq_printf(s, "tbnet_identity_arp_errors: %lld\n",
+		   atomic64_read(&state->tbnet_identity.arp_errors));
+	mutex_unlock(&state->tbnet_identity.lock);
 	seq_printf(s, "tbnet_policy: %s\n",
 		   tbv_tbnet_policy_name(state->cfg.requested.tbnet));
 	seq_printf(s, "native_service_count: %u\n",
@@ -130,6 +152,12 @@ static int tbv_debugfs_peers_show(struct seq_file *s, void *unused)
 			   peer->nr_rails);
 
 		list_for_each_entry(rail, &peer->rails, node) {
+			bool data_ready;
+
+			data_ready = peer->backend == TBV_BACKEND_APPLE ?
+				tbv_rail_apple_data_ready(rail) :
+				tbv_rail_data_ready(rail);
+
 			seq_printf(s,
 				   "  rail=0x%x route=0x%llx local=%u remote=%u path=%u link_speed=%uGb/s link_width=0x%x active=%u data_ready=%u state=%s negotiated=%u ready_sent=%u remote_ready=%u attempts=%u last_error=%d local_out=%d local_tx=%d local_rx=%d remote_rail=0x%x remote_out=%d remote_tx=%d remote_rx=%d\n",
 				   rail->rail_id, rail->key.route,
@@ -139,7 +167,7 @@ static int tbv_debugfs_peers_show(struct seq_file *s, void *unused)
 				   rail->link_speed,
 				   rail->link_width,
 				   rail->active,
-				   tbv_rail_data_ready(rail),
+				   data_ready,
 				   tbv_path_state_name(rail->path.state),
 				   rail->native_negotiated,
 				   rail->native_ready_sent,

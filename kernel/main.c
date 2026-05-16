@@ -33,6 +33,16 @@ module_param(tbnet_identity, charp, 0444);
 MODULE_PARM_DESC(tbnet_identity,
 		 "Apple TBnet identity: auto, stock, stock_proxy, minimal_packet, off");
 
+static char *tbnet_identity_tbnet = "thunderbolt0";
+module_param(tbnet_identity_tbnet, charp, 0444);
+MODULE_PARM_DESC(tbnet_identity_tbnet,
+		 "Netdev that carries stock ThunderboltIP packets for tbnet_identity=stock_proxy");
+
+static char *tbnet_identity_gid = "auto";
+module_param(tbnet_identity_gid, charp, 0444);
+MODULE_PARM_DESC(tbnet_identity_gid,
+		 "Netdev whose IPv4 address is proxied as the RDMA GID for tbnet_identity=stock_proxy; auto uses roce_netdev");
+
 static char *lanes = "auto";
 module_param(lanes, charp, 0444);
 MODULE_PARM_DESC(lanes, "Lane request: auto, N, or MIN-MAX");
@@ -103,6 +113,7 @@ static int __init tbv_init(void)
 {
 	char lanes_desc[32];
 	struct tbv_resolved_config resolved;
+	struct tbv_tbnet_identity_config identity_cfg;
 	struct tbv_service_config service_cfg;
 	struct tbv_config cfg;
 	int ret;
@@ -130,12 +141,20 @@ static int __init tbv_init(void)
 		return -EINVAL;
 	}
 
-	if (enable_tunnels && !negotiate_native) {
-		pr_err("enable_tunnels=1 requires negotiate_native=1\n");
+	if (enable_tunnels && !start_rings) {
+		pr_err("enable_tunnels=1 requires start_rings=1\n");
 		return -EINVAL;
 	}
 
-	ret = tbv_core_init(&tbv_driver_state, &resolved);
+	if (enable_tunnels && resolved.native_enabled && !negotiate_native) {
+		pr_err("enable_tunnels=1 requires negotiate_native=1 when native Linux transport is enabled\n");
+		return -EINVAL;
+	}
+
+	identity_cfg.tbnet_netdev = tbnet_identity_tbnet;
+	identity_cfg.gid_netdev = tbnet_identity_gid;
+
+	ret = tbv_core_init(&tbv_driver_state, &resolved, &identity_cfg);
 	if (ret)
 		return ret;
 	tbv_driver_state.native_wr_striping = native_wr_striping;

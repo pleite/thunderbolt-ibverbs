@@ -2,6 +2,7 @@
 
 #define pr_fmt(fmt) "thunderbolt_ibverbs: " fmt
 
+#include <linux/device.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
@@ -23,7 +24,8 @@ static void tbv_core_log_backend(enum tbv_backend_type type)
 }
 
 int tbv_core_init(struct tbv_state *state,
-		  const struct tbv_resolved_config *cfg)
+		  const struct tbv_resolved_config *cfg,
+		  const struct tbv_tbnet_identity_config *identity_cfg)
 {
 	int ret;
 
@@ -38,7 +40,8 @@ int tbv_core_init(struct tbv_state *state,
 	if (!cfg->native_enabled && !cfg->apple_enabled)
 		return -EINVAL;
 
-	ret = tbv_tbnet_identity_prepare(&state->tbnet_identity, cfg);
+	ret = tbv_tbnet_identity_prepare(&state->tbnet_identity, cfg,
+					 identity_cfg);
 	if (ret) {
 		mutex_destroy(&state->lock);
 		return ret;
@@ -68,6 +71,11 @@ void tbv_core_exit(struct tbv_state *state)
 	if (!list_empty(&state->peers))
 		pr_warn("unloading with live peers after service teardown\n");
 
+	if (state->verbs_parent) {
+		put_device(state->verbs_parent);
+		state->verbs_parent = NULL;
+	}
+
 	tbv_debugfs_exit(state);
 	if (!xa_empty(&state->verbs_mrs_xa))
 		pr_warn("unloading with live MR registry entries\n");
@@ -77,4 +85,26 @@ void tbv_core_exit(struct tbv_state *state)
 	xa_destroy(&state->verbs_qps_xa);
 	tbv_tbnet_identity_stop(&state->tbnet_identity);
 	mutex_destroy(&state->lock);
+}
+
+void tbv_state_set_verbs_parent(struct tbv_state *state, struct device *dev)
+{
+	if (!dev)
+		return;
+
+	mutex_lock(&state->lock);
+	if (!state->verbs_parent)
+		state->verbs_parent = get_device(dev);
+	mutex_unlock(&state->lock);
+}
+
+struct device *tbv_state_get_verbs_parent(struct tbv_state *state)
+{
+	struct device *dev;
+
+	mutex_lock(&state->lock);
+	dev = state->verbs_parent ? get_device(state->verbs_parent) : NULL;
+	mutex_unlock(&state->lock);
+
+	return dev;
 }

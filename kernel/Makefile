@@ -35,6 +35,8 @@ help:
 	@echo "  profile=auto|mac_compat|linux_perf|mixed"
 	@echo "  tbnet=auto|allow|prefer_rdma|block"
 	@echo "  tbnet_identity=auto|stock|stock_proxy|minimal_packet|off"
+	@echo "  tbnet_identity_tbnet=<netdev>"
+	@echo "  tbnet_identity_gid=auto|<netdev>"
 	@echo "  bind_services=0|1"
 	@echo "  allocate_rings=0|1"
 	@echo "  start_rings=0|1"

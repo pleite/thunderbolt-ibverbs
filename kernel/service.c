@@ -196,6 +196,8 @@ static int tbv_service_probe(struct tb_service *svc,
 		if (ret) {
 			goto err_remove_rail;
 		}
+		tbv_state_set_verbs_parent(tbv_service_state,
+					   tb_ring_dma_device(rail->path.tx_ring));
 		pr_info("allocated rings service id=%d native_lane=%u tx_hop=%d rx_hop=%d out_hop=%d\n",
 			svc->id, backend == TBV_BACKEND_NATIVE ? native_lane : 0,
 			rail->path.tx_ring->hop,
@@ -217,6 +219,18 @@ static int tbv_service_probe(struct tb_service *svc,
 			    tbv_service_state->negotiate_native)
 				tbv_native_control_queue_rail(tbv_service_state,
 							      rail);
+			else if (backend == TBV_BACKEND_APPLE &&
+				 tbv_service_state->enable_tunnels) {
+				ret = tbv_path_enable_tunnel(&rail->path, xd,
+							     rail->path.cfg.receive_path);
+				if (ret)
+					goto err_remove_rail;
+				pr_info("enabled Apple data path service id=%d tx_path=%d rx_path=%d tx_hop=%d rx_hop=%d\n",
+					svc->id, rail->path.local_transmit_path,
+					rail->path.remote_transmit_path,
+					rail->path.local_tx_hop,
+					rail->path.local_rx_hop);
+			}
 		}
 	}
 

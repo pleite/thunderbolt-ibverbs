@@ -13,6 +13,7 @@
 #include "tbv.h"
 
 #define TBV_NATIVE_HELLO_RETRIES 5
+#define TBV_NATIVE_TUNNEL_RETRIES 20
 #define TBV_NATIVE_READY_RETRIES 10
 #define TBV_NATIVE_HELLO_TIMEOUT_MS 1000
 #define TBV_NATIVE_HELLO_RETRY_DELAY_MS 200
@@ -94,6 +95,7 @@ void tbv_native_control_queue_rail(struct tbv_state *state,
 	rail->native_work_state = state;
 	WRITE_ONCE(rail->native_work_stop, false);
 	rail->native_attempts = 0;
+	rail->native_tunnel_attempts = 0;
 	rail->native_ready_attempts = 0;
 	rail->native_last_error = 0;
 	rail->native_ready_sent = false;
@@ -524,12 +526,18 @@ static void tbv_native_control_work(struct work_struct *work)
 			goto out;
 		}
 
+		attempt = ++rail->native_tunnel_attempts;
 		ret = tbv_path_enable_tunnel(&rail->path, peer->xd,
 					     rail->remote_transmit_path);
 		rail->native_last_error = ret;
 		if (ret) {
-			pr_warn("native tunnel route=0x%llx rail=0x%x enable failed: %d\n",
-				rail->key.route, rail->rail_id, ret);
+			if (attempt < TBV_NATIVE_TUNNEL_RETRIES) {
+				retry = true;
+			} else {
+				pr_warn("native tunnel route=0x%llx rail=0x%x enable failed after %u attempts: %d\n",
+					rail->key.route, rail->rail_id,
+					attempt, ret);
+			}
 			goto out;
 		}
 

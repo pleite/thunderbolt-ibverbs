@@ -5,9 +5,13 @@
 #include <linux/atomic.h>
 #include <linux/bitops.h>
 #include <linux/completion.h>
+#include <linux/if.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
+#include <linux/netdevice.h>
+#include <linux/notifier.h>
 #include <linux/refcount.h>
+#include <linux/sizes.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/uuid.h>
@@ -24,6 +28,9 @@
 #define TBV_APPLE_PRTCID 0xfa57
 #define TBV_APPLE_PRTCVERS 1
 #define TBV_APPLE_PRTCREVS 0
+#define TBV_APPLE_QPN_SHIFT 8
+#define TBV_APPLE_FRAME_SIZE SZ_4K
+#define TBV_APPLE_MAX_MSG_SIZE SZ_16M
 
 #define TBV_TBNET_ID_STATE_CARRIER		BIT(0)
 #define TBV_TBNET_ID_STATE_NEIGHBOR_READY	BIT(1)
@@ -141,12 +148,25 @@ struct tbv_path {
 	struct list_head tx_control_free;
 	struct list_head tx_control_queue;
 	struct list_head tx_data_queue;
+	struct delayed_work tx_poll_work;
 	atomic_t tx_inflight;
 	atomic64_t data_tx_enqueued;
 	atomic64_t data_tx_posted;
 	atomic64_t data_tx_completed;
 	atomic64_t data_rx_completed;
+	u8 rx_raw_opcode;
+	u8 rx_raw_flags;
+	u32 rx_raw_dest_qp;
+	u32 rx_raw_src_qp;
+	u32 rx_raw_psn;
+	u32 rx_raw_imm_data;
+	u32 rx_raw_rkey;
+	u32 rx_raw_done;
+	u32 rx_raw_remaining;
+	u64 rx_raw_base;
+	bool rx_raw_pending;
 	bool tx_scheduling;
+	bool tx_raw_stream_active;
 	int local_transmit_path;
 	int local_tx_hop;
 	int local_rx_hop;
@@ -170,6 +190,7 @@ struct tbv_rail {
 	int remote_tx_hop;
 	int remote_rx_hop;
 	u32 native_attempts;
+	u32 native_tunnel_attempts;
 	u32 native_ready_attempts;
 	int native_last_error;
 	bool active;
@@ -198,9 +219,29 @@ static inline bool tbv_rail_data_ready(const struct tbv_rail *rail)
 	       rail->native_remote_ready;
 }
 
+static inline bool tbv_rail_apple_data_ready(const struct tbv_rail *rail)
+{
+	return rail && rail->path.state == TBV_PATH_TUNNEL_ENABLED;
+}
+
 struct tbv_tbnet_identity {
 	enum tbv_tbnet_identity_mode mode;
 	unsigned long state;
+	struct mutex lock;
+	char tbnet_netdev_name[IFNAMSIZ];
+	char gid_netdev_name[IFNAMSIZ];
+	struct net_device *tbnet_dev;
+	struct net_device *gid_dev;
+	struct notifier_block netdev_nb;
+	struct notifier_block inetaddr_nb;
+	__be32 proxy_ipv4;
+	bool netdev_nb_registered;
+	bool inetaddr_nb_registered;
+	bool rx_handler_registered;
+	atomic64_t arp_requests;
+	atomic64_t arp_replies;
+	atomic64_t arp_ignored;
+	atomic64_t arp_errors;
 };
 
 struct tbv_tbip_control {
@@ -225,6 +266,11 @@ struct tbv_tbip_login_response_params {
 struct tbv_tbnet_arp_proxy {
 	__be32 ipv4;
 	u8 mac[TBV_ETH_ALEN];
+};
+
+struct tbv_tbnet_identity_config {
+	const char *tbnet_netdev;
+	const char *gid_netdev;
 };
 
 struct tbv_state {
@@ -263,6 +309,8 @@ struct tbv_state {
 	atomic64_t data_wr_live;
 	atomic64_t data_wr_no_path;
 	atomic64_t data_wr_copied;
+	atomic64_t data_wr_zcopy;
+	atomic64_t data_wr_zcopy_fallback;
 	atomic64_t data_wr_copy_error;
 	atomic64_t data_wr_path_send;
 	atomic64_t data_wr_path_send_error;
@@ -290,6 +338,7 @@ struct tbv_state {
 	atomic64_t data_cq_overflow;
 	struct xarray verbs_mrs_xa;
 	struct xarray verbs_qps_xa;
+	struct device *verbs_parent;
 	struct tbv_ibdev *ibdev;
 };
 
@@ -305,10 +354,17 @@ struct tbv_service_config {
 
 struct tb_property_dir;
 struct tbv_data_frame;
+struct tbv_native_data_header;
 struct tbv_tx_packet;
+struct device;
+struct page;
 struct tb_ring;
 struct tb_xdomain;
 typedef void (*tbv_path_tx_done_fn)(void *ctx, int status);
+typedef int (*tbv_path_next_page_fn)(void *ctx, struct page **page,
+				     u32 *page_off, u32 *length,
+				     tbv_path_tx_done_fn *done,
+				     void **done_ctx);
 #define TBV_PATH_SEND_CONTROL	BIT(0)
 #define TBV_PATH_SEND_DEFER	BIT(1)
 extern const uuid_t tbv_native_service_uuid;
@@ -327,11 +383,19 @@ const char *tbv_backend_name(enum tbv_backend_type type);
 
 int tbv_ibdev_start(struct tbv_state *state, bool register_verbs);
 void tbv_ibdev_stop(struct tbv_state *state);
+const char *tbv_ibdev_roce_netdev_name(void);
 void tbv_ibdev_rx_frame(struct tbv_state *state, const void *data, u32 len);
+void tbv_ibdev_rx_native_frame(struct tbv_state *state,
+			       const struct tbv_native_data_header *hdr,
+			       const void *payload);
+void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
+			      const struct tbv_path *path,
+			      const void *payload, u32 len, u8 eof);
 
 int tbv_tbnet_identity_check_config(const struct tbv_resolved_config *cfg);
 int tbv_tbnet_identity_prepare(struct tbv_tbnet_identity *identity,
-			       const struct tbv_resolved_config *cfg);
+			       const struct tbv_resolved_config *cfg,
+			       const struct tbv_tbnet_identity_config *identity_cfg);
 void tbv_tbnet_identity_stop(struct tbv_tbnet_identity *identity);
 int tbv_tbip_build_login(void *buf, size_t size,
 			 const struct tbv_tbip_login_params *params);
@@ -395,6 +459,15 @@ int tbv_path_send(struct tbv_path *path, const void *data, u32 len,
 int tbv_path_send_owned(struct tbv_path *path, void *data, u32 len,
 			unsigned int flags,
 			tbv_path_tx_done_fn done, void *done_ctx);
+int tbv_path_send_marked_owned(struct tbv_path *path, void *data, u32 len,
+			       u8 sof, u8 eof, unsigned int flags,
+			       tbv_path_tx_done_fn done, void *done_ctx);
+int tbv_path_send_page_stream(struct tbv_path *path,
+			      const struct tbv_native_data_header *hdr,
+			      u32 total_length, unsigned int flags,
+			      tbv_path_tx_done_fn meta_done,
+			      void *meta_done_ctx,
+			      tbv_path_next_page_fn next, void *next_ctx);
 void tbv_path_kick_tx(struct tbv_path *path);
 u32 tbv_path_cancel_data_done_ctx(struct tbv_path *path,
 				  tbv_path_tx_done_fn done, void *done_ctx);
@@ -405,7 +478,10 @@ int tbv_debugfs_init(struct tbv_state *state);
 void tbv_debugfs_exit(struct tbv_state *state);
 
 int tbv_core_init(struct tbv_state *state,
-		  const struct tbv_resolved_config *cfg);
+		  const struct tbv_resolved_config *cfg,
+		  const struct tbv_tbnet_identity_config *identity_cfg);
 void tbv_core_exit(struct tbv_state *state);
+void tbv_state_set_verbs_parent(struct tbv_state *state, struct device *dev);
+struct device *tbv_state_get_verbs_parent(struct tbv_state *state);
 
 #endif
