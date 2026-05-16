@@ -545,7 +545,7 @@ static int tbv_get_port_immutable(struct ib_device *ibdev, u32 port_num,
 
 	immutable->pkey_tbl_len = attr.pkey_tbl_len;
 	immutable->gid_tbl_len = attr.gid_tbl_len;
-	immutable->core_cap_flags = RDMA_CORE_PORT_IBA_IB;
+	immutable->core_cap_flags = RDMA_CORE_PORT_IBA_ROCE_UDP_ENCAP;
 	immutable->max_mad_size = IB_MGMT_MAD_SIZE;
 	return 0;
 }
@@ -553,7 +553,7 @@ static int tbv_get_port_immutable(struct ib_device *ibdev, u32 port_num,
 static enum rdma_link_layer tbv_get_link_layer(struct ib_device *ibdev,
 					       u32 port_num)
 {
-	return IB_LINK_LAYER_INFINIBAND;
+	return IB_LINK_LAYER_ETHERNET;
 }
 
 static int tbv_query_gid(struct ib_device *ibdev, u32 port_num, int index,
