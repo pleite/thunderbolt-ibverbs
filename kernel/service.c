@@ -257,6 +257,7 @@ static const struct tb_service_id tbv_service_ids[] = {
 	{ TB_SERVICE("tbverb1", TBV_NATIVE_PRTCID), .driver_data = 1 },
 	{ TB_SERVICE("tbverb2", TBV_NATIVE_PRTCID), .driver_data = 2 },
 	{ TB_SERVICE("tbverb3", TBV_NATIVE_PRTCID), .driver_data = 3 },
+#ifndef TBV_LINUX_PERF_ONLY
 	{
 		.match_flags = TBSVC_MATCH_PROTOCOL_KEY |
 			       TBSVC_MATCH_PROTOCOL_ID |
@@ -270,6 +271,7 @@ static const struct tb_service_id tbv_service_ids[] = {
 		.protocol_version = TBV_APPLE_PRTCVERS,
 		.protocol_revision = TBV_APPLE_PRTCREVS,
 	},
+#endif
 	{ },
 };
 MODULE_DEVICE_TABLE(tbsvc, tbv_service_ids);
