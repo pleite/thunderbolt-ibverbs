@@ -8,6 +8,7 @@
 #include <linux/errno.h>
 #include <linux/highmem.h>
 #include <linux/idr.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/mmzone.h>
 #include <linux/netdevice.h>
@@ -90,6 +91,11 @@ static uint apple_tx_pace_after_frames;
 module_param(apple_tx_pace_after_frames, uint, 0644);
 MODULE_PARM_DESC(apple_tx_pace_after_frames,
 		 "Start Apple-compatible TX pacing after this many queued FA57 frames in a QP burst; 0 starts immediately");
+
+static uint apple_tx_cooldown_us;
+module_param(apple_tx_cooldown_us, uint, 0644);
+MODULE_PARM_DESC(apple_tx_cooldown_us,
+		 "Microseconds to delay the next Apple-compatible SEND after a completed SEND; 0 disables cooldown");
 
 static uint apple_rx_pending_bytes = TBV_APPLE_MAX_MSG_SIZE;
 module_param(apple_rx_pending_bytes, uint, 0644);
@@ -212,6 +218,7 @@ struct tbv_qp {
 	atomic_t apple_tx_inflight;
 	atomic_t apple_tx_inflight_frames;
 	atomic_t apple_tx_pace_queued_frames;
+	atomic64_t apple_tx_cooldown_until_ns;
 	u32 send_psn;
 	u32 rx_expected_psn;
 	struct tbv_rx_message rx_msg;
@@ -1037,6 +1044,7 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	atomic_set(&tqp->apple_tx_inflight, 0);
 	atomic_set(&tqp->apple_tx_inflight_frames, 0);
 	atomic_set(&tqp->apple_tx_pace_queued_frames, 0);
+	atomic64_set(&tqp->apple_tx_cooldown_until_ns, 0);
 	init_completion(&tqp->refs_zero);
 	INIT_LIST_HEAD(&tqp->pending_sends);
 	INIT_LIST_HEAD(&tqp->pending_reads);
@@ -1231,6 +1239,22 @@ static void tbv_qp_release_apple_tx_window(struct tbv_qp *tqp,
 		wake_up_all(&tqp->apple_tx_wait);
 }
 
+static void tbv_qp_note_apple_tx_cooldown(struct tbv_qp *tqp, int status)
+{
+	unsigned int cooldown_us;
+	u64 until;
+
+	if (status)
+		return;
+
+	cooldown_us = READ_ONCE(apple_tx_cooldown_us);
+	if (!cooldown_us)
+		return;
+
+	until = ktime_get_ns() + (u64)cooldown_us * NSEC_PER_USEC;
+	atomic64_set(&tqp->apple_tx_cooldown_until_ns, until);
+}
+
 static bool tbv_send_complete(struct tbv_send_ctx *send, int status)
 {
 	struct tbv_qp *tqp = send->tqp;
@@ -1247,6 +1271,7 @@ static bool tbv_send_complete(struct tbv_send_ctx *send, int status)
 		return false;
 
 	if (send->apple_window_acquired) {
+		tbv_qp_note_apple_tx_cooldown(tqp, status);
 		tbv_qp_release_apple_tx_window(tqp,
 						send->apple_window_wr_acquired,
 						send->apple_window_frames);
@@ -3147,23 +3172,67 @@ static bool tbv_qp_try_acquire_apple_tx_window(struct tbv_qp *tqp, u32 frames,
 	return acquired;
 }
 
+static u64 tbv_qp_apple_tx_cooldown_remaining_us(struct tbv_qp *tqp)
+{
+	u64 until = atomic64_read(&tqp->apple_tx_cooldown_until_ns);
+	u64 now;
+
+	if (!READ_ONCE(apple_tx_cooldown_us))
+		return 0;
+	if (!until)
+		return 0;
+
+	now = ktime_get_ns();
+	if (!time_after64(until, now))
+		return 0;
+
+	return DIV_ROUND_UP_ULL(until - now, NSEC_PER_USEC);
+}
+
 static int tbv_qp_acquire_apple_tx_window(struct tbv_qp *tqp, u32 frames,
 					  bool *wr_acquired,
 					  u32 *frames_acquired)
 {
 	int ret = -ETIMEDOUT;
-	long waited;
+	unsigned long deadline = jiffies + msecs_to_jiffies(5000);
 
 	*wr_acquired = false;
 	*frames_acquired = 0;
-	waited = wait_event_timeout(tqp->apple_tx_wait,
-				    tbv_qp_try_acquire_apple_tx_window(tqp,
-								       frames,
-								       wr_acquired,
-								       frames_acquired,
-								       &ret),
-				    msecs_to_jiffies(5000));
-	return waited ? ret : -ETIMEDOUT;
+
+	for (;;) {
+		u64 cooldown_us;
+		unsigned long min_us;
+		long remaining;
+		long waited;
+
+		if (time_after_eq(jiffies, deadline))
+			return -ETIMEDOUT;
+
+		remaining = deadline - jiffies;
+		waited = wait_event_timeout(tqp->apple_tx_wait,
+					    tbv_qp_try_acquire_apple_tx_window(tqp,
+									       frames,
+									       wr_acquired,
+									       frames_acquired,
+									       &ret),
+					    remaining);
+		if (!waited)
+			return -ETIMEDOUT;
+		if (ret)
+			return ret;
+
+		cooldown_us = tbv_qp_apple_tx_cooldown_remaining_us(tqp);
+		if (!cooldown_us)
+			return 0;
+
+		tbv_qp_release_apple_tx_window(tqp, *wr_acquired,
+					       *frames_acquired);
+		*wr_acquired = false;
+		*frames_acquired = 0;
+
+		min_us = min_t(u64, cooldown_us, ULONG_MAX - 10);
+		usleep_range(min_us, min_us + 10);
+	}
 }
 
 static int tbv_umem_copy_to(struct tbv_mr *mr, u64 addr, const void *src,
