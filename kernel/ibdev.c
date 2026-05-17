@@ -4,6 +4,7 @@
 
 #include <linux/atomic.h>
 #include <linux/completion.h>
+#include <linux/delay.h>
 #include <linux/errno.h>
 #include <linux/highmem.h>
 #include <linux/idr.h>
@@ -74,6 +75,16 @@ static uint apple_tx_max_inflight_frames;
 module_param(apple_tx_max_inflight_frames, uint, 0644);
 MODULE_PARM_DESC(apple_tx_max_inflight_frames,
 		 "Maximum Apple-compatible 4 KiB FA57 frames in flight per QP; 0 disables the frame window");
+
+static uint apple_tx_pace_us;
+module_param(apple_tx_pace_us, uint, 0644);
+MODULE_PARM_DESC(apple_tx_pace_us,
+		 "Microseconds to sleep between Apple-compatible FA57 TX frames; 0 disables pacing");
+
+static uint apple_tx_pace_interval_frames = 1;
+module_param(apple_tx_pace_interval_frames, uint, 0644);
+MODULE_PARM_DESC(apple_tx_pace_interval_frames,
+		 "Apply Apple-compatible TX pacing every N FA57 frames; 0 is treated as 1");
 
 static uint apple_rx_pending_bytes = TBV_APPLE_MAX_MSG_SIZE;
 module_param(apple_rx_pending_bytes, uint, 0644);
@@ -1619,6 +1630,9 @@ static int tbv_post_apple_send(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 		u32 payload_len = min_t(u32, total_len - offset,
 					TBV_APPLE_FRAME_SIZE);
 		bool last = offset + payload_len == total_len;
+		u32 frame_index;
+		unsigned int pace_us;
+		unsigned int pace_interval;
 		struct tbv_apple_send_fill fill = {
 			.segs = segs,
 			.tqp = tqp,
@@ -1640,8 +1654,17 @@ static int tbv_post_apple_send(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 		}
 
 		remaining--;
+		frame_index = nfrags - remaining;
 		sent_any = true;
 		offset += payload_len;
+
+		pace_us = READ_ONCE(apple_tx_pace_us);
+		pace_interval = READ_ONCE(apple_tx_pace_interval_frames);
+		if (!pace_interval)
+			pace_interval = 1;
+		if (offset < total_len && pace_us &&
+		    frame_index % pace_interval == 0)
+			usleep_range(pace_us, pace_us + 10);
 	}
 
 	tbv_path_kick_tx(path);
