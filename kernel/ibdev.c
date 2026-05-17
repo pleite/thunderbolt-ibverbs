@@ -42,7 +42,9 @@
 #define TBV_RX_REORDER_MAX_BYTES (64u * 1024u * 1024u)
 #define TBV_RX_REORDER_MAX_FRAGS TBV_NATIVE_DATA_MAX_FRAGS
 #define TBV_IBDEV_GID_TBL_LEN 8
-#define TBV_APPLE_PENDING_RX_SLOTS 16
+#define TBV_APPLE_PENDING_RX_DEFAULT_SLOTS 4096
+#define TBV_APPLE_PENDING_RX_MAX_SLOTS 16384
+#define TBV_APPLE_PENDING_RX_TOTAL_BYTES_DEFAULT (64u * 1024u * 1024u)
 #define TBV_APPLE_SLOT_WIRE_SIZE 256
 #define TBV_APPLE_FRAME_SLOT_USER_SIZE 252
 #define TBV_APPLE_FRAME_SPLIT_USER_SIZE 12
@@ -72,6 +74,17 @@ static uint apple_rx_pending_bytes = TBV_APPLE_MAX_MSG_SIZE;
 module_param(apple_rx_pending_bytes, uint, 0644);
 MODULE_PARM_DESC(apple_rx_pending_bytes,
 		 "Maximum bytes buffered per early Apple UC receive when no receive WQE is posted");
+
+static uint apple_rx_pending_slots = TBV_APPLE_PENDING_RX_DEFAULT_SLOTS;
+module_param(apple_rx_pending_slots, uint, 0644);
+MODULE_PARM_DESC(apple_rx_pending_slots,
+		 "Maximum number of early Apple UC receives buffered per QP");
+
+static uint apple_rx_pending_total_bytes =
+	TBV_APPLE_PENDING_RX_TOTAL_BYTES_DEFAULT;
+module_param(apple_rx_pending_total_bytes, uint, 0644);
+MODULE_PARM_DESC(apple_rx_pending_total_bytes,
+		 "Maximum aggregate bytes buffered for early Apple UC receives per QP");
 
 struct tbv_ucontext {
 	struct ib_ucontext base;
@@ -182,10 +195,12 @@ struct tbv_qp {
 	struct list_head rx_reorder;
 	u32 rx_reorder_count;
 	u32 rx_reorder_bytes;
-	struct tbv_apple_pending_rx apple_pending[TBV_APPLE_PENDING_RX_SLOTS];
-	u8 apple_pending_head;
-	u8 apple_pending_tail;
-	u8 apple_pending_ready_count;
+	struct tbv_apple_pending_rx *apple_pending;
+	u32 apple_pending_slot_count;
+	u32 apple_pending_head;
+	u32 apple_pending_tail;
+	u32 apple_pending_ready_count;
+	u32 apple_pending_bytes;
 	int apple_pending_active;
 	bool qpn_allocated;
 	bool closing;
@@ -960,6 +975,24 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 		tqp->recvq_size = init_attr->cap.max_recv_wr;
 	}
 
+	if (tbv_state_apple_only(state) && READ_ONCE(apple_rx_pending_bytes) &&
+	    READ_ONCE(apple_rx_pending_total_bytes)) {
+		u32 slots = min_t(u32, READ_ONCE(apple_rx_pending_slots),
+				  TBV_APPLE_PENDING_RX_MAX_SLOTS);
+
+		if (slots) {
+			tqp->apple_pending =
+				kvcalloc(slots, sizeof(*tqp->apple_pending),
+					 GFP_KERNEL);
+			if (!tqp->apple_pending) {
+				kfree(tqp->recvq);
+				ida_free(&tbv_qpn_ida, qpn);
+				return -ENOMEM;
+			}
+			tqp->apple_pending_slot_count = slots;
+		}
+	}
+
 	tqp->init_attr = *init_attr;
 	tqp->owner = state;
 	spin_lock_init(&tqp->lock);
@@ -982,6 +1015,7 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	ret = __xa_insert(&tqp->owner->verbs_qps_xa, qpn, tqp, GFP_KERNEL);
 	xa_unlock_irqrestore(&tqp->owner->verbs_qps_xa, flags);
 	if (ret) {
+		kvfree(tqp->apple_pending);
 		kfree(tqp->recvq);
 		ida_free(&tbv_qpn_ida, qpn);
 		tqp->qpn_allocated = false;
@@ -1043,8 +1077,9 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 	wait_for_completion(&tqp->refs_zero);
 	tbv_qp_flush_reorder(tqp);
 	tbv_qp_flush_apple_pending(tqp);
-	for (i = 0; i < TBV_APPLE_PENDING_RX_SLOTS; i++)
+	for (i = 0; i < tqp->apple_pending_slot_count; i++)
 		kvfree(tqp->apple_pending[i].buf);
+	kvfree(tqp->apple_pending);
 
 	pending = tqp->recv_count;
 	if (tqp->owner && pending)
@@ -2367,20 +2402,42 @@ static void tbv_apple_pending_reset(struct tbv_apple_pending_rx *p)
 	p->ready = false;
 }
 
+static void tbv_apple_pending_release(struct tbv_qp *tqp,
+				      struct tbv_apple_pending_rx *p)
+{
+	if (p->delivered) {
+		if (tqp->apple_pending_bytes >= p->delivered)
+			tqp->apple_pending_bytes -= p->delivered;
+		else
+			tqp->apple_pending_bytes = 0;
+	}
+	tbv_apple_pending_reset(p);
+}
+
 static void tbv_qp_flush_apple_pending(struct tbv_qp *tqp)
 {
 	u32 i;
 
-	for (i = 0; i < TBV_APPLE_PENDING_RX_SLOTS; i++) {
+	if (!tqp->apple_pending) {
+		tqp->apple_pending_head = 0;
+		tqp->apple_pending_tail = 0;
+		tqp->apple_pending_ready_count = 0;
+		tqp->apple_pending_bytes = 0;
+		tqp->apple_pending_active = -1;
+		return;
+	}
+
+	for (i = 0; i < tqp->apple_pending_slot_count; i++) {
 		struct tbv_apple_pending_rx *p = &tqp->apple_pending[i];
 
 		if ((p->active || p->ready) && tqp->owner)
 			atomic64_inc(&tqp->owner->data_rx_pending_discarded);
-		tbv_apple_pending_reset(p);
+		tbv_apple_pending_release(tqp, p);
 	}
 	tqp->apple_pending_head = 0;
 	tqp->apple_pending_tail = 0;
 	tqp->apple_pending_ready_count = 0;
+	tqp->apple_pending_bytes = 0;
 	tqp->apple_pending_active = -1;
 }
 
@@ -2391,9 +2448,13 @@ tbv_apple_pending_active_locked(struct tbv_state *state, struct tbv_qp *tqp)
 
 	if (tqp->apple_pending_active >= 0)
 		return &tqp->apple_pending[tqp->apple_pending_active];
-	if (tqp->apple_pending_ready_count >= TBV_APPLE_PENDING_RX_SLOTS)
+	if (!tqp->apple_pending || !tqp->apple_pending_slot_count)
+		return NULL;
+	if (tqp->apple_pending_ready_count >= tqp->apple_pending_slot_count)
 		return NULL;
 	if (!READ_ONCE(apple_rx_pending_bytes))
+		return NULL;
+	if (!READ_ONCE(apple_rx_pending_total_bytes))
 		return NULL;
 
 	p = &tqp->apple_pending[tqp->apple_pending_tail];
@@ -2417,7 +2478,7 @@ static void tbv_apple_pending_finish_locked(struct tbv_qp *tqp)
 	tqp->apple_pending_active = -1;
 	tqp->apple_pending_ready_count++;
 	tqp->apple_pending_tail = (tqp->apple_pending_tail + 1) %
-				  TBV_APPLE_PENDING_RX_SLOTS;
+				  tqp->apple_pending_slot_count;
 }
 
 static void tbv_apple_rx_push_wc(struct tbv_qp *tqp,
@@ -2468,9 +2529,9 @@ static void tbv_apple_rx_drain_pending_locked(struct tbv_state *state,
 		atomic64_inc(&state->data_rx_op_send);
 		atomic64_inc(&state->data_rx_reorder_delivered);
 
-		tbv_apple_pending_reset(p);
+		tbv_apple_pending_release(tqp, p);
 		tqp->apple_pending_head = (tqp->apple_pending_head + 1) %
-					  TBV_APPLE_PENDING_RX_SLOTS;
+					  tqp->apple_pending_slot_count;
 		tqp->apple_pending_ready_count--;
 	}
 }
@@ -2493,12 +2554,15 @@ static int tbv_apple_rx_copy_piece(struct tbv_state *state,
 	return 0;
 }
 
-static int tbv_apple_rx_copy_piece_to_buf(struct tbv_apple_pending_rx *p,
+static int tbv_apple_rx_copy_piece_to_buf(struct tbv_qp *tqp,
+					  struct tbv_apple_pending_rx *p,
 					  const void *src, u32 len,
 					  u32 *user_len)
 {
 	u32 max_bytes;
 	u32 required;
+	u32 total_limit;
+	u32 total_required;
 
 	if (!len)
 		return 0;
@@ -2509,6 +2573,12 @@ static int tbv_apple_rx_copy_piece_to_buf(struct tbv_apple_pending_rx *p,
 			  TBV_APPLE_MAX_MSG_SIZE);
 	if (!max_bytes || required > max_bytes)
 		return -EMSGSIZE;
+
+	total_limit = READ_ONCE(apple_rx_pending_total_bytes);
+	if (!total_limit ||
+	    check_add_overflow(tqp->apple_pending_bytes, len, &total_required) ||
+	    total_required > total_limit)
+		return -ENOSPC;
 
 	if (required > p->capacity) {
 		u32 new_capacity = p->capacity ? p->capacity : PAGE_SIZE;
@@ -2538,6 +2608,7 @@ static int tbv_apple_rx_copy_piece_to_buf(struct tbv_apple_pending_rx *p,
 	}
 	memcpy((u8 *)p->buf + p->delivered, src, len);
 	p->delivered += len;
+	tqp->apple_pending_bytes += len;
 	*user_len += len;
 	return 0;
 }
@@ -2625,7 +2696,8 @@ out:
 	return 0;
 }
 
-static int tbv_apple_rx_copy_frame_to_buf(struct tbv_apple_pending_rx *p,
+static int tbv_apple_rx_copy_frame_to_buf(struct tbv_qp *tqp,
+					  struct tbv_apple_pending_rx *p,
 					  const void *payload, u32 len,
 					  u32 *out_user_len)
 {
@@ -2641,7 +2713,7 @@ static int tbv_apple_rx_copy_frame_to_buf(struct tbv_apple_pending_rx *p,
 		normal_slots--;
 
 	for (i = 0; i < normal_slots; i++) {
-		ret = tbv_apple_rx_copy_piece_to_buf(p,
+		ret = tbv_apple_rx_copy_piece_to_buf(tqp, p,
 						     data + i * TBV_APPLE_SLOT_WIRE_SIZE,
 						     TBV_APPLE_FRAME_SLOT_USER_SIZE,
 						     &user_len);
@@ -2652,12 +2724,12 @@ static int tbv_apple_rx_copy_frame_to_buf(struct tbv_apple_pending_rx *p,
 	if (!tail && num_slots) {
 		const u8 *slot = data + normal_slots * TBV_APPLE_SLOT_WIRE_SIZE;
 
-		ret = tbv_apple_rx_copy_piece_to_buf(p, slot,
+		ret = tbv_apple_rx_copy_piece_to_buf(tqp, p, slot,
 						     TBV_APPLE_FRAME_SPLIT_USER_SIZE,
 						     &user_len);
 		if (ret)
 			return ret;
-		ret = tbv_apple_rx_copy_piece_to_buf(p,
+		ret = tbv_apple_rx_copy_piece_to_buf(tqp, p,
 						     slot + TBV_APPLE_FRAME_SPLIT_USER_SIZE + 4,
 						     TBV_APPLE_TAIL_USER_SIZE,
 						     &user_len);
@@ -2669,7 +2741,7 @@ static int tbv_apple_rx_copy_frame_to_buf(struct tbv_apple_pending_rx *p,
 
 		/* See tbv_apple_rx_copy_frame(). */
 		if (prefix <= 4) {
-			ret = tbv_apple_rx_copy_piece_to_buf(p, frag,
+			ret = tbv_apple_rx_copy_piece_to_buf(tqp, p, frag,
 							     tail - 4,
 							     &user_len);
 			if (ret)
@@ -2681,17 +2753,17 @@ static int tbv_apple_rx_copy_frame_to_buf(struct tbv_apple_pending_rx *p,
 		if (prefix > TBV_APPLE_FRAME_SPLIT_USER_SIZE)
 			return -EINVAL;
 
-		ret = tbv_apple_rx_copy_piece_to_buf(p, frag, prefix,
+		ret = tbv_apple_rx_copy_piece_to_buf(tqp, p, frag, prefix,
 						     &user_len);
 		if (ret)
 			return ret;
-		ret = tbv_apple_rx_copy_piece_to_buf(p, frag + prefix + 4,
+		ret = tbv_apple_rx_copy_piece_to_buf(tqp, p, frag + prefix + 4,
 						     TBV_APPLE_TAIL_USER_SIZE,
 						     &user_len);
 		if (ret)
 			return ret;
 	} else if (tail) {
-		ret = tbv_apple_rx_copy_piece_to_buf(p,
+		ret = tbv_apple_rx_copy_piece_to_buf(tqp, p,
 						     data + normal_slots * TBV_APPLE_SLOT_WIRE_SIZE,
 						     tail, &user_len);
 		if (ret)
@@ -2741,11 +2813,13 @@ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 				tbv_qp_put(tqp);
 				return;
 			}
-			ret = tbv_apple_rx_copy_frame_to_buf(pending, payload,
-							     len, &user_len);
+			ret = tbv_apple_rx_copy_frame_to_buf(tqp, pending,
+							     payload, len,
+							     &user_len);
 			if (ret) {
 				atomic64_inc(&state->data_rx_bad_frame);
-				pending->status = ret == -EMSGSIZE ?
+				pending->status = (ret == -EMSGSIZE ||
+						   ret == -ENOSPC) ?
 					IB_WC_LOC_LEN_ERR : IB_WC_LOC_PROT_ERR;
 			}
 			if (eof == 3) {
