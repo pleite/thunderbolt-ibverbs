@@ -45,3 +45,7 @@ help:
 	@echo "  register_verbs=0|1"
 	@echo "  native_prtcstns=<u32>"
 	@echo "  apple_prtcstns=<u32>"
+	@echo "  apple_tx_max_inflight_wr=<N>"
+	@echo "  apple_rx_pending_bytes=<bytes>"
+	@echo "  apple_rx_pending_slots=<N>"
+	@echo "  apple_rx_pending_total_bytes=<bytes>"
