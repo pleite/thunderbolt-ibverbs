@@ -25,6 +25,9 @@ int tbv_native_control_legacy_start(struct tbv_state *state)
 	       sizeof(tbv_native_legacy_handler));
 	tbv_native_legacy_handler.uuid = &tbv_native_service_uuid;
 	tbv_native_legacy_handler.callback = tbv_native_control_legacy_handle;
+#ifdef TB_PROTOCOL_HANDLER_HAS_OWNER
+	tbv_native_legacy_handler.owner = THIS_MODULE;
+#endif
 	tbv_native_legacy_handler.data = state;
 
 	ret = tb_register_protocol_handler(&tbv_native_legacy_handler);

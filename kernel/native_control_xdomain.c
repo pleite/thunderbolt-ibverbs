@@ -32,6 +32,9 @@ int tbv_native_control_xdomain_start(struct tbv_state *state)
 	tbv_native_xdomain_handler.uuid = &tbv_native_service_uuid;
 	tbv_native_xdomain_handler.callback_xd =
 		tbv_native_control_xdomain_handle;
+#ifdef TB_PROTOCOL_HANDLER_HAS_OWNER
+	tbv_native_xdomain_handler.owner = THIS_MODULE;
+#endif
 	tbv_native_xdomain_handler.data = state;
 
 	ret = tb_register_protocol_handler(&tbv_native_xdomain_handler);
