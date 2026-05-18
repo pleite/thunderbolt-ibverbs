@@ -15,12 +15,78 @@ static bool tbv_peer_matches(const struct tbv_peer *peer,
 	return peer->backend == backend && peer->xd == xd;
 }
 
+static bool tbv_xdomain_same_remote_host(const struct tb_xdomain *a,
+					 const struct tb_xdomain *b)
+{
+	if (a == b)
+		return true;
+	if (!a || !b)
+		return false;
+
+	if (a->remote_uuid && b->remote_uuid)
+		return uuid_equal(a->remote_uuid, b->remote_uuid);
+
+	return a->route == b->route && a->link == b->link &&
+	       a->depth == b->depth;
+}
+
+static bool tbv_native_legacy_xdomain_allowed_locked(struct tbv_state *state,
+						     struct tb_xdomain *xd,
+						     u32 *existing_peer_id)
+{
+	struct tbv_peer *pos;
+
+	list_for_each_entry(pos, &state->peers, node) {
+		if (pos->backend != TBV_BACKEND_NATIVE)
+			continue;
+		if (pos->xd == xd)
+			return true;
+		if (!tbv_xdomain_same_remote_host(pos->xd, xd))
+			continue;
+
+		if (existing_peer_id)
+			*existing_peer_id = pos->peer_id;
+		return false;
+	}
+
+	return true;
+}
+
+static bool tbv_native_legacy_rail_key_allowed_locked(struct tbv_peer *peer,
+						      const struct tbv_rail_key *key,
+						      u32 *existing_peer_id)
+{
+	struct tbv_state *state = peer->state;
+	struct tbv_peer *pos_peer;
+
+	list_for_each_entry(pos_peer, &state->peers, node) {
+		struct tbv_rail *pos_rail;
+
+		if (pos_peer->backend != TBV_BACKEND_NATIVE)
+			continue;
+
+		list_for_each_entry(pos_rail, &pos_peer->rails, node) {
+			if (pos_peer == peer)
+				continue;
+			if (tbv_rail_key_cmp(key, &pos_rail->key))
+				continue;
+
+			if (existing_peer_id)
+				*existing_peer_id = pos_peer->peer_id;
+			return false;
+		}
+	}
+
+	return true;
+}
+
 struct tbv_peer *tbv_peer_get_or_create(struct tbv_state *state,
 					enum tbv_backend_type backend,
 					struct tb_xdomain *xd)
 {
 	struct tbv_peer *peer;
 	struct tbv_peer *pos;
+	u32 existing_peer_id = 0;
 
 	if (!tbv_backend_get(backend))
 		return ERR_PTR(-EINVAL);
@@ -47,6 +113,22 @@ struct tbv_peer *tbv_peer_get_or_create(struct tbv_state *state,
 		pr_info("peer %u reused backend=%s refs=%u\n", pos->peer_id,
 			tbv_backend_name(backend), refcount_read(&pos->refcnt));
 		return pos;
+	}
+
+	if (backend == TBV_BACKEND_NATIVE &&
+	    !state->native_control_source_aware &&
+	    !tbv_native_legacy_xdomain_allowed_locked(state, xd,
+						      &existing_peer_id)) {
+		atomic64_inc(&state->native_legacy_ambiguous_limited);
+		if (!state->native_legacy_multicable_warned) {
+			state->native_legacy_multicable_warned = true;
+			pr_warn("legacy source-blind native control: limiting remote host to peer %u; apply callback_xd kernel support for multi-cable native rails\n",
+				existing_peer_id);
+		}
+		mutex_unlock(&state->lock);
+		tb_xdomain_put(peer->xd);
+		kfree(peer);
+		return ERR_PTR(-EBUSY);
 	}
 
 	peer->peer_id = state->next_peer_id++;
@@ -90,6 +172,7 @@ struct tbv_rail *tbv_peer_add_rail(struct tbv_peer *peer,
 	struct tbv_path_config path_cfg;
 	struct tbv_rail *rail;
 	struct tbv_rail *pos;
+	u32 existing_peer_id = 0;
 
 	rail = kzalloc(sizeof(*rail), GFP_KERNEL);
 	if (!rail)
@@ -118,6 +201,21 @@ struct tbv_rail *tbv_peer_add_rail(struct tbv_peer *peer,
 	tbv_path_init(&rail->path, &path_cfg, rail);
 
 	mutex_lock(&peer->state->lock);
+	if (peer->backend == TBV_BACKEND_NATIVE &&
+	    !peer->state->native_control_source_aware &&
+	    !tbv_native_legacy_rail_key_allowed_locked(peer, key,
+						       &existing_peer_id)) {
+		atomic64_inc(&peer->state->native_legacy_ambiguous_limited);
+		if (!peer->state->native_legacy_multicable_warned) {
+			peer->state->native_legacy_multicable_warned = true;
+			pr_warn("legacy source-blind native control: rejecting duplicate native rail key from peer %u; apply callback_xd kernel support for multi-cable native rails\n",
+				existing_peer_id);
+		}
+		mutex_unlock(&peer->state->lock);
+		kfree(rail);
+		return ERR_PTR(-EBUSY);
+	}
+
 	list_for_each_entry(pos, &peer->rails, node) {
 		int cmp = tbv_rail_key_cmp(key, &pos->key);
 

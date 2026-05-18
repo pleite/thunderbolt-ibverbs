@@ -192,13 +192,14 @@ static int __init tbv_init(void)
 		snprintf(lanes_desc, sizeof(lanes_desc), "%u-%u",
 			 cfg.lanes_min, cfg.lanes_max);
 
-	pr_info("loaded compat=%s profile=%s resolved_profile=%s tbnet=%s tbnet_identity=%s lanes=%s native_data=%u apple_data=%u native_wr_striping=%u native_fragment_striping=%u\n",
+	pr_info("loaded compat=%s profile=%s resolved_profile=%s tbnet=%s tbnet_identity=%s lanes=%s native_control=%s native_data=%u apple_data=%u native_wr_striping=%u native_fragment_striping=%u\n",
 		tbv_compat_name(cfg.compat),
 		tbv_profile_name(cfg.profile),
 		tbv_profile_name(resolved.profile),
 		tbv_tbnet_policy_name(cfg.tbnet),
 		tbv_tbnet_identity_name(resolved.tbnet_identity),
 		lanes_desc,
+		tbv_native_control_mode_name(&tbv_driver_state),
 		native_data,
 		apple_data,
 		native_wr_striping,

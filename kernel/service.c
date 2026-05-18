@@ -452,7 +452,7 @@ err_unregister_apple:
 err_unregister_native:
 	tbv_unregister_native_dirs(state);
 err_clear:
-	tbv_native_control_stop();
+	tbv_native_control_stop(state);
 	tbv_service_state = NULL;
 	return ret;
 }
@@ -464,7 +464,7 @@ void tbv_services_stop(struct tbv_state *state)
 		state->services_registered = false;
 	}
 
-	tbv_native_control_stop();
+	tbv_native_control_stop(state);
 
 	if (state->apple_dir) {
 		tb_unregister_property_dir(tbv_apple_protocol_key,

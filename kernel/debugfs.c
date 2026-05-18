@@ -14,6 +14,15 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 	seq_printf(s, "apple_enabled: %u\n", state->cfg.apple_enabled);
 	seq_printf(s, "rc_supported: %u\n", state->cfg.rc_supported);
 	seq_printf(s, "uc_supported: %u\n", state->cfg.uc_supported);
+	seq_printf(s, "native_control: %s\n",
+		   tbv_native_control_mode_name(state));
+	seq_printf(s, "native_same_peer_multicable: %s\n",
+		   !state->cfg.native_enabled ||
+		   !state->native_control_registered ? "off" :
+		   state->native_control_source_aware ? "enabled" :
+						       "limited");
+	seq_printf(s, "native_legacy_ambiguous_limited: %lld\n",
+		   atomic64_read(&state->native_legacy_ambiguous_limited));
 	seq_printf(s, "tbnet_identity: %s\n",
 		   tbv_tbnet_identity_name(state->cfg.tbnet_identity));
 	mutex_lock(&state->tbnet_identity.lock);

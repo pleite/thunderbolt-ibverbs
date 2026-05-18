@@ -297,6 +297,9 @@ struct tbv_state {
 	bool register_verbs;
 	bool services_registered;
 	bool verbs_registered;
+	bool native_control_registered;
+	bool native_control_source_aware;
+	bool native_legacy_multicable_warned;
 	atomic_t verbs_ucontexts;
 	atomic_t verbs_pds;
 	atomic_t verbs_cqs;
@@ -340,6 +343,7 @@ struct tbv_state {
 	atomic64_t data_rx_reorder_window;
 	atomic64_t data_rx_pending_discarded;
 	atomic64_t data_cq_overflow;
+	atomic64_t native_legacy_ambiguous_limited;
 	struct xarray verbs_mrs_xa;
 	struct xarray verbs_qps_xa;
 	struct device *verbs_parent;
@@ -417,7 +421,8 @@ int tbv_services_start(struct tbv_state *state, bool bind_services,
 		       const struct tbv_service_config *service_cfg);
 void tbv_services_stop(struct tbv_state *state);
 int tbv_native_control_start(struct tbv_state *state);
-void tbv_native_control_stop(void);
+void tbv_native_control_stop(struct tbv_state *state);
+const char *tbv_native_control_mode_name(const struct tbv_state *state);
 int tbv_native_control_xdomain_start(struct tbv_state *state);
 void tbv_native_control_xdomain_stop(void);
 int tbv_native_control_legacy_start(struct tbv_state *state);

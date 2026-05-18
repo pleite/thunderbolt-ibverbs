@@ -579,21 +579,41 @@ out:
 
 int tbv_native_control_start(struct tbv_state *state)
 {
+	int ret;
+
 	if (!state->cfg.native_enabled)
 		return 0;
 
 #ifdef TB_PROTOCOL_HANDLER_HAS_XDOMAIN
-	return tbv_native_control_xdomain_start(state);
+	state->native_control_source_aware = true;
+	ret = tbv_native_control_xdomain_start(state);
 #else
-	return tbv_native_control_legacy_start(state);
+	state->native_control_source_aware = false;
+	ret = tbv_native_control_legacy_start(state);
 #endif
+	if (!ret)
+		state->native_control_registered = true;
+	return ret;
 }
 
-void tbv_native_control_stop(void)
+void tbv_native_control_stop(struct tbv_state *state)
 {
 #ifdef TB_PROTOCOL_HANDLER_HAS_XDOMAIN
 	tbv_native_control_xdomain_stop();
 #else
 	tbv_native_control_legacy_stop();
 #endif
+	if (state) {
+		state->native_control_registered = false;
+		state->native_control_source_aware = false;
+	}
+}
+
+const char *tbv_native_control_mode_name(const struct tbv_state *state)
+{
+	if (!state || !state->cfg.native_enabled ||
+	    !state->native_control_registered)
+		return "off";
+
+	return state->native_control_source_aware ? "source_aware" : "legacy";
 }
