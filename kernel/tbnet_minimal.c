@@ -778,14 +778,34 @@ static void tbv_tbnet_minimal_tx_poll_work(struct work_struct *work)
 				      msecs_to_jiffies(1));
 }
 
+static int
+tbv_tbnet_minimal_enable_paths(struct tbv_tbnet_minimal_session *s,
+			       int remote_transmit_path)
+{
+	/*
+	 * Keep this wired exactly like upstream drivers/net/thunderbolt/main.c.
+	 * ThunderboltIP's path setup predates the cleaner native backend in this
+	 * module, and macOS expects the stock TBnet ring/path pairing here.
+	 */
+	return tb_xdomain_enable_paths(s->xd, s->local_transmit_path,
+				       s->rx_ring->hop,
+				       remote_transmit_path,
+				       s->tx_ring->hop);
+}
+
+static void tbv_tbnet_minimal_disable_paths(struct tbv_tbnet_minimal_session *s)
+{
+	tb_xdomain_disable_paths(s->xd, s->local_transmit_path,
+				 s->rx_ring->hop,
+				 s->remote_transmit_path,
+				 s->tx_ring->hop);
+}
+
 static void tbv_tbnet_minimal_teardown_path(struct tbv_tbnet_minimal_session *s)
 {
 	mutex_lock(&s->lock);
 	if (s->path_enabled) {
-		tb_xdomain_disable_paths(s->xd, s->local_transmit_path,
-					 s->tx_ring->hop,
-					 s->remote_transmit_path,
-					 s->rx_ring->hop);
+		tbv_tbnet_minimal_disable_paths(s);
 		tb_xdomain_release_in_hopid(s->xd, s->remote_transmit_path);
 		s->path_enabled = false;
 		s->remote_transmit_path = 0;
@@ -842,10 +862,7 @@ static void tbv_tbnet_minimal_connected_work(struct work_struct *work)
 		goto err_stop;
 	}
 
-	ret = tb_xdomain_enable_paths(session->xd, session->local_transmit_path,
-				      session->tx_ring->hop,
-				      remote_transmit_path,
-				      session->rx_ring->hop);
+	ret = tbv_tbnet_minimal_enable_paths(session, remote_transmit_path);
 	if (ret) {
 		atomic64_inc(&session->identity->minimal_path_errors);
 		atomic64_inc(&session->path_errors);
