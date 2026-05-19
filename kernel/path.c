@@ -1607,21 +1607,25 @@ static void tbv_path_flush_tx_queue(struct tbv_path *path, int status)
 
 void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd)
 {
-	if (path->state == TBV_PATH_TUNNEL_ENABLED) {
+	bool tunnel_enabled = path->state == TBV_PATH_TUNNEL_ENABLED;
+	bool rings_started = tunnel_enabled ||
+			     path->state == TBV_PATH_RING_STARTED;
+
+	if (rings_started) {
+		if (path->rx_ring)
+			tb_ring_stop(path->rx_ring);
+		if (path->tx_ring)
+			tb_ring_stop(path->tx_ring);
+		path->state = TBV_PATH_RING_ALLOCATED;
+	}
+
+	if (tunnel_enabled) {
 		tb_xdomain_disable_paths(xd, path->local_transmit_path,
 					 path->local_tx_hop,
 					 path->remote_transmit_path,
 					 path->local_rx_hop);
 		tb_xdomain_release_in_hopid(xd, path->remote_transmit_path);
 		path->remote_transmit_path = -1;
-		path->state = TBV_PATH_RING_STARTED;
-	}
-
-	if (path->state == TBV_PATH_RING_STARTED) {
-		if (path->rx_ring)
-			tb_ring_stop(path->rx_ring);
-		if (path->tx_ring)
-			tb_ring_stop(path->tx_ring);
 		path->state = TBV_PATH_RING_ALLOCATED;
 	}
 
