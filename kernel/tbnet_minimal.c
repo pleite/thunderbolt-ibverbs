@@ -1031,6 +1031,23 @@ static int tbv_tbnet_minimal_handle_packet(const void *buf, size_t size,
 	}
 }
 
+static bool
+tbv_tbnet_minimal_xdomain_allowed(const struct tbv_tbnet_identity *identity,
+				  const struct tb_xdomain *xd)
+{
+	const char *vendor = xd && xd->vendor_name ? xd->vendor_name : NULL;
+
+	if (!identity->minimal_apple_only)
+		return true;
+
+	if (vendor && !strcmp(vendor, "Apple Inc."))
+		return true;
+
+	pr_info("skipping minimal TBnet service route=0x%llx vendor='%s'; Apple-only identity is enabled\n",
+		xd ? xd->route : 0, vendor ?: "<unknown>");
+	return false;
+}
+
 static int tbv_tbnet_minimal_probe(struct tb_service *svc,
 				   const struct tb_service_id *id)
 {
@@ -1040,6 +1057,8 @@ static int tbv_tbnet_minimal_probe(struct tb_service *svc,
 	int ret;
 
 	if (!identity)
+		return -ENODEV;
+	if (!tbv_tbnet_minimal_xdomain_allowed(identity, xd))
 		return -ENODEV;
 
 	session = kzalloc(sizeof(*session), GFP_KERNEL);
