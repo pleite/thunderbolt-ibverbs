@@ -130,19 +130,21 @@ static bool tbv_service_backend_data_enabled(const struct tbv_state *state,
 	return state->native_data;
 }
 
-static bool tbv_service_tbnet_neighbor_ready(const struct tbv_state *state)
+static bool tbv_service_tbnet_neighbor_ready(struct tbv_state *state,
+					     const struct tb_xdomain *xd)
 {
 	if (state->cfg.tbnet_identity != TBV_TBNET_ID_MINIMAL_PACKET)
 		return true;
 
-	return READ_ONCE(state->tbnet_identity.state) &
-	       TBV_TBNET_ID_STATE_NEIGHBOR_READY;
+	return tbv_tbnet_minimal_neighbor_ready(&state->tbnet_identity,
+						xd ? xd->remote_uuid : NULL);
 }
 
-static bool tbv_service_should_defer_apple_tunnel(struct tbv_state *state)
+static bool tbv_service_should_defer_apple_tunnel(struct tbv_state *state,
+						  const struct tb_xdomain *xd)
 {
 	return state->apple_tunnels_wait_tbnet &&
-	       !tbv_service_tbnet_neighbor_ready(state);
+	       !tbv_service_tbnet_neighbor_ready(state, xd);
 }
 
 static int tbv_service_enable_apple_tunnel(struct tbv_rail *rail)
@@ -166,6 +168,7 @@ static struct tbv_rail *
 tbv_service_next_pending_apple_rail(struct tbv_state *state)
 {
 	struct tbv_peer *peer;
+	bool pending = false;
 
 	mutex_lock(&state->lock);
 	list_for_each_entry(peer, &state->peers, node) {
@@ -178,12 +181,15 @@ tbv_service_next_pending_apple_rail(struct tbv_state *state)
 			if (rail->removing ||
 			    rail->path.state != TBV_PATH_RING_STARTED)
 				continue;
+			pending = true;
+			if (!tbv_service_tbnet_neighbor_ready(state, peer->xd))
+				continue;
 			refcount_inc(&rail->refcnt);
 			mutex_unlock(&state->lock);
 			return rail;
 		}
 	}
-	state->apple_tunnels_pending = false;
+	state->apple_tunnels_pending = pending;
 	mutex_unlock(&state->lock);
 	return NULL;
 }
@@ -195,7 +201,7 @@ static void tbv_service_apple_tunnel_work(struct work_struct *work)
 
 	if (!state->services_registered || !state->enable_tunnels)
 		return;
-	if (!tbv_service_tbnet_neighbor_ready(state))
+	if (!tbv_service_tbnet_neighbor_ready(state, NULL))
 		return;
 
 	for (;;) {
@@ -230,7 +236,7 @@ void tbv_services_tbnet_identity_ready(struct tbv_tbnet_identity *identity)
 		return;
 	if (!state->services_registered || !state->apple_tunnels_wait_tbnet)
 		return;
-	if (!tbv_service_tbnet_neighbor_ready(state))
+	if (!tbv_service_tbnet_neighbor_ready(state, NULL))
 		return;
 
 	queue_work(system_long_wq, &state->apple_tunnel_work);
@@ -348,7 +354,7 @@ static int tbv_service_probe(struct tb_service *svc,
 							      rail);
 			else if (backend == TBV_BACKEND_APPLE &&
 				 tbv_service_state->enable_tunnels) {
-				if (tbv_service_should_defer_apple_tunnel(tbv_service_state)) {
+				if (tbv_service_should_defer_apple_tunnel(tbv_service_state, xd)) {
 					tbv_service_state->apple_tunnels_pending = true;
 					pr_info("deferring Apple data path service id=%d route=0x%llx until TBnet neighbor is proven\n",
 						svc->id, xd->route);

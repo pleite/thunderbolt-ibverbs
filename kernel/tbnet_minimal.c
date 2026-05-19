@@ -89,6 +89,7 @@ struct tbv_tbnet_minimal_session {
 	bool path_enabled;
 	bool login_sent;
 	bool login_received;
+	bool neighbor_seen;
 	bool removing;
 	atomic64_t login_rx;
 	atomic64_t login_tx;
@@ -196,7 +197,7 @@ tbv_tbnet_minimal_tx_complete(struct tb_ring *ring, struct ring_frame *frame,
 		atomic64_inc(&session->packet_tx);
 		if (arp_reply) {
 			mutex_lock(&session->identity->lock);
-			session->identity->minimal_neighbor_seen = true;
+			session->neighbor_seen = true;
 			tbv_tbnet_minimal_recompute_state_locked(session->identity);
 			mutex_unlock(&session->identity->lock);
 			tbv_services_tbnet_identity_ready(session->identity);
@@ -386,26 +387,77 @@ void tbv_tbnet_minimal_recompute_state_locked(struct tbv_tbnet_identity *identit
 {
 	struct tbv_tbnet_minimal_session *session;
 	unsigned long state = 0;
+	bool neighbor_seen = false;
 
 	if (identity->mode != TBV_TBNET_ID_MINIMAL_PACKET)
 		return;
 
 	list_for_each_entry(session, &identity->minimal_sessions, node) {
-		if (!READ_ONCE(session->path_enabled))
+		if (!READ_ONCE(session->path_enabled)) {
+			session->neighbor_seen = false;
 			continue;
+		}
 		state |= TBV_TBNET_ID_STATE_CARRIER;
 		state |= TBV_TBNET_ID_STATE_PACKET_PATH_ACTIVE;
-		break;
+		if (identity->proxy_ipv4 && READ_ONCE(session->neighbor_seen))
+			neighbor_seen = true;
 	}
 
-	if (!(state & TBV_TBNET_ID_STATE_PACKET_PATH_ACTIVE))
-		identity->minimal_neighbor_seen = false;
+	if (!identity->proxy_ipv4)
+		list_for_each_entry(session, &identity->minimal_sessions, node)
+			session->neighbor_seen = false;
 
-	if ((state & TBV_TBNET_ID_STATE_PACKET_PATH_ACTIVE) &&
-	    identity->proxy_ipv4 && identity->minimal_neighbor_seen)
+	if (!(state & TBV_TBNET_ID_STATE_PACKET_PATH_ACTIVE) ||
+	    !identity->proxy_ipv4)
+		identity->minimal_neighbor_seen = false;
+	else
+		identity->minimal_neighbor_seen = neighbor_seen;
+
+	if (identity->minimal_neighbor_seen)
 		state |= TBV_TBNET_ID_STATE_NEIGHBOR_READY;
 
 	identity->state = state;
+}
+
+bool tbv_tbnet_minimal_neighbor_ready(struct tbv_tbnet_identity *identity,
+				      const uuid_t *remote_uuid)
+{
+	struct tbv_tbnet_minimal_session *session;
+	bool ready = false;
+
+	if (identity->mode != TBV_TBNET_ID_MINIMAL_PACKET)
+		return false;
+
+	mutex_lock(&identity->lock);
+	if (!identity->proxy_ipv4)
+		goto out;
+
+	list_for_each_entry(session, &identity->minimal_sessions, node) {
+		if (!READ_ONCE(session->path_enabled) ||
+		    !READ_ONCE(session->neighbor_seen))
+			continue;
+		if (remote_uuid &&
+		    !uuid_equal(session->xd->remote_uuid, remote_uuid))
+			continue;
+		ready = true;
+		break;
+	}
+
+out:
+	mutex_unlock(&identity->lock);
+	return ready;
+}
+
+void tbv_tbnet_minimal_clear_neighbors_locked(struct tbv_tbnet_identity *identity)
+{
+	struct tbv_tbnet_minimal_session *session;
+
+	if (identity->mode != TBV_TBNET_ID_MINIMAL_PACKET)
+		return;
+
+	list_for_each_entry(session, &identity->minimal_sessions, node)
+		session->neighbor_seen = false;
+	identity->minimal_neighbor_seen = false;
 }
 
 static void tbv_tbnet_minimal_recompute_state(struct tbv_tbnet_identity *identity)
@@ -437,11 +489,12 @@ void tbv_tbnet_minimal_debugfs_show(struct seq_file *s,
 			   session->svc->prtcstns, session->mac,
 			   session->xd->local_uuid, session->xd->remote_uuid);
 		seq_printf(s,
-			   "tbnet_minimal_session%u_state: rings_started=%u path_enabled=%u login_sent=%u login_received=%u removing=%u tx_inflight=%d\n",
+			   "tbnet_minimal_session%u_state: rings_started=%u path_enabled=%u login_sent=%u login_received=%u neighbor_seen=%u removing=%u tx_inflight=%d\n",
 			   idx, READ_ONCE(session->rings_started),
 			   READ_ONCE(session->path_enabled),
 			   READ_ONCE(session->login_sent),
 			   READ_ONCE(session->login_received),
+			   READ_ONCE(session->neighbor_seen),
 			   READ_ONCE(session->removing),
 			   atomic_read(&session->tx_inflight));
 		seq_printf(s,

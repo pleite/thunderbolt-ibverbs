@@ -510,6 +510,7 @@ static void tbv_tbnet_identity_put_gid_locked(struct tbv_tbnet_identity *identit
 		identity->gid_dev = NULL;
 	}
 	identity->proxy_ipv4 = 0;
+	tbv_tbnet_minimal_clear_neighbors_locked(identity);
 	identity->minimal_neighbor_seen = false;
 }
 
