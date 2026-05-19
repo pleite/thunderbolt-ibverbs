@@ -256,6 +256,8 @@ struct tbv_tbnet_identity {
 	atomic64_t minimal_login_rx;
 	atomic64_t minimal_login_tx;
 	atomic64_t minimal_logout_rx;
+	atomic64_t minimal_logout_tx;
+	atomic64_t minimal_status_rx;
 	atomic64_t minimal_status_tx;
 	atomic64_t minimal_packet_rx;
 	atomic64_t minimal_packet_tx_posted;
@@ -295,6 +297,11 @@ struct tbv_tbip_login_response_params {
 };
 
 struct tbv_tbip_status_params {
+	struct tbv_tbip_control ctrl;
+	u32 status;
+};
+
+struct tbv_tbip_status_result {
 	struct tbv_tbip_control ctrl;
 	u32 status;
 };
@@ -473,6 +480,8 @@ int tbv_tbip_parse_login(const void *buf, size_t size,
 			 struct tbv_tbip_login_params *params);
 int tbv_tbip_parse_login_response(const void *buf, size_t size,
 				  struct tbv_tbip_login_response_result *result);
+int tbv_tbip_parse_status(const void *buf, size_t size,
+			  struct tbv_tbip_status_result *result);
 int tbv_tbnet_arp_reply_for_request(void *reply, size_t reply_size,
 				    const void *request, size_t request_size,
 				    const struct tbv_tbnet_arp_proxy *proxy);

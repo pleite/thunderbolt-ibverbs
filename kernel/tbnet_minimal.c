@@ -96,6 +96,8 @@ struct tbv_tbnet_minimal_session {
 	atomic64_t login_rx;
 	atomic64_t login_tx;
 	atomic64_t logout_rx;
+	atomic64_t logout_tx;
+	atomic64_t status_rx;
 	atomic64_t status_tx;
 	atomic64_t packet_rx;
 	atomic64_t packet_tx_posted;
@@ -135,6 +137,9 @@ static void tbv_tbnet_minimal_rx_work(struct work_struct *work);
 static void tbv_tbnet_minimal_tx_poll_work(struct work_struct *work);
 static void
 tbv_tbnet_minimal_free_rings(struct tbv_tbnet_minimal_session *session);
+static int
+tbv_tbnet_minimal_send_logout_request(struct tbv_tbnet_minimal_session *session,
+				      u8 sequence);
 
 static void
 tbv_tbnet_minimal_fill_reply_ctrl(struct tbv_tbnet_minimal_session *session,
@@ -522,8 +527,10 @@ void tbv_tbnet_minimal_debugfs_show(struct seq_file *s,
 			   atomic64_read(&session->login_tx),
 			   READ_ONCE(session->login_retries));
 		seq_printf(s,
-			   "tbnet_minimal_session%u_control: logout_rx=%lld status_tx=%lld\n",
+			   "tbnet_minimal_session%u_control: logout_rx=%lld logout_tx=%lld status_rx=%lld status_tx=%lld\n",
 			   idx, atomic64_read(&session->logout_rx),
+			   atomic64_read(&session->logout_tx),
+			   atomic64_read(&session->status_rx),
 			   atomic64_read(&session->status_tx));
 		seq_printf(s,
 			   "tbnet_minimal_session%u_packets: rx=%lld tx_posted=%lld tx_completed=%lld tx_errors=%lld path_errors=%lld\n",
@@ -926,6 +933,9 @@ static void tbv_tbnet_minimal_login_work(struct work_struct *work)
 	struct tbv_tbip_login_params params;
 	u8 request[128];
 	u8 reply[128];
+	bool need_reset;
+	bool retry_later = false;
+	u8 sequence;
 	int ret;
 	int len;
 
@@ -934,9 +944,25 @@ static void tbv_tbnet_minimal_login_work(struct work_struct *work)
 		mutex_unlock(&session->lock);
 		return;
 	}
+	sequence = session->login_retries % 4;
+	need_reset = !session->login_received;
+	mutex_unlock(&session->lock);
+
+	if (need_reset) {
+		ret = tbv_tbnet_minimal_send_logout_request(session, sequence);
+		if (ret && ret != -ETIMEDOUT && ret != -ENODEV)
+			pr_debug("minimal TBnet logout reset route=0x%llx ret=%d\n",
+				 session->xd->route, ret);
+	}
+
+	mutex_lock(&session->lock);
+	if (session->path_enabled || session->removing) {
+		mutex_unlock(&session->lock);
+		return;
+	}
 	memset(&params, 0, sizeof(params));
 	params.ctrl.route = session->xd->route;
-	params.ctrl.sequence = session->login_retries % 4;
+	params.ctrl.sequence = sequence;
 	uuid_copy(&params.ctrl.initiator_uuid, session->xd->local_uuid);
 	uuid_copy(&params.ctrl.target_uuid, session->xd->remote_uuid);
 	params.ctrl.command_id = atomic_inc_return(&session->command_id);
@@ -977,10 +1003,21 @@ static void tbv_tbnet_minimal_login_work(struct work_struct *work)
 	}
 
 	mutex_lock(&session->lock);
-	session->login_retries = 0;
 	session->login_sent = true;
+	if (session->login_received) {
+		session->login_retries = 0;
+	} else if (!session->removing &&
+		   session->login_retries++ < TBV_TBNET_MIN_LOGIN_RETRIES) {
+		retry_later = true;
+	} else if (!session->removing) {
+		pr_info("minimal TBnet peer login timed out route=0x%llx\n",
+			session->xd->route);
+	}
 	mutex_unlock(&session->lock);
 	queue_work(system_long_wq, &session->connected_work);
+	if (retry_later)
+		queue_delayed_work(system_long_wq, &session->login_work,
+				   msecs_to_jiffies(TBV_TBNET_MIN_LOGIN_DELAY_MS));
 }
 
 static int tbv_tbnet_minimal_send_login_response(
@@ -1022,6 +1059,50 @@ static int tbv_tbnet_minimal_send_status(
 				   TB_CFG_PKG_XDOMAIN_RESP);
 }
 
+static int
+tbv_tbnet_minimal_send_logout_request(struct tbv_tbnet_minimal_session *session,
+				      u8 sequence)
+{
+	struct tbv_tbip_status_result status;
+	struct tbv_tbip_control ctrl;
+	u8 request[128];
+	u8 reply[128];
+	int ret;
+	int len;
+
+	memset(&ctrl, 0, sizeof(ctrl));
+	ctrl.route = session->xd->route;
+	ctrl.sequence = sequence;
+	uuid_copy(&ctrl.initiator_uuid, session->xd->local_uuid);
+	uuid_copy(&ctrl.target_uuid, session->xd->remote_uuid);
+	ctrl.command_id = atomic_inc_return(&session->command_id);
+
+	len = tbv_tbip_build_logout(request, sizeof(request), &ctrl);
+	if (len < 0)
+		return len;
+
+	memset(reply, 0, sizeof(reply));
+	atomic64_inc(&session->identity->minimal_logout_tx);
+	atomic64_inc(&session->logout_tx);
+	ret = tb_xdomain_request(session->xd, request, len,
+				 TB_CFG_PKG_XDOMAIN_RESP, reply, sizeof(reply),
+				 TB_CFG_PKG_XDOMAIN_RESP,
+				 TBV_TBNET_MIN_LOGOUT_TIMEOUT_MS);
+	if (!ret)
+		ret = tbv_tbip_parse_status(reply, sizeof(reply), &status);
+	if (!ret &&
+	    (!tbv_tbnet_minimal_ctrl_matches(session, &status.ctrl) ||
+	     status.status)) {
+		ret = -EPROTO;
+	}
+	if (!ret) {
+		atomic64_inc(&session->identity->minimal_status_rx);
+		atomic64_inc(&session->status_rx);
+	}
+
+	return ret;
+}
+
 static int tbv_tbnet_minimal_handle_packet_common(
 	struct tb_xdomain *source_xd, const void *buf, size_t size, void *data)
 {
@@ -1057,6 +1138,7 @@ static int tbv_tbnet_minimal_handle_packet_common(
 		mutex_lock(&session->lock);
 		if (!session->removing) {
 			session->login_received = true;
+			session->login_retries = 0;
 			session->remote_transmit_path =
 				(int)login.transmit_path;
 			if (!session->login_sent)

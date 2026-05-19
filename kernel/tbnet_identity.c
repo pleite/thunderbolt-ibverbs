@@ -290,6 +290,29 @@ int tbv_tbip_parse_login_response(const void *buf, size_t size,
 	return 0;
 }
 
+int tbv_tbip_parse_status(const void *buf, size_t size,
+			  struct tbv_tbip_status_result *result)
+{
+	const struct tbv_tbip_status *msg = buf;
+	enum tbv_tbip_type type;
+	int ret;
+
+	if (!result)
+		return -EINVAL;
+	if (size < sizeof(*msg))
+		return -EINVAL;
+
+	memset(result, 0, sizeof(*result));
+	ret = tbv_tbip_parse_header(buf, size, &type, &result->ctrl);
+	if (ret)
+		return ret;
+	if (type != TBV_TBIP_STATUS)
+		return -EPROTO;
+
+	result->status = msg->status;
+	return 0;
+}
+
 static bool tbv_arp_is_ipv4_ethernet(const struct tbv_arphdr *arp)
 {
 	return arp->ar_hrd == cpu_to_be16(TBV_ARPHRD_ETHER) &&
