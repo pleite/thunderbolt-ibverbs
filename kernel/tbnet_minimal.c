@@ -1317,6 +1317,7 @@ static struct tb_service_driver tbv_tbnet_minimal_driver = {
 
 int tbv_tbnet_minimal_start(struct tbv_tbnet_identity *identity)
 {
+	u32 prtcstns = TBV_TBNET_MATCH_FRAGS_ID | TBV_TBNET_64K_FRAMES;
 	int ret;
 
 	if (identity->minimal_started)
@@ -1331,11 +1332,11 @@ int tbv_tbnet_minimal_start(struct tbv_tbnet_identity *identity)
 					       "prtcvers", 1);
 	ret = ret ?: tb_property_add_immediate(identity->minimal_dir,
 					       "prtcrevs", 1);
+	if (identity->minimal_e2e)
+		prtcstns |= TBV_TBNET_E2E;
 	ret = ret ?: tb_property_add_immediate(identity->minimal_dir,
 					       "prtcstns",
-					       TBV_TBNET_E2E |
-					       TBV_TBNET_MATCH_FRAGS_ID |
-					       TBV_TBNET_64K_FRAMES);
+					       prtcstns);
 	if (ret)
 		goto err_free_dir;
 
