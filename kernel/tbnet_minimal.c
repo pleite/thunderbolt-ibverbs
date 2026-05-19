@@ -90,6 +90,7 @@ struct tbv_tbnet_minimal_session {
 	bool login_sent;
 	bool login_received;
 	bool neighbor_seen;
+	bool handler_registered;
 	bool removing;
 	atomic64_t login_rx;
 	atomic64_t login_tx;
@@ -131,6 +132,8 @@ static void tbv_tbnet_minimal_connected_work(struct work_struct *work);
 static void tbv_tbnet_minimal_disconnect_work(struct work_struct *work);
 static void tbv_tbnet_minimal_rx_work(struct work_struct *work);
 static void tbv_tbnet_minimal_tx_poll_work(struct work_struct *work);
+static void
+tbv_tbnet_minimal_free_rings(struct tbv_tbnet_minimal_session *session);
 
 static void
 tbv_tbnet_minimal_fill_reply_ctrl(struct tbv_tbnet_minimal_session *session,
@@ -1019,14 +1022,19 @@ static int tbv_tbnet_minimal_send_status(
 				   TB_CFG_PKG_XDOMAIN_RESP);
 }
 
-static int tbv_tbnet_minimal_handle_packet(const void *buf, size_t size,
-					   void *data)
+static int tbv_tbnet_minimal_handle_packet_common(
+	struct tb_xdomain *source_xd, const void *buf, size_t size, void *data)
 {
 	struct tbv_tbnet_minimal_session *session = data;
 	struct tbv_tbip_login_params login;
 	struct tbv_tbip_control ctrl;
 	enum tbv_tbip_type type;
 	int ret;
+
+	if (!session)
+		return 0;
+	if (source_xd && source_xd != session->xd)
+		return 0;
 
 	ret = tbv_tbip_parse_type(buf, size, &type, &ctrl);
 	if (ret || !tbv_tbnet_minimal_ctrl_matches(session, &ctrl))
@@ -1070,6 +1078,22 @@ static int tbv_tbnet_minimal_handle_packet(const void *buf, size_t size,
 	}
 }
 
+#ifdef TB_PROTOCOL_HANDLER_HAS_XDOMAIN
+static int tbv_tbnet_minimal_handle_packet_xd(struct tb_xdomain *source_xd,
+					      const void *buf, size_t size,
+					      void *data)
+{
+	return tbv_tbnet_minimal_handle_packet_common(source_xd, buf, size,
+						     data);
+}
+#else
+static int tbv_tbnet_minimal_handle_packet(const void *buf, size_t size,
+					   void *data)
+{
+	return tbv_tbnet_minimal_handle_packet_common(NULL, buf, size, data);
+}
+#endif
+
 static bool
 tbv_tbnet_minimal_xdomain_allowed(const struct tbv_tbnet_identity *identity,
 				  const struct tb_xdomain *xd)
@@ -1087,6 +1111,49 @@ tbv_tbnet_minimal_xdomain_allowed(const struct tbv_tbnet_identity *identity,
 	return false;
 }
 
+static bool
+tbv_tbnet_minimal_legacy_session_allowed(struct tbv_tbnet_identity *identity,
+					 struct tb_xdomain *xd)
+{
+#ifdef TB_PROTOCOL_HANDLER_HAS_XDOMAIN
+	return true;
+#else
+	struct tbv_tbnet_minimal_session *session;
+	bool allowed = true;
+
+	mutex_lock(&identity->lock);
+	list_for_each_entry(session, &identity->minimal_sessions, node) {
+		struct tb_xdomain *existing = session->xd;
+		bool same_host;
+
+		if (existing == xd) {
+			same_host = true;
+		} else if (existing && xd && existing->remote_uuid &&
+			   xd->remote_uuid) {
+			same_host = uuid_equal(existing->remote_uuid,
+					       xd->remote_uuid);
+		} else {
+			same_host = existing && xd &&
+				    existing->route == xd->route &&
+				    existing->link == xd->link &&
+				    existing->depth == xd->depth;
+		}
+
+		if (!same_host)
+			continue;
+
+		allowed = false;
+		break;
+	}
+	mutex_unlock(&identity->lock);
+
+	if (!allowed)
+		pr_warn("legacy source-blind minimal TBnet control: limiting remote Apple host to one link; apply callback_xd kernel support for multi-link Apple identity\n");
+
+	return allowed;
+#endif
+}
+
 static int tbv_tbnet_minimal_probe(struct tb_service *svc,
 				   const struct tb_service_id *id)
 {
@@ -1099,6 +1166,8 @@ static int tbv_tbnet_minimal_probe(struct tb_service *svc,
 		return -ENODEV;
 	if (!tbv_tbnet_minimal_xdomain_allowed(identity, xd))
 		return -ENODEV;
+	if (!tbv_tbnet_minimal_legacy_session_allowed(identity, xd))
+		return -EBUSY;
 
 	session = kzalloc(sizeof(*session), GFP_KERNEL);
 	if (!session)
@@ -1128,9 +1197,16 @@ static int tbv_tbnet_minimal_probe(struct tb_service *svc,
 		goto err_free;
 
 	session->handler.uuid = &tbv_tbnet_svc_uuid;
+#ifdef TB_PROTOCOL_HANDLER_HAS_XDOMAIN
+	session->handler.callback_xd = tbv_tbnet_minimal_handle_packet_xd;
+#else
 	session->handler.callback = tbv_tbnet_minimal_handle_packet;
+#endif
 	session->handler.data = session;
-	tb_register_protocol_handler(&session->handler);
+	ret = tb_register_protocol_handler(&session->handler);
+	if (ret)
+		goto err_free_rings;
+	session->handler_registered = true;
 
 	mutex_lock(&identity->lock);
 	list_add_tail(&session->node, &identity->minimal_sessions);
@@ -1145,6 +1221,8 @@ static int tbv_tbnet_minimal_probe(struct tb_service *svc,
 		session->mac, svc->prtcstns);
 	return 0;
 
+err_free_rings:
+	tbv_tbnet_minimal_free_rings(session);
 err_free:
 	mutex_destroy(&session->lock);
 	kfree(session);
@@ -1190,7 +1268,10 @@ tbv_tbnet_minimal_destroy_session(struct tbv_tbnet_minimal_session *session)
 	cancel_work_sync(&session->disconnect_work);
 	cancel_work_sync(&session->rx_work);
 	cancel_delayed_work_sync(&session->tx_poll_work);
-	tb_unregister_protocol_handler(&session->handler);
+	if (session->handler_registered) {
+		tb_unregister_protocol_handler(&session->handler);
+		session->handler_registered = false;
+	}
 	tbv_tbnet_minimal_teardown_path(session);
 
 	mutex_lock(&identity->lock);
