@@ -90,6 +90,7 @@ struct tbv_tbnet_minimal_session {
 	bool path_enabled;
 	bool login_sent;
 	bool login_received;
+	bool logout_reset_sent;
 	bool neighbor_seen;
 	bool handler_registered;
 	bool removing;
@@ -842,6 +843,7 @@ static void tbv_tbnet_minimal_teardown_path(struct tbv_tbnet_minimal_session *s)
 	}
 	s->login_sent = false;
 	s->login_received = false;
+	s->logout_reset_sent = false;
 	s->login_retries = 0;
 	mutex_unlock(&s->lock);
 
@@ -945,7 +947,9 @@ static void tbv_tbnet_minimal_login_work(struct work_struct *work)
 		return;
 	}
 	sequence = session->login_retries % 4;
-	need_reset = !session->login_received;
+	need_reset = !session->login_received && !session->logout_reset_sent;
+	if (need_reset)
+		session->logout_reset_sent = true;
 	mutex_unlock(&session->lock);
 
 	if (need_reset) {
