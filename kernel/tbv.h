@@ -387,6 +387,13 @@ struct tbv_state {
 	atomic64_t data_rx_reorder_dropped;
 	atomic64_t data_rx_reorder_window;
 	atomic64_t data_rx_pending_discarded;
+	atomic64_t apple_rx_sof;
+	atomic64_t apple_rx_eof3;
+	atomic64_t apple_rx_eof_other;
+	atomic64_t apple_rx_sof_while_active;
+	atomic64_t apple_rx_no_sof_when_idle;
+	atomic64_t apple_rx_eof_without_active;
+	atomic64_t apple_rx_len_overrun;
 	atomic64_t data_cq_overflow;
 	atomic64_t native_legacy_ambiguous_limited;
 	struct xarray verbs_mrs_xa;
@@ -444,7 +451,7 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 			       const void *payload);
 void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 			      const struct tbv_path *path,
-			      const void *payload, u32 len, u8 eof);
+			      const void *payload, u32 len, u8 sof, u8 eof);
 
 int tbv_tbnet_identity_check_config(const struct tbv_resolved_config *cfg);
 int tbv_tbnet_identity_prepare(struct tbv_tbnet_identity *identity,

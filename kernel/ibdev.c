@@ -4,11 +4,9 @@
 
 #include <linux/atomic.h>
 #include <linux/completion.h>
-#include <linux/delay.h>
 #include <linux/errno.h>
 #include <linux/highmem.h>
 #include <linux/idr.h>
-#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/mmzone.h>
 #include <linux/netdevice.h>
@@ -47,7 +45,6 @@
 #define TBV_APPLE_PENDING_RX_DEFAULT_SLOTS 4096
 #define TBV_APPLE_PENDING_RX_MAX_SLOTS 16384
 #define TBV_APPLE_PENDING_RX_TOTAL_BYTES_DEFAULT (64u * 1024u * 1024u)
-
 static char *roce_netdev;
 module_param(roce_netdev, charp, 0444);
 MODULE_PARM_DESC(roce_netdev,
@@ -68,30 +65,10 @@ module_param(apple_tx_max_inflight_wr, uint, 0644);
 MODULE_PARM_DESC(apple_tx_max_inflight_wr,
 		 "Maximum Apple-compatible UC SEND work requests in flight per QP; 0 disables the software window");
 
-static uint apple_tx_max_inflight_frames;
+static uint apple_tx_max_inflight_frames = 2;
 module_param(apple_tx_max_inflight_frames, uint, 0644);
 MODULE_PARM_DESC(apple_tx_max_inflight_frames,
-		 "Maximum Apple-compatible 4 KiB FA57 frames in flight per QP; 0 disables the frame window");
-
-static uint apple_tx_pace_us;
-module_param(apple_tx_pace_us, uint, 0644);
-MODULE_PARM_DESC(apple_tx_pace_us,
-		 "Microseconds to sleep between Apple-compatible FA57 TX frame groups; 0 disables pacing");
-
-static uint apple_tx_pace_interval_frames = 1;
-module_param(apple_tx_pace_interval_frames, uint, 0644);
-MODULE_PARM_DESC(apple_tx_pace_interval_frames,
-		 "Apply Apple-compatible TX pacing every N non-terminal FA57 frames; 0 is treated as 1");
-
-static uint apple_tx_pace_after_frames;
-module_param(apple_tx_pace_after_frames, uint, 0644);
-MODULE_PARM_DESC(apple_tx_pace_after_frames,
-		 "Start Apple-compatible TX pacing after this many queued FA57 frames in a QP burst; 0 starts immediately");
-
-static uint apple_tx_cooldown_us;
-module_param(apple_tx_cooldown_us, uint, 0644);
-MODULE_PARM_DESC(apple_tx_cooldown_us,
-		 "Microseconds to delay the next Apple-compatible SEND after a completed SEND; 0 disables cooldown");
+		 "Maximum Apple-compatible 4 KiB FA57 frames queued from one SEND before waiting for TX completions; 0 disables the frame window");
 
 static uint apple_rx_pending_bytes = TBV_APPLE_MAX_MSG_SIZE;
 module_param(apple_rx_pending_bytes, uint, 0644);
@@ -108,6 +85,25 @@ static uint apple_rx_pending_total_bytes =
 module_param(apple_rx_pending_total_bytes, uint, 0644);
 MODULE_PARM_DESC(apple_rx_pending_total_bytes,
 		 "Maximum aggregate bytes buffered for early Apple UC receives per QP");
+
+static uint apple_rx_trace;
+module_param(apple_rx_trace, uint, 0644);
+MODULE_PARM_DESC(apple_rx_trace,
+		 "Print the first N Apple RX callbacks with SOF/EOF and assembly state");
+
+static bool tbv_apple_rx_trace_take(void)
+{
+	u32 remaining;
+
+	do {
+		remaining = READ_ONCE(apple_rx_trace);
+		if (!remaining)
+			return false;
+	} while (cmpxchg(&apple_rx_trace, remaining, remaining - 1) !=
+		 remaining);
+
+	return true;
+}
 
 struct tbv_ucontext {
 	struct ib_ucontext base;
@@ -214,8 +210,6 @@ struct tbv_qp {
 	u32 remote_recv_credits;
 	atomic_t apple_tx_inflight;
 	atomic_t apple_tx_inflight_frames;
-	atomic_t apple_tx_pace_queued_frames;
-	atomic64_t apple_tx_cooldown_until_ns;
 	u32 send_psn;
 	u32 rx_expected_psn;
 	struct tbv_rx_message rx_msg;
@@ -261,6 +255,9 @@ struct tbv_send_ctx {
 	u32 psn;
 	enum ib_wc_opcode wc_opcode;
 	atomic_t apple_pending;
+	atomic_t apple_batch_pending;
+	struct completion apple_batch_done;
+	int apple_batch_status;
 	bool signaled;
 	bool completed;
 	bool apple_window_acquired;
@@ -310,6 +307,7 @@ struct tbv_apple_send_fill {
 	const struct tbv_send_segment *segs;
 	struct tbv_qp *tqp;
 	u32 offset;
+	u32 payload_len;
 	int nsegs;
 };
 
@@ -1072,8 +1070,6 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	refcount_set(&tqp->refs, 1);
 	atomic_set(&tqp->apple_tx_inflight, 0);
 	atomic_set(&tqp->apple_tx_inflight_frames, 0);
-	atomic_set(&tqp->apple_tx_pace_queued_frames, 0);
-	atomic64_set(&tqp->apple_tx_cooldown_until_ns, 0);
 	init_completion(&tqp->refs_zero);
 	INIT_LIST_HEAD(&tqp->pending_sends);
 	INIT_LIST_HEAD(&tqp->pending_reads);
@@ -1261,27 +1257,8 @@ static void tbv_qp_release_apple_tx_window(struct tbv_qp *tqp,
 		atomic_dec(&tqp->apple_tx_inflight);
 	if (frames_acquired)
 		atomic_sub(frames_acquired, &tqp->apple_tx_inflight_frames);
-	if (atomic_read(&tqp->apple_tx_inflight) <= 0 &&
-	    atomic_read(&tqp->apple_tx_inflight_frames) <= 0)
-		atomic_set(&tqp->apple_tx_pace_queued_frames, 0);
 	if (wr_acquired || frames_acquired)
 		wake_up_all(&tqp->apple_tx_wait);
-}
-
-static void tbv_qp_note_apple_tx_cooldown(struct tbv_qp *tqp, int status)
-{
-	unsigned int cooldown_us;
-	u64 until;
-
-	if (status)
-		return;
-
-	cooldown_us = READ_ONCE(apple_tx_cooldown_us);
-	if (!cooldown_us)
-		return;
-
-	until = ktime_get_ns() + (u64)cooldown_us * NSEC_PER_USEC;
-	atomic64_set(&tqp->apple_tx_cooldown_until_ns, until);
 }
 
 static bool tbv_send_complete(struct tbv_send_ctx *send, int status)
@@ -1300,7 +1277,6 @@ static bool tbv_send_complete(struct tbv_send_ctx *send, int status)
 		return false;
 
 	if (send->apple_window_acquired) {
-		tbv_qp_note_apple_tx_cooldown(tqp, status);
 		tbv_qp_release_apple_tx_window(tqp,
 						send->apple_window_wr_acquired,
 						send->apple_window_frames);
@@ -1575,6 +1551,13 @@ static void tbv_apple_send_tx_done(void *ctx, int status)
 	struct tbv_qp *tqp = send->tqp;
 	bool last;
 
+	if (atomic_read(&send->apple_batch_pending) > 0) {
+		if (status)
+			WRITE_ONCE(send->apple_batch_status, status);
+		if (atomic_dec_and_test(&send->apple_batch_pending))
+			complete(&send->apple_batch_done);
+	}
+
 	last = atomic_dec_and_test(&send->apple_pending);
 	if (status) {
 		if (tbv_qp_unqueue_send(tqp, send)) {
@@ -1596,10 +1579,47 @@ static int tbv_apple_send_fill(void *ctx, void *dst, u32 len)
 	struct tbv_apple_send_fill *fill = ctx;
 	int ret;
 
+	if (fill->payload_len > len)
+		return -EINVAL;
+
 	ret = tbv_copy_send_range(fill->segs, fill->nsegs, fill->offset, dst,
-				  len);
+				  fill->payload_len);
 	if (ret)
 		atomic64_inc(&fill->tqp->owner->data_wr_copy_error);
+	else if (fill->payload_len < len)
+		memset((u8 *)dst + fill->payload_len, 0,
+		       len - fill->payload_len);
+	return ret;
+}
+
+static int tbv_post_apple_send_frame(struct tbv_qp *tqp,
+				     struct tbv_path *path,
+				     struct tbv_send_ctx *ctx,
+				     const struct tbv_send_segment *segs,
+				     int nsegs, u32 offset,
+				     u32 payload_len, u8 sof, u8 eof,
+				     tbv_path_tx_done_fn done,
+				     void *done_ctx)
+{
+	struct tbv_apple_send_fill fill = {
+		.segs = segs,
+		.tqp = tqp,
+		.offset = offset,
+		.payload_len = payload_len,
+		.nsegs = nsegs,
+	};
+	int ret;
+
+	tbv_send_ctx_get(ctx);
+	atomic64_inc(&tqp->owner->data_wr_path_send);
+	ret = tbv_path_send_marked_fill(path, payload_len, sof, eof,
+					TBV_PATH_SEND_DEFER,
+					tbv_apple_send_fill, &fill,
+					done, done_ctx);
+	if (ret) {
+		tbv_send_ctx_put(ctx);
+		atomic64_inc(&tqp->owner->data_wr_path_send_error);
+	}
 	return ret;
 }
 
@@ -1613,6 +1633,8 @@ static int tbv_post_apple_send(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	u32 offset = 0;
 	u32 nfrags;
 	u32 remaining;
+	u32 frame_post_limit;
+	u32 batch_frames = 0;
 	int nsegs = 0;
 	bool apple_wr_acquired = false;
 	u32 apple_frames_acquired = 0;
@@ -1675,6 +1697,8 @@ static int tbv_post_apple_send(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	ctx->apple_window_wr_acquired = apple_wr_acquired;
 	ctx->apple_window_frames = apple_frames_acquired;
 	ctx->apple_window_acquired = apple_wr_acquired || apple_frames_acquired;
+	atomic_set(&ctx->apple_batch_pending, 0);
+	init_completion(&ctx->apple_batch_done);
 	INIT_LIST_HEAD(&ctx->node);
 
 	spin_lock_irqsave(&tqp->lock, flags);
@@ -1690,52 +1714,52 @@ static int tbv_post_apple_send(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	if (ret)
 		goto err_unqueue_ctx;
 
+	frame_post_limit = READ_ONCE(apple_tx_max_inflight_frames);
 	while (offset < total_len) {
 		u32 payload_len = min_t(u32, total_len - offset,
 					TBV_APPLE_FRAME_SIZE);
 		bool last = offset + payload_len == total_len;
-		u32 frame_index;
-		unsigned int pace_us;
-		unsigned int pace_interval;
-		unsigned int pace_after;
-		int queued_frames = 0;
-		struct tbv_apple_send_fill fill = {
-			.segs = segs,
-			.tqp = tqp,
-			.offset = offset,
-			.nsegs = nsegs,
-		};
+		bool frame_batched = false;
 
-		tbv_send_ctx_get(ctx);
-		atomic64_inc(&tqp->owner->data_wr_path_send);
-		ret = tbv_path_send_marked_fill(path, payload_len,
-						1, last ? 3 : 2,
-						TBV_PATH_SEND_DEFER,
-						tbv_apple_send_fill, &fill,
-						tbv_apple_send_tx_done, ctx);
-		if (ret) {
-			tbv_send_ctx_put(ctx);
-			atomic64_inc(&tqp->owner->data_wr_path_send_error);
-			goto err_release_reservation;
+		if (batch_frames) {
+			frame_batched = true;
+		} else if (frame_post_limit && frame_post_limit < remaining) {
+			reinit_completion(&ctx->apple_batch_done);
+			WRITE_ONCE(ctx->apple_batch_status, 0);
+			atomic_set(&ctx->apple_batch_pending,
+				   frame_post_limit);
+			frame_batched = true;
 		}
 
+		ret = tbv_post_apple_send_frame(tqp, path, ctx, segs, nsegs,
+						offset, payload_len,
+						1,
+						last ? 3 : 2,
+						tbv_apple_send_tx_done, ctx);
+		if (ret)
+			goto err_release_reservation;
+
 		remaining--;
-		frame_index = nfrags - remaining;
 		sent_any = true;
 		offset += payload_len;
+		if (frame_batched) {
+			batch_frames++;
+			if (batch_frames >= frame_post_limit) {
+				unsigned long waited;
 
-		pace_us = READ_ONCE(apple_tx_pace_us);
-		pace_interval = READ_ONCE(apple_tx_pace_interval_frames);
-		pace_after = READ_ONCE(apple_tx_pace_after_frames);
-		if (!pace_interval)
-			pace_interval = 1;
-		if (pace_us)
-			queued_frames =
-				atomic_inc_return(&tqp->apple_tx_pace_queued_frames);
-		if (offset < total_len && pace_us &&
-		    (unsigned int)queued_frames > pace_after &&
-		    frame_index % pace_interval == 0)
-			usleep_range(pace_us, pace_us + 10);
+				tbv_path_kick_tx(path);
+				waited = wait_for_completion_timeout(
+					&ctx->apple_batch_done,
+					msecs_to_jiffies(5000));
+				ret = waited ?
+					READ_ONCE(ctx->apple_batch_status) :
+					-ETIMEDOUT;
+				atomic_set(&ctx->apple_batch_pending, 0);
+				batch_frames = 0;
+				if (ret)
+					goto err_release_reservation;
+			}
+		}
 	}
 
 	tbv_path_kick_tx(path);
@@ -1745,6 +1769,7 @@ static int tbv_post_apple_send(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	return 0;
 
 err_release_reservation:
+	atomic_set(&ctx->apple_batch_pending, 0);
 	tbv_path_release_data_reservation(path, remaining);
 	if (sent_any)
 		tbv_path_kick_tx(path);
@@ -2657,6 +2682,16 @@ static void tbv_apple_rx_drain_pending_locked(struct tbv_state *state,
 		else if (p->delivered > wqe.length)
 			status = IB_WC_LOC_LEN_ERR;
 
+		if (status == IB_WC_LOC_LEN_ERR)
+			atomic64_inc(&state->apple_rx_len_overrun);
+		if (tbv_apple_rx_trace_take())
+			pr_info("apple rx drain qpn=%u pending_len=%u copy_len=%u delivered=%u wqe_len=%u status=%d head=%u ready=%u recv_count=%u wr_id=%llu\n",
+				tqp->base.qp_num, p->delivered, copy_len,
+				delivered, wqe.length, status,
+				tqp->apple_pending_head,
+				tqp->apple_pending_ready_count,
+				tqp->recv_count, wqe.wr_id);
+
 		tbv_apple_rx_push_wc(tqp, &wqe, delivered, status);
 		atomic64_inc(&state->data_rx_send);
 		atomic64_inc(&state->data_rx_op_send);
@@ -2783,7 +2818,7 @@ static int tbv_apple_rx_copy_frame_to_buf(struct tbv_qp *tqp,
 
 void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 			      const struct tbv_path *path,
-			      const void *payload, u32 len, u8 eof)
+			      const void *payload, u32 len, u8 sof, u8 eof)
 {
 	struct tbv_rx_message *msg;
 	struct tbv_qp *tqp;
@@ -2799,6 +2834,13 @@ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 	}
 
 	qpn = tbv_apple_qpn_from_path(path);
+	if (sof)
+		atomic64_inc(&state->apple_rx_sof);
+	if (eof == 3)
+		atomic64_inc(&state->apple_rx_eof3);
+	else
+		atomic64_inc(&state->apple_rx_eof_other);
+
 	tqp = tbv_qp_get_by_num(state, qpn);
 	if (!tqp) {
 		atomic64_inc(&state->data_rx_no_qp);
@@ -2807,10 +2849,33 @@ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 
 	mutex_lock(&tqp->rx_lock);
 	msg = &tqp->rx_msg;
+	if (!msg->active && tqp->apple_pending_ready_count)
+		tbv_apple_rx_drain_pending_locked(state, tqp);
+	if (tbv_apple_rx_trace_take())
+		pr_info("apple rx qpn=%u sof=%u eof=%u len=%u active=%u received=%u delivered=%u wqe_len=%u recv_count=%u pending_active=%d pending_ready=%u\n",
+			qpn, sof, eof, len, msg->active, msg->received,
+			msg->delivered, msg->active ? msg->wqe.length : 0,
+			tqp->recv_count, tqp->apple_pending_active,
+			tqp->apple_pending_ready_count);
+	if (sof && (msg->active || tqp->apple_pending_active >= 0))
+		atomic64_inc(&state->apple_rx_sof_while_active);
 	if (!msg->active) {
-		if (!tbv_qp_pop_recv(tqp, &msg->wqe)) {
-			struct tbv_apple_pending_rx *pending;
+		struct tbv_apple_pending_rx *pending = NULL;
 
+		if (tqp->apple_pending_active >= 0) {
+			pending = tbv_apple_pending_active_locked(state, tqp);
+		} else if (!sof) {
+			atomic64_inc(&state->apple_rx_no_sof_when_idle);
+		}
+
+		/*
+		 * If a frame arrived before userspace posted a receive WQE, keep
+		 * the whole Apple message in the pending assembler until EOF.
+		 * Switching to a newly posted WQE mid-message corrupts the
+		 * message boundary: the prefix stays in the deferred buffer and
+		 * the suffix is completed as a separate receive.
+		 */
+		if (!pending && !tbv_qp_pop_recv(tqp, &msg->wqe)) {
 			pending = tbv_apple_pending_active_locked(state, tqp);
 			if (!pending) {
 				atomic64_inc(&state->data_rx_no_recv);
@@ -2819,6 +2884,9 @@ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 				tbv_qp_put(tqp);
 				return;
 			}
+		}
+
+		if (pending) {
 			ret = tbv_apple_rx_copy_frame_to_buf(tqp, pending,
 							     payload, len,
 							     &user_len);
@@ -2850,8 +2918,10 @@ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 	}
 
 	msg->received += user_len;
-	if (msg->received > msg->wqe.length)
+	if (msg->received > msg->wqe.length) {
 		msg->status = IB_WC_LOC_LEN_ERR;
+		atomic64_inc(&state->apple_rx_len_overrun);
+	}
 
 	if (eof == 3) {
 		tbv_apple_rx_push_wc(tqp, &msg->wqe, msg->delivered,
@@ -2859,6 +2929,8 @@ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 		memset(msg, 0, sizeof(*msg));
 		atomic64_inc(&state->data_rx_send);
 		atomic64_inc(&state->data_rx_op_send);
+	} else if (!msg->active) {
+		atomic64_inc(&state->apple_rx_eof_without_active);
 	}
 	mutex_unlock(&tqp->rx_lock);
 	tbv_qp_put(tqp);
@@ -3074,67 +3146,24 @@ static bool tbv_qp_try_acquire_apple_tx_window(struct tbv_qp *tqp, u32 frames,
 	return acquired;
 }
 
-static u64 tbv_qp_apple_tx_cooldown_remaining_us(struct tbv_qp *tqp)
-{
-	u64 until = atomic64_read(&tqp->apple_tx_cooldown_until_ns);
-	u64 now;
-
-	if (!READ_ONCE(apple_tx_cooldown_us))
-		return 0;
-	if (!until)
-		return 0;
-
-	now = ktime_get_ns();
-	if (!time_after64(until, now))
-		return 0;
-
-	return DIV_ROUND_UP_ULL(until - now, NSEC_PER_USEC);
-}
-
 static int tbv_qp_acquire_apple_tx_window(struct tbv_qp *tqp, u32 frames,
 					  bool *wr_acquired,
 					  u32 *frames_acquired)
 {
 	int ret = -ETIMEDOUT;
-	unsigned long deadline = jiffies + msecs_to_jiffies(5000);
+	long waited;
 
 	*wr_acquired = false;
 	*frames_acquired = 0;
 
-	for (;;) {
-		u64 cooldown_us;
-		unsigned long min_us;
-		long remaining;
-		long waited;
-
-		if (time_after_eq(jiffies, deadline))
-			return -ETIMEDOUT;
-
-		remaining = deadline - jiffies;
-		waited = wait_event_timeout(tqp->apple_tx_wait,
-					    tbv_qp_try_acquire_apple_tx_window(tqp,
-									       frames,
-									       wr_acquired,
-									       frames_acquired,
-									       &ret),
-					    remaining);
-		if (!waited)
-			return -ETIMEDOUT;
-		if (ret)
-			return ret;
-
-		cooldown_us = tbv_qp_apple_tx_cooldown_remaining_us(tqp);
-		if (!cooldown_us)
-			return 0;
-
-		tbv_qp_release_apple_tx_window(tqp, *wr_acquired,
-					       *frames_acquired);
-		*wr_acquired = false;
-		*frames_acquired = 0;
-
-		min_us = min_t(u64, cooldown_us, ULONG_MAX - 10);
-		usleep_range(min_us, min_us + 10);
-	}
+	waited = wait_event_timeout(tqp->apple_tx_wait,
+				    tbv_qp_try_acquire_apple_tx_window(tqp,
+								       frames,
+								       wr_acquired,
+								       frames_acquired,
+								       &ret),
+				    msecs_to_jiffies(5000));
+	return waited ? ret : -ETIMEDOUT;
 }
 
 static int tbv_umem_copy_to(struct tbv_mr *mr, u64 addr, const void *src,

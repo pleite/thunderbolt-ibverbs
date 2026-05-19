@@ -123,6 +123,10 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_wr_no_path));
 	seq_printf(s, "data_wr_copied: %lld\n",
 		   atomic64_read(&state->data_wr_copied));
+	seq_printf(s, "data_wr_zcopy: %lld\n",
+		   atomic64_read(&state->data_wr_zcopy));
+	seq_printf(s, "data_wr_zcopy_fallback: %lld\n",
+		   atomic64_read(&state->data_wr_zcopy_fallback));
 	seq_printf(s, "data_wr_copy_error: %lld\n",
 		   atomic64_read(&state->data_wr_copy_error));
 	seq_printf(s, "data_wr_path_send: %lld\n",
@@ -173,6 +177,20 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_reorder_window));
 	seq_printf(s, "data_rx_pending_discarded: %lld\n",
 		   atomic64_read(&state->data_rx_pending_discarded));
+	seq_printf(s, "apple_rx_sof: %lld\n",
+		   atomic64_read(&state->apple_rx_sof));
+	seq_printf(s, "apple_rx_eof3: %lld\n",
+		   atomic64_read(&state->apple_rx_eof3));
+	seq_printf(s, "apple_rx_eof_other: %lld\n",
+		   atomic64_read(&state->apple_rx_eof_other));
+	seq_printf(s, "apple_rx_sof_while_active: %lld\n",
+		   atomic64_read(&state->apple_rx_sof_while_active));
+	seq_printf(s, "apple_rx_no_sof_when_idle: %lld\n",
+		   atomic64_read(&state->apple_rx_no_sof_when_idle));
+	seq_printf(s, "apple_rx_eof_without_active: %lld\n",
+		   atomic64_read(&state->apple_rx_eof_without_active));
+	seq_printf(s, "apple_rx_len_overrun: %lld\n",
+		   atomic64_read(&state->apple_rx_len_overrun));
 	seq_printf(s, "data_cq_overflow: %lld\n",
 		   atomic64_read(&state->data_cq_overflow));
 	return 0;

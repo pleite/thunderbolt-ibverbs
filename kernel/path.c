@@ -10,7 +10,11 @@
 #include "tbv.h"
 
 #define TBV_NATIVE_RING_SIZE 1024
-#define TBV_APPLE_RING_SIZE 256
+/* Apple-originated bursts can exhaust a 256-entry RX ring before credits
+ * recycle. 1024 entries passed checked Mac-to-Linux UC bursts beyond one full
+ * ring while keeping per-direction buffer cost modest.
+ */
+#define TBV_APPLE_RING_SIZE 1024
 #define TBV_DATA_FRAME_SIZE SZ_4K
 #define TBV_DATA_PDF_FRAME_START 1
 #define TBV_DATA_PDF_FRAME_END 3
@@ -48,6 +52,8 @@ struct tbv_tx_packet {
 	bool queued;
 	bool zcopy;
 	bool unmap_dma;
+	bool raw_stream_start;
+	bool raw_stream_end;
 	u8 control_buf[TBV_CONTROL_FRAME_SIZE];
 };
 
@@ -374,7 +380,7 @@ static void tbv_path_rx_complete(struct tb_ring *ring, struct ring_frame *frame,
 		if (path->rail && path->rail->peer &&
 		    path->rail->peer->backend == TBV_BACKEND_APPLE) {
 			tbv_ibdev_rx_apple_frame(state, path, f->buf, len,
-						 frame->eof);
+						 frame->sof, frame->eof);
 		} else if (path->rx_raw_pending) {
 			tbv_path_rx_raw_payload(path, state, f->buf, len);
 		} else if (!tbv_native_data_parse_header(f->buf, len, &hdr) &&
@@ -809,6 +815,8 @@ static struct tbv_tx_packet *tbv_path_alloc_pooled_data_packet(
 	packet->queued = false;
 	packet->zcopy = false;
 	packet->unmap_dma = false;
+	packet->raw_stream_start = false;
+	packet->raw_stream_end = false;
 	return packet;
 }
 
@@ -1014,6 +1022,7 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 		struct tbv_tx_packet *packet;
 		struct tbv_data_frame *f;
 		bool needs_staging;
+		bool old_raw_stream_active;
 		int ret;
 
 		spin_lock_irqsave(&path->tx_lock, flags);
@@ -1025,11 +1034,17 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 			return;
 		}
 
-		if (!list_empty(&path->tx_control_queue)) {
+		if (!path->tx_raw_stream_active &&
+		    !list_empty(&path->tx_control_queue)) {
 			packet = list_first_entry(&path->tx_control_queue,
 						  struct tbv_tx_packet, node);
 			needs_staging = true;
 		} else {
+			if (list_empty(&path->tx_data_queue)) {
+				path->tx_scheduling = false;
+				spin_unlock_irqrestore(&path->tx_lock, flags);
+				return;
+			}
 			packet = list_first_entry(&path->tx_data_queue,
 						  struct tbv_tx_packet, node);
 			needs_staging = !packet->zcopy;
@@ -1041,7 +1056,8 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 			return;
 		}
 
-		if (!list_empty(&path->tx_control_queue)) {
+		if (!path->tx_raw_stream_active &&
+		    !list_empty(&path->tx_control_queue)) {
 			packet = list_first_entry(&path->tx_control_queue,
 						  struct tbv_tx_packet, node);
 			path->tx_control_queued--;
@@ -1052,6 +1068,11 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 		}
 		list_del_init(&packet->node);
 		packet->queued = false;
+		old_raw_stream_active = path->tx_raw_stream_active;
+		if (packet->raw_stream_start)
+			path->tx_raw_stream_active = true;
+		if (packet->raw_stream_end)
+			path->tx_raw_stream_active = false;
 
 		if (needs_staging) {
 			f = list_first_entry(&path->tx_free,
@@ -1084,6 +1105,7 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 			if (state)
 				atomic64_inc(&state->data_tx_errors);
 			spin_lock_irqsave(&path->tx_lock, flags);
+			path->tx_raw_stream_active = old_raw_stream_active;
 			if (ret == -ENOMEM &&
 			    path->state == TBV_PATH_TUNNEL_ENABLED) {
 				list_add(&packet->node, &path->tx_data_queue);
@@ -1123,6 +1145,7 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 				atomic64_inc(&state->data_tx_posted);
 			if (!packet->control)
 				atomic64_inc(&path->data_tx_posted);
+			tbv_path_schedule_tx_poll(path);
 			continue;
 		}
 
@@ -1134,6 +1157,7 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 		f->frame.callback = NULL;
 		spin_lock_irqsave(&path->tx_lock, flags);
 		list_add_tail(&f->free_node, &path->tx_free);
+		path->tx_raw_stream_active = old_raw_stream_active;
 		if (ret == -ENOMEM &&
 		    path->state == TBV_PATH_TUNNEL_ENABLED) {
 			if (packet->control) {
@@ -1141,7 +1165,8 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 					 &path->tx_control_queue);
 				path->tx_control_queued++;
 			} else {
-				list_add(&packet->node, &path->tx_data_queue);
+				list_add(&packet->node,
+					 &path->tx_data_queue);
 				path->tx_data_queued++;
 			}
 			packet->queued = true;
@@ -1366,6 +1391,7 @@ int tbv_path_send_page_stream(struct tbv_path *path,
 		ret = -ENOMEM;
 		goto err_meta_done;
 	}
+	packet->raw_stream_start = true;
 	list_add_tail(&packet->node, &packets);
 	packet_count++;
 	dma_dev = tb_ring_dma_device(path->tx_ring);
@@ -1408,6 +1434,8 @@ int tbv_path_send_page_stream(struct tbv_path *path,
 			ret = -ENOMEM;
 			goto err_release;
 		}
+		if (prepared + len == total_length)
+			packet->raw_stream_end = true;
 		list_add_tail(&packet->node, &packets);
 		packet_count++;
 		prepared += len;
