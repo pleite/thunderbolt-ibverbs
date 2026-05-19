@@ -806,17 +806,17 @@ tbv_tbnet_minimal_enable_paths(struct tbv_tbnet_minimal_session *s,
 	 * module, and macOS expects the stock TBnet ring/path pairing here.
 	 */
 	return tb_xdomain_enable_paths(s->xd, s->local_transmit_path,
-				       s->rx_ring->hop,
+				       s->tx_ring->hop,
 				       remote_transmit_path,
-				       s->tx_ring->hop);
+				       s->rx_ring->hop);
 }
 
 static void tbv_tbnet_minimal_disable_paths(struct tbv_tbnet_minimal_session *s)
 {
 	tb_xdomain_disable_paths(s->xd, s->local_transmit_path,
-				 s->rx_ring->hop,
+				 s->tx_ring->hop,
 				 s->remote_transmit_path,
-				 s->tx_ring->hop);
+				 s->rx_ring->hop);
 }
 
 static void tbv_tbnet_minimal_teardown_path(struct tbv_tbnet_minimal_session *s)
