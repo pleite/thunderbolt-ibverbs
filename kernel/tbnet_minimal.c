@@ -1069,10 +1069,13 @@ static int tbv_tbnet_minimal_handle_packet_common(
 		return 1;
 
 	case TBV_TBIP_LOGOUT:
+		atomic64_inc(&session->identity->minimal_logout_rx);
 		atomic64_inc(&session->logout_rx);
 		ret = tbv_tbnet_minimal_send_status(session, &ctrl);
-		if (!ret)
+		if (!ret) {
+			atomic64_inc(&session->identity->minimal_status_tx);
 			atomic64_inc(&session->status_tx);
+		}
 		pr_info("minimal TBnet logout received route=0x%llx status_ret=%d\n",
 			session->xd->route, ret);
 		queue_work(system_long_wq, &session->disconnect_work);

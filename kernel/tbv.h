@@ -255,6 +255,8 @@ struct tbv_tbnet_identity {
 	bool rx_handler_registered;
 	atomic64_t minimal_login_rx;
 	atomic64_t minimal_login_tx;
+	atomic64_t minimal_logout_rx;
+	atomic64_t minimal_status_tx;
 	atomic64_t minimal_packet_rx;
 	atomic64_t minimal_packet_tx_posted;
 	atomic64_t minimal_packet_tx;

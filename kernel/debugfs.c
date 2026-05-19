@@ -50,6 +50,10 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->tbnet_identity.minimal_login_rx));
 	seq_printf(s, "tbnet_identity_minimal_login_tx: %lld\n",
 		   atomic64_read(&state->tbnet_identity.minimal_login_tx));
+	seq_printf(s, "tbnet_identity_minimal_logout_rx: %lld\n",
+		   atomic64_read(&state->tbnet_identity.minimal_logout_rx));
+	seq_printf(s, "tbnet_identity_minimal_status_tx: %lld\n",
+		   atomic64_read(&state->tbnet_identity.minimal_status_tx));
 	seq_printf(s, "tbnet_identity_minimal_packet_rx: %lld\n",
 		   atomic64_read(&state->tbnet_identity.minimal_packet_rx));
 	seq_printf(s, "tbnet_identity_minimal_packet_tx_posted: %lld\n",
