@@ -152,7 +152,7 @@ tbv_resolve_tbnet_identity(const struct tbv_config *cfg,
 		return cfg->tbnet_identity;
 
 	if (profile == TBV_PROFILE_MAC_COMPAT || profile == TBV_PROFILE_MIXED)
-		return TBV_TBNET_ID_STOCK_PROXY;
+		return TBV_TBNET_ID_MINIMAL_PACKET;
 
 	return TBV_TBNET_ID_OFF;
 }
