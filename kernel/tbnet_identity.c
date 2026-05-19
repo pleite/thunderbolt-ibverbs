@@ -821,6 +821,7 @@ int tbv_tbnet_identity_prepare(struct tbv_tbnet_identity *identity,
 
 	memset(identity, 0, sizeof(*identity));
 	identity->mode = cfg->tbnet_identity;
+	identity->minimal_e2e = identity_cfg->minimal_e2e;
 	mutex_init(&identity->lock);
 	INIT_LIST_HEAD(&identity->minimal_sessions);
 

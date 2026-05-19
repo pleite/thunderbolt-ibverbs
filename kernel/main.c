@@ -43,6 +43,11 @@ module_param(tbnet_identity_gid, charp, 0444);
 MODULE_PARM_DESC(tbnet_identity_gid,
 		 "Netdev whose IPv4 address is proxied as the RDMA GID for tbnet_identity=stock_proxy; auto uses roce_netdev");
 
+static bool tbnet_identity_minimal_e2e;
+module_param(tbnet_identity_minimal_e2e, bool, 0444);
+MODULE_PARM_DESC(tbnet_identity_minimal_e2e,
+		 "Enable E2E flow control on minimal ThunderboltIP packet rings");
+
 static char *lanes = "auto";
 module_param(lanes, charp, 0444);
 MODULE_PARM_DESC(lanes, "Lane request: auto, N, or MIN-MAX");
@@ -153,6 +158,7 @@ static int __init tbv_init(void)
 
 	identity_cfg.tbnet_netdev = tbnet_identity_tbnet;
 	identity_cfg.gid_netdev = tbnet_identity_gid;
+	identity_cfg.minimal_e2e = tbnet_identity_minimal_e2e;
 
 	ret = tbv_core_init(&tbv_driver_state, &resolved, &identity_cfg);
 	if (ret)
@@ -192,12 +198,13 @@ static int __init tbv_init(void)
 		snprintf(lanes_desc, sizeof(lanes_desc), "%u-%u",
 			 cfg.lanes_min, cfg.lanes_max);
 
-	pr_info("loaded compat=%s profile=%s resolved_profile=%s tbnet=%s tbnet_identity=%s lanes=%s native_control=%s native_data=%u apple_data=%u native_wr_striping=%u native_fragment_striping=%u\n",
+	pr_info("loaded compat=%s profile=%s resolved_profile=%s tbnet=%s tbnet_identity=%s tbnet_identity_minimal_e2e=%u lanes=%s native_control=%s native_data=%u apple_data=%u native_wr_striping=%u native_fragment_striping=%u\n",
 		tbv_compat_name(cfg.compat),
 		tbv_profile_name(cfg.profile),
 		tbv_profile_name(resolved.profile),
 		tbv_tbnet_policy_name(cfg.tbnet),
 		tbv_tbnet_identity_name(resolved.tbnet_identity),
+		tbnet_identity_minimal_e2e,
 		lanes_desc,
 		tbv_native_control_mode_name(&tbv_driver_state),
 		native_data,

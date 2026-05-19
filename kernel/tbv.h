@@ -244,6 +244,7 @@ struct tbv_tbnet_identity {
 	struct notifier_block netdev_nb;
 	struct notifier_block inetaddr_nb;
 	__be32 proxy_ipv4;
+	bool minimal_e2e;
 	bool minimal_dir_registered;
 	bool minimal_driver_registered;
 	bool minimal_started;
@@ -309,6 +310,7 @@ struct tbv_tbnet_arp_proxy {
 struct tbv_tbnet_identity_config {
 	const char *tbnet_netdev;
 	const char *gid_netdev;
+	bool minimal_e2e;
 };
 
 struct tbv_state {

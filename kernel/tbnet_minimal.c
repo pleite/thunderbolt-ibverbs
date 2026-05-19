@@ -315,7 +315,8 @@ tbv_tbnet_minimal_alloc_rings(struct tbv_tbnet_minimal_session *session)
 	int hopid;
 	int ret;
 
-	if (session->svc->prtcstns & TBV_TBNET_E2E)
+	if (session->identity->minimal_e2e &&
+	    session->svc->prtcstns & TBV_TBNET_E2E)
 		flags |= RING_FLAG_E2E;
 
 	session->tx_ring = tb_ring_alloc_tx(session->xd->tb->nhi, -1,

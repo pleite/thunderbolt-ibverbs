@@ -37,6 +37,7 @@ help:
 	@echo "  tbnet_identity=auto|stock|stock_proxy|minimal_packet|off"
 	@echo "  tbnet_identity_tbnet=<netdev>"
 	@echo "  tbnet_identity_gid=auto|<netdev>"
+	@echo "  tbnet_identity_minimal_e2e=0|1"
 	@echo "  bind_services=0|1"
 	@echo "  allocate_rings=0|1"
 	@echo "  start_rings=0|1"

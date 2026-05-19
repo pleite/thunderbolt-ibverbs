@@ -36,6 +36,8 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   state->tbnet_identity.gid_netdev_name : "<unset>");
 	seq_printf(s, "tbnet_identity_proxy_ipv4: %pI4\n",
 		   &state->tbnet_identity.proxy_ipv4);
+	seq_printf(s, "tbnet_identity_minimal_e2e: %u\n",
+		   state->tbnet_identity.minimal_e2e);
 	seq_printf(s, "tbnet_identity_rx_handler: %u\n",
 		   state->tbnet_identity.rx_handler_registered);
 	seq_printf(s, "tbnet_identity_minimal_started: %u\n",
