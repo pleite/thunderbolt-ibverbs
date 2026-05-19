@@ -62,6 +62,7 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->tbnet_identity.arp_ignored));
 	seq_printf(s, "tbnet_identity_arp_errors: %lld\n",
 		   atomic64_read(&state->tbnet_identity.arp_errors));
+	tbv_tbnet_minimal_debugfs_show(s, &state->tbnet_identity);
 	mutex_unlock(&state->tbnet_identity.lock);
 	seq_printf(s, "tbnet_policy: %s\n",
 		   tbv_tbnet_policy_name(state->cfg.requested.tbnet));

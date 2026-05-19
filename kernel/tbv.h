@@ -39,6 +39,7 @@
 
 struct tb_property_dir;
 struct tbv_tbnet_minimal_session;
+struct seq_file;
 
 enum tbv_compat_mode {
 	TBV_COMPAT_AUTO,
@@ -461,6 +462,8 @@ int tbv_tbnet_arp_reply_for_request(void *reply, size_t reply_size,
 int tbv_tbnet_minimal_start(struct tbv_tbnet_identity *identity);
 void tbv_tbnet_minimal_stop(struct tbv_tbnet_identity *identity);
 void tbv_tbnet_minimal_recompute_state_locked(struct tbv_tbnet_identity *identity);
+void tbv_tbnet_minimal_debugfs_show(struct seq_file *s,
+				    struct tbv_tbnet_identity *identity);
 struct tb_property_dir *tbv_service_create_native_dir(void);
 struct tb_property_dir *tbv_service_create_apple_dir(u32 prtcstns);
 int tbv_services_start(struct tbv_state *state, bool bind_services,

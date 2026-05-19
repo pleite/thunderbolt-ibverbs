@@ -16,9 +16,11 @@
 #include <linux/errno.h>
 #include <linux/etherdevice.h>
 #include <linux/highmem.h>
+#include <linux/if_ether.h>
 #include <linux/jhash.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/thunderbolt.h>
@@ -87,6 +89,25 @@ struct tbv_tbnet_minimal_session {
 	bool login_sent;
 	bool login_received;
 	bool removing;
+	atomic64_t login_rx;
+	atomic64_t login_tx;
+	atomic64_t packet_rx;
+	atomic64_t packet_tx_posted;
+	atomic64_t packet_tx;
+	atomic64_t packet_tx_errors;
+	atomic64_t path_errors;
+	atomic64_t arp_requests;
+	atomic64_t arp_replies;
+	atomic64_t arp_ignored;
+	atomic64_t arp_errors;
+	atomic64_t rx_arp;
+	atomic64_t rx_ipv4;
+	atomic64_t rx_ipv6;
+	atomic64_t rx_other;
+	u32 last_rx_len;
+	u32 last_tx_len;
+	u16 last_rx_ethertype;
+	u16 last_tx_ethertype;
 };
 
 /* Network property directory UUID: c66189ca-1cce-4195-bdb8-49592e5f5a4f */
@@ -167,8 +188,10 @@ tbv_tbnet_minimal_tx_complete(struct tb_ring *ring, struct ring_frame *frame,
 	spin_unlock_irqrestore(&session->tx_lock, flags);
 	atomic_dec(&session->tx_inflight);
 
-	if (!canceled)
+	if (!canceled) {
 		atomic64_inc(&session->identity->minimal_packet_tx);
+		atomic64_inc(&session->packet_tx);
+	}
 }
 
 static void tbv_tbnet_minimal_rx_ready(void *data)
@@ -378,6 +401,69 @@ static void tbv_tbnet_minimal_recompute_state(struct tbv_tbnet_identity *identit
 	mutex_unlock(&identity->lock);
 }
 
+void tbv_tbnet_minimal_debugfs_show(struct seq_file *s,
+				    struct tbv_tbnet_identity *identity)
+{
+	struct tbv_tbnet_minimal_session *session;
+	u32 idx = 0;
+
+	if (identity->mode != TBV_TBNET_ID_MINIMAL_PACKET)
+		return;
+
+	list_for_each_entry(session, &identity->minimal_sessions, node) {
+		seq_printf(s,
+			   "tbnet_minimal_session%u: svc=%d route=0x%llx prtcstns=0x%x mac=%pM local_uuid=%pUb remote_uuid=%pUb\n",
+			   idx, session->svc->id, session->xd->route,
+			   session->svc->prtcstns, session->mac,
+			   session->xd->local_uuid, session->xd->remote_uuid);
+		seq_printf(s,
+			   "tbnet_minimal_session%u_state: rings_started=%u path_enabled=%u login_sent=%u login_received=%u removing=%u tx_inflight=%d\n",
+			   idx, READ_ONCE(session->rings_started),
+			   READ_ONCE(session->path_enabled),
+			   READ_ONCE(session->login_sent),
+			   READ_ONCE(session->login_received),
+			   READ_ONCE(session->removing),
+			   atomic_read(&session->tx_inflight));
+		seq_printf(s,
+			   "tbnet_minimal_session%u_paths: local_tx_path=%d remote_tx_path=%d tx_hop=%d rx_hop=%d\n",
+			   idx, READ_ONCE(session->local_transmit_path),
+			   READ_ONCE(session->remote_transmit_path),
+			   session->tx_ring ? session->tx_ring->hop : -1,
+			   session->rx_ring ? session->rx_ring->hop : -1);
+		seq_printf(s,
+			   "tbnet_minimal_session%u_login: rx=%lld tx=%lld retries=%d\n",
+			   idx, atomic64_read(&session->login_rx),
+			   atomic64_read(&session->login_tx),
+			   READ_ONCE(session->login_retries));
+		seq_printf(s,
+			   "tbnet_minimal_session%u_packets: rx=%lld tx_posted=%lld tx_completed=%lld tx_errors=%lld path_errors=%lld\n",
+			   idx, atomic64_read(&session->packet_rx),
+			   atomic64_read(&session->packet_tx_posted),
+			   atomic64_read(&session->packet_tx),
+			   atomic64_read(&session->packet_tx_errors),
+			   atomic64_read(&session->path_errors));
+		seq_printf(s,
+			   "tbnet_minimal_session%u_arp: requests=%lld replies=%lld ignored=%lld errors=%lld\n",
+			   idx, atomic64_read(&session->arp_requests),
+			   atomic64_read(&session->arp_replies),
+			   atomic64_read(&session->arp_ignored),
+			   atomic64_read(&session->arp_errors));
+		seq_printf(s,
+			   "tbnet_minimal_session%u_rx_ethertypes: arp=%lld ipv4=%lld ipv6=%lld other=%lld last=0x%04x last_len=%u\n",
+			   idx, atomic64_read(&session->rx_arp),
+			   atomic64_read(&session->rx_ipv4),
+			   atomic64_read(&session->rx_ipv6),
+			   atomic64_read(&session->rx_other),
+			   READ_ONCE(session->last_rx_ethertype),
+			   READ_ONCE(session->last_rx_len));
+		seq_printf(s,
+			   "tbnet_minimal_session%u_tx_last: ethertype=0x%04x len=%u\n",
+			   idx, READ_ONCE(session->last_tx_ethertype),
+			   READ_ONCE(session->last_tx_len));
+		idx++;
+	}
+}
+
 static int
 tbv_tbnet_minimal_send_frame(struct tbv_tbnet_minimal_session *session,
 			     const void *payload, u32 payload_len)
@@ -410,9 +496,12 @@ tbv_tbnet_minimal_send_frame(struct tbv_tbnet_minimal_session *session,
 	atomic_inc(&session->tx_inflight);
 	spin_unlock_irqrestore(&session->tx_lock, flags);
 
-	memset(f->buf, 0, TBV_TBNET_MIN_FRAME_SIZE);
 	hdr = f->buf;
 	frame_id = (u16)atomic_inc_return(&session->frame_id);
+	dma_sync_single_for_cpu(tb_ring_dma_device(session->tx_ring),
+				f->dma, TBV_TBNET_MIN_FRAME_SIZE,
+				DMA_TO_DEVICE);
+	memset(f->buf, 0, TBV_TBNET_MIN_FRAME_SIZE);
 	hdr->frame_size = cpu_to_le32(payload_len);
 	hdr->frame_index = cpu_to_le16(0);
 	hdr->frame_id = cpu_to_le16(frame_id);
@@ -430,12 +519,15 @@ tbv_tbnet_minimal_send_frame(struct tbv_tbnet_minimal_session *session,
 	ret = tb_ring_tx(session->tx_ring, &f->frame);
 	if (!ret) {
 		atomic64_inc(&session->identity->minimal_packet_tx_posted);
+		atomic64_inc(&session->packet_tx_posted);
+		WRITE_ONCE(session->last_tx_len, payload_len);
 		schedule_delayed_work(&session->tx_poll_work,
 				      msecs_to_jiffies(1));
 		return 0;
 	}
 
 	atomic64_inc(&session->identity->minimal_packet_tx_errors);
+	atomic64_inc(&session->packet_tx_errors);
 	atomic_dec(&session->tx_inflight);
 	spin_lock_irqsave(&session->tx_lock, flags);
 	list_add_tail(&f->node, &session->tx_free);
@@ -448,8 +540,9 @@ tbv_tbnet_minimal_send_arp_reply(struct tbv_tbnet_minimal_session *session,
 				 const void *request, u32 request_len)
 {
 	struct tbv_tbnet_arp_proxy proxy;
-	u8 reply[sizeof(struct tbv_tbnet_frame_header) + 64];
+	u8 reply[ETH_ZLEN];
 	__be32 proxy_ipv4;
+	u32 reply_len;
 	int ret;
 
 	proxy_ipv4 = READ_ONCE(session->identity->proxy_ipv4);
@@ -460,20 +553,55 @@ tbv_tbnet_minimal_send_arp_reply(struct tbv_tbnet_minimal_session *session,
 	proxy.ipv4 = proxy_ipv4;
 	memcpy(proxy.mac, session->mac, sizeof(proxy.mac));
 
+	memset(reply, 0, sizeof(reply));
 	ret = tbv_tbnet_arp_reply_for_request(reply, sizeof(reply),
 					      request, request_len, &proxy);
 	if (ret <= 0)
 		return ret;
 
 	atomic64_inc(&session->identity->arp_requests);
-	ret = tbv_tbnet_minimal_send_frame(session, reply, ret);
-	if (ret) {
-		atomic64_inc(&session->identity->arp_errors);
+	atomic64_inc(&session->arp_requests);
+	reply_len = max_t(u32, ret, ETH_ZLEN);
+	ret = tbv_tbnet_minimal_send_frame(session, reply, reply_len);
+	if (ret)
 		return ret;
-	}
 
 	atomic64_inc(&session->identity->arp_replies);
+	atomic64_inc(&session->arp_replies);
+	WRITE_ONCE(session->last_tx_ethertype, ETH_P_ARP);
 	return 0;
+}
+
+static void
+tbv_tbnet_minimal_count_rx_payload(struct tbv_tbnet_minimal_session *session,
+				   const void *payload, u32 payload_len)
+{
+	const struct ethhdr *eth = payload;
+	u16 ethertype = 0;
+
+	WRITE_ONCE(session->last_rx_len, payload_len);
+	if (payload_len < sizeof(*eth)) {
+		atomic64_inc(&session->rx_other);
+		WRITE_ONCE(session->last_rx_ethertype, 0);
+		return;
+	}
+
+	ethertype = be16_to_cpu(eth->h_proto);
+	WRITE_ONCE(session->last_rx_ethertype, ethertype);
+	switch (ethertype) {
+	case ETH_P_ARP:
+		atomic64_inc(&session->rx_arp);
+		break;
+	case ETH_P_IP:
+		atomic64_inc(&session->rx_ipv4);
+		break;
+	case ETH_P_IPV6:
+		atomic64_inc(&session->rx_ipv6);
+		break;
+	default:
+		atomic64_inc(&session->rx_other);
+		break;
+	}
 }
 
 static void
@@ -489,6 +617,7 @@ tbv_tbnet_minimal_handle_rx_frame(struct tbv_tbnet_minimal_session *session,
 
 	if (frame_len < sizeof(*hdr)) {
 		atomic64_inc(&session->identity->minimal_path_errors);
+		atomic64_inc(&session->path_errors);
 		return;
 	}
 
@@ -498,13 +627,21 @@ tbv_tbnet_minimal_handle_rx_frame(struct tbv_tbnet_minimal_session *session,
 	if (!payload_len || payload_len > frame_len - sizeof(*hdr) ||
 	    frame_count != 1 || frame_index != 0) {
 		atomic64_inc(&session->identity->minimal_path_errors);
+		atomic64_inc(&session->path_errors);
 		return;
 	}
 
 	atomic64_inc(&session->identity->minimal_packet_rx);
+	atomic64_inc(&session->packet_rx);
+	tbv_tbnet_minimal_count_rx_payload(session, hdr + 1, payload_len);
 	ret = tbv_tbnet_minimal_send_arp_reply(session, hdr + 1, payload_len);
-	if (ret == -ENOENT)
+	if (ret == -ENOENT) {
 		atomic64_inc(&session->identity->arp_ignored);
+		atomic64_inc(&session->arp_ignored);
+	} else if (ret) {
+		atomic64_inc(&session->identity->arp_errors);
+		atomic64_inc(&session->arp_errors);
+	}
 }
 
 static void tbv_tbnet_minimal_rx_work(struct work_struct *work)
@@ -535,6 +672,7 @@ static void tbv_tbnet_minimal_rx_work(struct work_struct *work)
 		frame->flags = 0;
 		if (tb_ring_rx(session->rx_ring, frame)) {
 			atomic64_inc(&session->identity->minimal_path_errors);
+			atomic64_inc(&session->path_errors);
 			break;
 		}
 	}
@@ -613,6 +751,7 @@ static void tbv_tbnet_minimal_connected_work(struct work_struct *work)
 	ret = tb_xdomain_alloc_in_hopid(session->xd, remote_transmit_path);
 	if (ret != remote_transmit_path) {
 		atomic64_inc(&session->identity->minimal_path_errors);
+		atomic64_inc(&session->path_errors);
 		pr_warn("minimal TBnet failed to allocate Rx HopID %d: %d\n",
 			remote_transmit_path, ret);
 		return;
@@ -623,6 +762,7 @@ static void tbv_tbnet_minimal_connected_work(struct work_struct *work)
 	ret = tbv_tbnet_minimal_prime_rx(session);
 	if (ret) {
 		atomic64_inc(&session->identity->minimal_path_errors);
+		atomic64_inc(&session->path_errors);
 		goto err_stop;
 	}
 
@@ -632,6 +772,7 @@ static void tbv_tbnet_minimal_connected_work(struct work_struct *work)
 				      session->rx_ring->hop);
 	if (ret) {
 		atomic64_inc(&session->identity->minimal_path_errors);
+		atomic64_inc(&session->path_errors);
 		pr_warn("minimal TBnet failed to enable packet path: %d\n",
 			ret);
 		goto err_stop;
@@ -695,6 +836,7 @@ static void tbv_tbnet_minimal_login_work(struct work_struct *work)
 
 	memset(reply, 0, sizeof(reply));
 	atomic64_inc(&session->identity->minimal_login_tx);
+	atomic64_inc(&session->login_tx);
 	ret = tb_xdomain_request(session->xd, request, len,
 				 TB_CFG_PKG_XDOMAIN_RESP, reply, sizeof(reply),
 				 TB_CFG_PKG_XDOMAIN_RESP,
@@ -790,6 +932,7 @@ static int tbv_tbnet_minimal_handle_packet(const void *buf, size_t size,
 			return 1;
 
 		atomic64_inc(&session->identity->minimal_login_rx);
+		atomic64_inc(&session->login_rx);
 		mutex_lock(&session->lock);
 		if (!session->removing) {
 			session->login_received = true;
