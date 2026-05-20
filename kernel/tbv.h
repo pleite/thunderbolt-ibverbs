@@ -379,6 +379,7 @@ struct tbv_state {
 	atomic64_t data_wr_op_unsupported;
 	atomic64_t data_wr_live;
 	atomic64_t data_wr_no_path;
+	atomic64_t data_wr_no_recv_credit;
 	atomic64_t data_wr_copied;
 	atomic64_t data_wr_zcopy;
 	atomic64_t data_wr_zcopy_fallback;

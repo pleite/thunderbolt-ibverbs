@@ -210,8 +210,6 @@ struct tbv_qp {
 	struct completion refs_zero;
 	struct list_head pending_sends;
 	struct list_head pending_reads;
-	struct xarray pending_sends_xa;
-	struct xarray pending_reads_xa;
 	struct delayed_work timeout_work;
 	struct ib_qp_init_attr init_attr;
 	struct ib_qp_attr attr;
@@ -242,6 +240,7 @@ struct tbv_qp {
 	bool qpn_allocated;
 	bool dest_qp_known;
 	bool closing;
+	bool timeout_work_armed;
 };
 
 struct tbv_mr {
@@ -551,9 +550,10 @@ static void tbv_qp_schedule_timeout_locked(struct tbv_qp *tqp)
 	struct workqueue_struct *wq = tqp->owner && tqp->owner->workqueue ?
 				      tqp->owner->workqueue : system_wq;
 
-	if (!delay || tqp->closing)
+	if (!delay || tqp->closing || tqp->timeout_work_armed)
 		return;
 
+	tqp->timeout_work_armed = true;
 	mod_delayed_work(wq, &tqp->timeout_work, delay);
 }
 
@@ -628,36 +628,24 @@ tbv_qp_validate_native_endpoint(struct tbv_qp *tqp,
 	return status;
 }
 
-static int tbv_qp_queue_send(struct tbv_qp *tqp, struct tbv_send_ctx *send)
+static void tbv_qp_queue_send(struct tbv_qp *tqp, struct tbv_send_ctx *send)
 {
 	unsigned long flags;
-	int ret;
 
 	spin_lock_irqsave(&tqp->lock, flags);
-	ret = xa_insert(&tqp->pending_sends_xa, send->psn, send, GFP_ATOMIC);
-	if (ret)
-		goto out;
 	send->queued_jiffies = 0;
 	list_add_tail(&send->node, &tqp->pending_sends);
-out:
 	spin_unlock_irqrestore(&tqp->lock, flags);
-	return ret;
 }
 
-static int tbv_qp_queue_read(struct tbv_qp *tqp, struct tbv_read_ctx *read)
+static void tbv_qp_queue_read(struct tbv_qp *tqp, struct tbv_read_ctx *read)
 {
 	unsigned long flags;
-	int ret;
 
 	spin_lock_irqsave(&tqp->lock, flags);
-	ret = xa_insert(&tqp->pending_reads_xa, read->psn, read, GFP_ATOMIC);
-	if (ret)
-		goto out;
 	read->queued_jiffies = 0;
 	list_add_tail(&read->node, &tqp->pending_reads);
-out:
 	spin_unlock_irqrestore(&tqp->lock, flags);
-	return ret;
 }
 
 static void tbv_qp_arm_send_timeout(struct tbv_qp *tqp,
@@ -693,11 +681,12 @@ static bool tbv_qp_unqueue_send(struct tbv_qp *tqp, struct tbv_send_ctx *send)
 	bool found = false;
 
 	spin_lock_irqsave(&tqp->lock, flags);
-	pos = xa_load(&tqp->pending_sends_xa, send->psn);
-	if (pos == send) {
-		xa_erase(&tqp->pending_sends_xa, send->psn);
+	list_for_each_entry(pos, &tqp->pending_sends, node) {
+		if (pos != send)
+			continue;
 		list_del_init(&send->node);
 		found = true;
+		break;
 	}
 	spin_unlock_irqrestore(&tqp->lock, flags);
 	return found;
@@ -710,11 +699,12 @@ static bool tbv_qp_unqueue_read(struct tbv_qp *tqp, struct tbv_read_ctx *read)
 	bool found = false;
 
 	spin_lock_irqsave(&tqp->lock, flags);
-	pos = xa_load(&tqp->pending_reads_xa, read->psn);
-	if (pos == read) {
-		xa_erase(&tqp->pending_reads_xa, read->psn);
+	list_for_each_entry(pos, &tqp->pending_reads, node) {
+		if (pos != read)
+			continue;
 		list_del_init(&read->node);
 		found = true;
+		break;
 	}
 	spin_unlock_irqrestore(&tqp->lock, flags);
 	return found;
@@ -722,52 +712,52 @@ static bool tbv_qp_unqueue_read(struct tbv_qp *tqp, struct tbv_read_ctx *read)
 
 static struct tbv_send_ctx *tbv_qp_take_send(struct tbv_qp *tqp, u32 psn)
 {
-	struct tbv_send_ctx *send;
+	struct tbv_send_ctx *send, *found = NULL;
 	unsigned long flags;
 
 	spin_lock_irqsave(&tqp->lock, flags);
-	send = xa_load(&tqp->pending_sends_xa, psn);
-	if (send) {
-		xa_erase(&tqp->pending_sends_xa, psn);
+	list_for_each_entry(send, &tqp->pending_sends, node) {
+		if (send->psn != psn)
+			continue;
 		list_del_init(&send->node);
+		found = send;
+		break;
 	}
 	spin_unlock_irqrestore(&tqp->lock, flags);
-	return send;
+	return found;
 }
 
 static struct tbv_read_ctx *tbv_qp_find_read_get(struct tbv_qp *tqp, u32 psn)
 {
-	struct tbv_read_ctx *read;
+	struct tbv_read_ctx *read, *found = NULL;
 	unsigned long flags;
 
 	spin_lock_irqsave(&tqp->lock, flags);
-	read = xa_load(&tqp->pending_reads_xa, psn);
-	if (read && !refcount_inc_not_zero(&read->refs))
-		read = NULL;
+	list_for_each_entry(read, &tqp->pending_reads, node) {
+		if (read->psn != psn)
+			continue;
+		if (refcount_inc_not_zero(&read->refs))
+			found = read;
+		break;
+	}
 	spin_unlock_irqrestore(&tqp->lock, flags);
-	return read;
+	return found;
 }
 
 static void tbv_qp_flush_sends(struct tbv_qp *tqp, struct list_head *flush)
 {
-	struct tbv_send_ctx *send;
 	unsigned long flags;
 
 	spin_lock_irqsave(&tqp->lock, flags);
-	list_for_each_entry(send, &tqp->pending_sends, node)
-		xa_erase(&tqp->pending_sends_xa, send->psn);
 	list_splice_init(&tqp->pending_sends, flush);
 	spin_unlock_irqrestore(&tqp->lock, flags);
 }
 
 static void tbv_qp_flush_reads(struct tbv_qp *tqp, struct list_head *flush)
 {
-	struct tbv_read_ctx *read;
 	unsigned long flags;
 
 	spin_lock_irqsave(&tqp->lock, flags);
-	list_for_each_entry(read, &tqp->pending_reads, node)
-		xa_erase(&tqp->pending_reads_xa, read->psn);
 	list_splice_init(&tqp->pending_reads, flush);
 	spin_unlock_irqrestore(&tqp->lock, flags);
 }
@@ -1292,8 +1282,6 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	init_completion(&tqp->refs_zero);
 	INIT_LIST_HEAD(&tqp->pending_sends);
 	INIT_LIST_HEAD(&tqp->pending_reads);
-	xa_init(&tqp->pending_sends_xa);
-	xa_init(&tqp->pending_reads_xa);
 	INIT_LIST_HEAD(&tqp->rx_reorder);
 	INIT_DELAYED_WORK(&tqp->timeout_work, tbv_qp_timeout_work);
 	tqp->apple_pending_active = -1;
@@ -1306,8 +1294,6 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	ret = __xa_insert(&tqp->owner->verbs_qps_xa, qpn, tqp, GFP_KERNEL);
 	xa_unlock_irqrestore(&tqp->owner->verbs_qps_xa, flags);
 	if (ret) {
-		xa_destroy(&tqp->pending_reads_xa);
-		xa_destroy(&tqp->pending_sends_xa);
 		kvfree(tqp->apple_pending);
 		kfree(tqp->recvq);
 		ida_free(&tbv_qpn_ida, qpn);
@@ -1332,6 +1318,9 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 	wake_up_all(&tqp->credit_wait);
 	wake_up_all(&tqp->apple_tx_wait);
 	cancel_delayed_work_sync(&tqp->timeout_work);
+	spin_lock_irqsave(&tqp->lock, flags);
+	tqp->timeout_work_armed = false;
+	spin_unlock_irqrestore(&tqp->lock, flags);
 
 	tbv_qp_flush_sends(tqp, &flush);
 	while (!list_empty(&flush)) {
@@ -1387,8 +1376,6 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 	if (tqp->owner && pending)
 		atomic_sub(pending, &tqp->owner->verbs_recv_wqes);
 	kfree(tqp->recvq);
-	xa_destroy(&tqp->pending_reads_xa);
-	xa_destroy(&tqp->pending_sends_xa);
 	if (tqp->qpn_allocated) {
 		ida_free(&tbv_qpn_ida, qp->qp_num);
 		tqp->qpn_allocated = false;
@@ -1678,14 +1665,12 @@ static bool tbv_qp_timeout_reap_tx(struct tbv_qp *tqp,
 	list_for_each_entry_safe(send, send_tmp, &tqp->pending_sends, node) {
 		if (!tbv_qp_entry_expired(send->queued_jiffies, now, timeout))
 			continue;
-		xa_erase(&tqp->pending_sends_xa, send->psn);
 		list_move_tail(&send->node, timed_out_sends);
 		timed_out = true;
 	}
 	list_for_each_entry_safe(read, read_tmp, &tqp->pending_reads, node) {
 		if (!tbv_qp_entry_expired(read->queued_jiffies, now, timeout))
 			continue;
-		xa_erase(&tqp->pending_reads_xa, read->psn);
 		list_move_tail(&read->node, timed_out_reads);
 		timed_out = true;
 	}
@@ -1770,7 +1755,12 @@ static void tbv_qp_timeout_work(struct work_struct *work)
 	LIST_HEAD(timed_out_reads);
 	unsigned long timeout = tbv_qp_timeout_jiffies();
 	unsigned long now = jiffies;
+	unsigned long flags;
 	bool need_resched = false;
+
+	spin_lock_irqsave(&tqp->lock, flags);
+	tqp->timeout_work_armed = false;
+	spin_unlock_irqrestore(&tqp->lock, flags);
 
 	if (!timeout)
 		return;
@@ -2112,9 +2102,7 @@ static int tbv_post_apple_send(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 
 	remaining = nfrags;
 	atomic_set(&ctx->apple_pending, nfrags);
-	ret = tbv_qp_queue_send(tqp, ctx);
-	if (ret)
-		goto err_complete_ctx;
+	tbv_qp_queue_send(tqp, ctx);
 
 	ret = tbv_path_reserve_data(path, nfrags);
 	if (ret)
@@ -2151,7 +2139,6 @@ err_release_reservation:
 		tbv_path_kick_tx(path);
 err_unqueue_ctx:
 	tbv_qp_unqueue_send(tqp, ctx);
-err_complete_ctx:
 	tbv_send_complete(ctx, ret);
 	tbv_send_ctx_put(ctx);
 	tbv_release_path_refs(&path, 1);
@@ -2381,12 +2368,7 @@ static int tbv_post_rdma_read(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 		goto err_put_ctx;
 	}
 
-	ret = tbv_qp_queue_read(tqp, ctx);
-	if (ret) {
-		tbv_release_path_refs(&path, 1);
-		kfree(frame);
-		goto err_put_ctx;
-	}
+	tbv_qp_queue_read(tqp, ctx);
 	tbv_qp_arm_read_timeout(tqp, ctx);
 	tbv_read_ctx_get(ctx);
 	atomic64_inc(&tqp->owner->data_wr_path_send);
@@ -2502,9 +2484,25 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 
 	if (is_send) {
 		ret = tbv_qp_consume_remote_recv_credit(tqp);
-		if (ret)
+		if (!ret) {
+			credit_consumed = true;
+		} else if (ret == -EAGAIN) {
+			/*
+			 * Native receive credits are an advisory flow-control signal.
+			 * They are not reliable enough to be a verbs admission gate:
+			 * setup-time credits can legitimately race QP bring-up, and
+			 * RC post_send must not fail synchronously just because the
+			 * remote credit side-channel has not caught up.
+			 *
+			 * If the remote really has no receive resource, the receive
+			 * side will either buffer within its reorder window or complete
+			 * this WR asynchronously with an error ACK.
+			 */
+			atomic64_inc(&tqp->owner->data_wr_no_recv_credit);
+			ret = 0;
+		} else {
 			goto err_release_segs;
-		credit_consumed = true;
+		}
 	}
 
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
@@ -2526,9 +2524,7 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	spin_unlock_irqrestore(&tqp->lock, flags);
 	ctx->psn = psn;
 
-	ret = tbv_qp_queue_send(tqp, ctx);
-	if (ret)
-		goto err_put_ctx_return_credit;
+	tbv_qp_queue_send(tqp, ctx);
 
 	if (tbv_should_zcopy_payload(total_len) && fragment_striping) {
 		atomic64_inc(&tqp->owner->data_wr_zcopy_fallback);
@@ -2799,8 +2795,6 @@ err_unqueue_ctx:
 	tbv_send_ctx_put(ctx);
 	tbv_release_send_segments(segs, nsegs);
 	return ret;
-err_put_ctx_return_credit:
-	tbv_send_ctx_put(ctx);
 err_return_credit:
 	if (credit_consumed)
 		tbv_qp_return_remote_recv_credit(tqp);
