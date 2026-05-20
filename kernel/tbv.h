@@ -236,14 +236,18 @@ struct tbv_peer {
 	struct tb_xdomain *xd;
 	struct list_head rails;
 	struct ida rail_ids;
+	/* Serializes XDomain control and tunnel setup transactions per link. */
+	struct mutex control_lock;
 	u32 nr_rails;
 };
 
 static inline bool tbv_rail_data_ready(const struct tbv_rail *rail)
 {
-	return rail &&
-	       rail->path.state == TBV_PATH_TUNNEL_ENABLED &&
-	       rail->native_remote_ready;
+	if (!rail || rail->path.state != TBV_PATH_TUNNEL_ENABLED)
+		return false;
+	if (!rail->peer || rail->peer->backend != TBV_BACKEND_NATIVE)
+		return true;
+	return rail->native_ready_sent && rail->native_remote_ready;
 }
 
 static inline bool tbv_rail_apple_data_ready(const struct tbv_rail *rail)
@@ -606,9 +610,9 @@ int tbv_path_send_page_stream(struct tbv_path *path,
 			      void *meta_done_ctx,
 			      tbv_path_next_page_fn next, void *next_ctx);
 void tbv_path_kick_tx(struct tbv_path *path);
-u32 tbv_path_cancel_data_done_ctx(struct tbv_path *path,
-				  tbv_path_tx_done_fn done, void *done_ctx);
-u32 tbv_path_cancel_data_owner_ctx(struct tbv_path *path, void *owner_ctx);
+void tbv_path_cancel_data_done_ctx(struct tbv_path *path,
+				   tbv_path_tx_done_fn done, void *done_ctx);
+void tbv_path_cancel_data_owner_ctx(struct tbv_path *path, void *owner_ctx);
 void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd);
 
 const struct tbv_backend_ops *tbv_backend_get(enum tbv_backend_type type);

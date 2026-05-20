@@ -2,8 +2,22 @@
 
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
+#include <linux/thunderbolt.h>
 
+#include "../proto/native_wire.h"
 #include "tbv.h"
+
+static u32 tbv_debugfs_wire_path_flags(const struct tbv_path *path)
+{
+	u32 flags = 0;
+
+	if (path->cfg.tx_flags & RING_FLAG_FRAME)
+		flags |= TBV_NATIVE_WIRE_PATH_FRAME;
+	if (path->cfg.e2e)
+		flags |= TBV_NATIVE_WIRE_PATH_E2E;
+
+	return flags;
+}
 
 static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 {
@@ -283,6 +297,16 @@ static int tbv_debugfs_peers_show(struct seq_file *s, void *unused)
 				   atomic64_read(&rail->path.data_tx_credit_received),
 				   rail->path.tx_remote_data_credits,
 				   rail->path.tx_remote_data_credit_max);
+			seq_printf(s,
+				   "    path_cfg tx_flags=0x%x rx_flags=0x%x e2e=%u wire_flags=0x%x tx_ring=%u rx_ring=%u sof_mask=0x%x eof_mask=0x%x\n",
+				   rail->path.cfg.tx_flags,
+				   rail->path.cfg.rx_flags,
+				   rail->path.cfg.e2e,
+				   tbv_debugfs_wire_path_flags(&rail->path),
+				   rail->path.cfg.tx_ring_size,
+				   rail->path.cfg.rx_ring_size,
+				   rail->path.cfg.sof_mask,
+				   rail->path.cfg.eof_mask);
 			seq_printf(s,
 				   "    data_rx_completed=%lld data_rx_credit_sent=%lld data_rx_credit_send_error=%lld data_rx_repost_failed=%lld rx_credit_pending=%u\n",
 				   atomic64_read(&rail->path.data_rx_completed),

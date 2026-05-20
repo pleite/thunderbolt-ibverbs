@@ -880,7 +880,8 @@ int tbv_path_alloc_rings(struct tbv_path *path, struct tb_xdomain *xd,
 					 path->cfg.rx_ring_size,
 					 path->cfg.rx_flags, e2e_tx_hop,
 					 path->cfg.sof_mask,
-					 path->cfg.eof_mask, NULL, NULL);
+					 path->cfg.eof_mask,
+					 NULL, NULL);
 	if (!path->rx_ring) {
 		tb_xdomain_release_out_hopid(xd, path->local_transmit_path);
 		path->local_transmit_path = -1;
@@ -1651,6 +1652,28 @@ static void tbv_path_release_packet_list_silent(struct list_head *packets,
 	}
 }
 
+struct tbv_path_cancel_done {
+	tbv_path_tx_done_fn done;
+	void *ctx;
+};
+
+static void tbv_path_cancel_record_done(struct tbv_path_cancel_done *done,
+					u32 *done_count, u32 done_max,
+					struct tbv_tx_packet *packet)
+{
+	if (!packet || !packet->done)
+		return;
+	if (*done_count >= done_max)
+		return;
+
+	done[*done_count].done = packet->done;
+	done[*done_count].ctx = packet->done_ctx;
+	(*done_count)++;
+	packet->done = NULL;
+	packet->done_ctx = NULL;
+	packet->owner_ctx = NULL;
+}
+
 static void tbv_path_release_owned_frame_list(struct list_head *frames)
 {
 	while (!list_empty(frames)) {
@@ -1883,18 +1906,26 @@ static bool tbv_path_packet_matches(const struct tbv_tx_packet *packet,
 	       packet->done_ctx == done_ctx;
 }
 
-static u32 tbv_path_cancel_data_match(struct tbv_path *path,
-				      tbv_path_tx_done_fn done, void *done_ctx,
-				      void *owner_ctx)
+static void tbv_path_cancel_data_match(struct tbv_path *path,
+				       tbv_path_tx_done_fn done, void *done_ctx,
+				       void *owner_ctx)
 {
 	struct tbv_tx_packet *packet;
 	struct tbv_tx_packet *tmp;
+	struct tbv_path_cancel_done *done_list;
 	LIST_HEAD(cancel);
 	unsigned long flags;
 	u32 i;
+	u32 done_count = 0;
+	u32 done_max;
 
 	if ((!done || !done_ctx) && !owner_ctx)
-		return 0;
+		return;
+
+	done_max = max_t(u32, path->tx_frame_count, 1);
+	done_list = kvcalloc(done_max, sizeof(*done_list), GFP_KERNEL);
+	if (!done_list)
+		return;
 
 	spin_lock_irqsave(&path->tx_lock, flags);
 	list_for_each_entry_safe(packet, tmp, &path->tx_data_queue, node) {
@@ -1903,10 +1934,10 @@ static u32 tbv_path_cancel_data_match(struct tbv_path *path,
 			continue;
 		list_del_init(&packet->node);
 		packet->queued = false;
-		if (path->tx_data_queued)
-			path->tx_data_queued--;
-		packet->owner_ctx = NULL;
-		list_add_tail(&packet->node, &cancel);
+			if (path->tx_data_queued)
+				path->tx_data_queued--;
+			packet->owner_ctx = NULL;
+			list_add_tail(&packet->node, &cancel);
 	}
 
 	for (i = 0; i < path->tx_frame_count; i++) {
@@ -1917,7 +1948,10 @@ static u32 tbv_path_cancel_data_match(struct tbv_path *path,
 		    !tbv_path_packet_matches(packet, done, done_ctx,
 					     owner_ctx))
 			continue;
-		packet->owner_ctx = NULL;
+		tbv_path_cancel_record_done(done_list, &done_count, done_max,
+					    packet);
+		f->done = NULL;
+		f->done_ctx = NULL;
 	}
 
 	list_for_each_entry_safe(packet, tmp, &path->tx_zcopy_inflight, node) {
@@ -1926,7 +1960,8 @@ static u32 tbv_path_cancel_data_match(struct tbv_path *path,
 			continue;
 		list_del_init(&packet->node);
 		packet->inflight = false;
-		packet->owner_ctx = NULL;
+		tbv_path_cancel_record_done(done_list, &done_count, done_max,
+					    packet);
 	}
 	spin_unlock_irqrestore(&path->tx_lock, flags);
 
@@ -1936,18 +1971,21 @@ static u32 tbv_path_cancel_data_match(struct tbv_path *path,
 		tbv_path_tx_packet_release(packet, -ECANCELED);
 	}
 
-	return 0;
+	for (i = 0; i < done_count; i++)
+		done_list[i].done(done_list[i].ctx, -ECANCELED);
+
+	kvfree(done_list);
 }
 
-u32 tbv_path_cancel_data_done_ctx(struct tbv_path *path,
-				  tbv_path_tx_done_fn done, void *done_ctx)
+void tbv_path_cancel_data_done_ctx(struct tbv_path *path,
+				   tbv_path_tx_done_fn done, void *done_ctx)
 {
-	return tbv_path_cancel_data_match(path, done, done_ctx, NULL);
+	tbv_path_cancel_data_match(path, done, done_ctx, NULL);
 }
 
-u32 tbv_path_cancel_data_owner_ctx(struct tbv_path *path, void *owner_ctx)
+void tbv_path_cancel_data_owner_ctx(struct tbv_path *path, void *owner_ctx)
 {
-	return tbv_path_cancel_data_match(path, NULL, NULL, owner_ctx);
+	tbv_path_cancel_data_match(path, NULL, NULL, owner_ctx);
 }
 
 static void tbv_path_flush_tx_queue(struct tbv_path *path, int status)

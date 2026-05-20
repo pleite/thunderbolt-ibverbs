@@ -100,6 +100,7 @@ struct tbv_peer *tbv_peer_get_or_create(struct tbv_state *state,
 	peer->backend = backend;
 	peer->xd = tb_xdomain_get(xd);
 	INIT_LIST_HEAD(&peer->rails);
+	mutex_init(&peer->control_lock);
 
 	mutex_lock(&state->lock);
 	list_for_each_entry(pos, &state->peers, node) {
@@ -201,8 +202,13 @@ struct tbv_rail *tbv_peer_add_rail(struct tbv_peer *peer,
 	rail->native_remote_ready = false;
 	tbv_native_control_init_rail(rail, peer);
 	tbv_path_default_config(peer->backend, &path_cfg);
-	if (peer->backend == TBV_BACKEND_NATIVE &&
-	    peer->state->cfg.profile == TBV_PROFILE_LINUX_PERF) {
+	if (peer->backend == TBV_BACKEND_NATIVE) {
+		/*
+		 * Native rails only bind to Linux peers.  Even in mixed mode the
+		 * Mac-facing wire format is handled by the separate Apple
+		 * backend, so native can keep the hardware E2E delivery contract
+		 * needed for RC semantics.
+		 */
 		path_cfg.tx_flags |= RING_FLAG_E2E;
 		path_cfg.rx_flags |= RING_FLAG_E2E;
 		path_cfg.e2e = true;
