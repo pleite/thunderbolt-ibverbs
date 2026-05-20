@@ -40,7 +40,14 @@
 #define TBV_APPLE_PRIMARY_QPN TBV_IBDEV_QPN_MIN
 #define TBV_IBDEV_PAGE_SIZE_CAP (SZ_4K | SZ_2M | SZ_1G)
 #define TBV_PSN_MASK 0x00ffffffu
-#define TBV_RX_REORDER_MAX_MESSAGES 64
+/*
+ * Native SEND receives can observe future PSNs when Thunderbolt paths deliver
+ * fragments out of order under load.  The provider advertises
+ * TBV_IBDEV_MAX_QP_WR outstanding WRs, so the receive-side reorder window must
+ * cover that contract instead of failing legal traffic at an arbitrary smaller
+ * depth.
+ */
+#define TBV_RX_REORDER_MAX_MESSAGES TBV_IBDEV_MAX_QP_WR
 #define TBV_RX_REORDER_MAX_BYTES (64u * 1024u * 1024u)
 #define TBV_RX_REORDER_MAX_FRAGS TBV_NATIVE_DATA_MAX_FRAGS
 #define TBV_IBDEV_GID_TBL_LEN 8
@@ -171,21 +178,29 @@ struct tbv_rx_message {
 	bool solicited;
 };
 
+struct tbv_rx_reorder_frag {
+	struct list_head node;
+	u32 offset;
+	u32 len;
+	u8 data[];
+};
+
 struct tbv_rx_reorder_msg {
 	struct list_head node;
+	struct list_head frags;
 	unsigned long first_jiffies;
 	u32 src_qp;
 	u32 psn;
 	u32 total_len;
 	u32 imm_data;
 	u32 received;
+	u32 buffered_bytes;
 	u16 frag_count;
 	u16 frags_received;
 	DECLARE_BITMAP(frag_seen, TBV_RX_REORDER_MAX_FRAGS);
 	bool complete;
 	bool with_imm;
 	bool solicited;
-	void *buf;
 };
 
 struct tbv_apple_pending_rx {
@@ -3930,9 +3945,15 @@ static int tbv_rx_copy_to_wqe(struct tbv_state *state,
 
 static void tbv_rx_reorder_free_msg(struct tbv_rx_reorder_msg *msg)
 {
+	struct tbv_rx_reorder_frag *frag;
+	struct tbv_rx_reorder_frag *tmp;
+
 	if (!msg)
 		return;
-	kvfree(msg->buf);
+	list_for_each_entry_safe(frag, tmp, &msg->frags, node) {
+		list_del(&frag->node);
+		kfree(frag);
+	}
 	kfree(msg);
 }
 
@@ -3997,6 +4018,47 @@ static bool tbv_rx_fragment_shape(u32 total_len, u32 offset, u32 len,
 	return true;
 }
 
+static void tbv_rx_reorder_unlink_msg_locked(struct tbv_qp *tqp,
+					     struct tbv_rx_reorder_msg *msg)
+{
+	list_del(&msg->node);
+	tqp->rx_reorder_count--;
+	if (tqp->rx_reorder_bytes >= msg->buffered_bytes)
+		tqp->rx_reorder_bytes -= msg->buffered_bytes;
+	else
+		tqp->rx_reorder_bytes = 0;
+}
+
+static int tbv_rx_reorder_store_fragment_locked(struct tbv_qp *tqp,
+						struct tbv_rx_reorder_msg *msg,
+						u32 offset, const void *payload,
+						u32 len)
+{
+	struct tbv_rx_reorder_frag *frag;
+	u32 new_bytes;
+
+	if (!len)
+		return 0;
+
+	if (check_add_overflow(tqp->rx_reorder_bytes, len, &new_bytes) ||
+	    new_bytes > TBV_RX_REORDER_MAX_BYTES)
+		return -ENOSPC;
+
+	frag = kmalloc(struct_size(frag, data, len), GFP_KERNEL);
+	if (!frag)
+		return -ENOMEM;
+
+	INIT_LIST_HEAD(&frag->node);
+	frag->offset = offset;
+	frag->len = len;
+	memcpy(frag->data, payload, len);
+	list_add_tail(&frag->node, &msg->frags);
+
+	msg->buffered_bytes += len;
+	tqp->rx_reorder_bytes = new_bytes;
+	return 0;
+}
+
 static void tbv_rx_finish_send(struct tbv_state *state, struct tbv_qp *tqp,
 			       struct tbv_path *rx_path)
 {
@@ -4044,6 +4106,7 @@ static bool tbv_rx_deliver_reorder_msg_locked(struct tbv_state *state,
 					      struct tbv_path *rx_path,
 					      struct tbv_rx_reorder_msg *msg)
 {
+	struct tbv_rx_reorder_frag *frag;
 	struct tbv_cq *recv_cq = container_of(tqp->base.recv_cq,
 					      struct tbv_cq, base);
 	struct tbv_recv_wqe wqe;
@@ -4057,15 +4120,17 @@ static bool tbv_rx_deliver_reorder_msg_locked(struct tbv_state *state,
 		return false;
 	}
 
-	list_del(&msg->node);
-	tqp->rx_reorder_count--;
-	tqp->rx_reorder_bytes -= msg->total_len;
+	tbv_rx_reorder_unlink_msg_locked(tqp, msg);
 
 	status = msg->total_len > wqe.length ? IB_WC_LOC_LEN_ERR :
 					       IB_WC_SUCCESS;
-	if (msg->total_len && tbv_rx_copy_to_wqe(state, &wqe, 0, msg->buf,
-						 msg->total_len, &delivered))
-		status = IB_WC_LOC_PROT_ERR;
+	list_for_each_entry(frag, &msg->frags, node) {
+		if (tbv_rx_copy_to_wqe(state, &wqe, frag->offset, frag->data,
+				       frag->len, &delivered)) {
+			status = IB_WC_LOC_PROT_ERR;
+			break;
+		}
+	}
 
 	wc.wr_id = wqe.wr_id;
 	wc.status = status;
@@ -4112,9 +4177,7 @@ static void tbv_rx_drop_reorder_msg_locked(struct tbv_state *state,
 					   struct tbv_qp *tqp,
 					   struct tbv_rx_reorder_msg *msg)
 {
-	list_del(&msg->node);
-	tqp->rx_reorder_count--;
-	tqp->rx_reorder_bytes -= msg->total_len;
+	tbv_rx_reorder_unlink_msg_locked(tqp, msg);
 	atomic64_inc(&state->data_rx_reorder_dropped);
 	tbv_rx_reorder_free_msg(msg);
 }
@@ -4132,6 +4195,7 @@ static void tbv_rx_buffer_fragment_locked(struct tbv_state *state,
 	u32 imm_data = with_imm ? hdr->rkey : 0;
 	u32 frag_idx;
 	u32 frag_count;
+	int ret;
 
 	if (delta < 0) {
 		tbv_send_ack_on_path(state, rx_path, hdr->src_qp,
@@ -4153,12 +4217,7 @@ static void tbv_rx_buffer_fragment_locked(struct tbv_state *state,
 
 	msg = tbv_rx_reorder_find(tqp, psn);
 	if (!msg) {
-		u32 new_bytes = tqp->rx_reorder_bytes;
-
-		if (tqp->rx_reorder_count >= TBV_RX_REORDER_MAX_MESSAGES ||
-		    check_add_overflow(tqp->rx_reorder_bytes, total_len,
-				       &new_bytes) ||
-		    new_bytes > TBV_RX_REORDER_MAX_BYTES) {
+		if (tqp->rx_reorder_count >= TBV_RX_REORDER_MAX_MESSAGES) {
 			atomic64_inc(&state->data_rx_reorder_window);
 			tbv_send_ack_on_path(state, rx_path, hdr->src_qp,
 					     hdr->dest_qp, psn, 1);
@@ -4171,17 +4230,8 @@ static void tbv_rx_buffer_fragment_locked(struct tbv_state *state,
 					     hdr->dest_qp, psn, 1);
 			return;
 		}
-		if (total_len) {
-			msg->buf = kvzalloc(total_len, GFP_KERNEL);
-			if (!msg->buf) {
-				kfree(msg);
-				tbv_send_ack_on_path(state, rx_path,
-						     hdr->src_qp,
-						     hdr->dest_qp, psn, 1);
-				return;
-			}
-		}
 
+		INIT_LIST_HEAD(&msg->frags);
 		msg->first_jiffies = jiffies;
 		msg->src_qp = hdr->src_qp;
 		msg->psn = psn;
@@ -4192,7 +4242,6 @@ static void tbv_rx_buffer_fragment_locked(struct tbv_state *state,
 		msg->solicited = hdr->flags & TBV_NATIVE_DATA_F_SOLICITED;
 		list_add_tail(&msg->node, &tqp->rx_reorder);
 		tqp->rx_reorder_count++;
-		tqp->rx_reorder_bytes = new_bytes;
 		atomic64_inc(&state->data_rx_reorder_buffered);
 		tbv_qp_schedule_timeout(tqp);
 	} else if (msg->src_qp != hdr->src_qp ||
@@ -4207,8 +4256,16 @@ static void tbv_rx_buffer_fragment_locked(struct tbv_state *state,
 		return;
 	}
 
-	if (hdr->length && msg->buf)
-		memcpy((u8 *)msg->buf + offset, payload, hdr->length);
+	ret = tbv_rx_reorder_store_fragment_locked(tqp, msg, offset, payload,
+						   hdr->length);
+	if (ret) {
+		if (ret == -ENOSPC)
+			atomic64_inc(&state->data_rx_reorder_window);
+		tbv_rx_drop_reorder_msg_locked(state, tqp, msg);
+		tbv_send_ack_on_path(state, rx_path, hdr->src_qp, hdr->dest_qp,
+				     psn, 1);
+		return;
+	}
 	set_bit(frag_idx, msg->frag_seen);
 	msg->frags_received++;
 	msg->received += hdr->length;
