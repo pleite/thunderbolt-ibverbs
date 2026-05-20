@@ -474,8 +474,10 @@ const char *tbv_backend_name(enum tbv_backend_type type);
 int tbv_ibdev_start(struct tbv_state *state, bool register_verbs);
 void tbv_ibdev_stop(struct tbv_state *state);
 const char *tbv_ibdev_roce_netdev_name(void);
-void tbv_ibdev_rx_frame(struct tbv_state *state, const void *data, u32 len);
+void tbv_ibdev_rx_frame(struct tbv_state *state, struct tbv_path *rx_path,
+			const void *data, u32 len);
 void tbv_ibdev_rx_native_frame(struct tbv_state *state,
+			       struct tbv_path *rx_path,
 			       const struct tbv_native_data_header *hdr,
 			       const void *payload);
 void tbv_ibdev_rx_apple_frame(struct tbv_state *state,

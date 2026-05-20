@@ -346,7 +346,7 @@ static void tbv_path_rx_raw_payload(struct tbv_path *path,
 	path->rx_raw_done += len;
 	path->rx_raw_remaining -= len;
 	if (state)
-		tbv_ibdev_rx_native_frame(state, &hdr, payload);
+		tbv_ibdev_rx_native_frame(state, path, &hdr, payload);
 }
 
 static void tbv_path_zcopy_tx_complete(struct tb_ring *ring,
@@ -420,7 +420,7 @@ static void tbv_path_rx_complete(struct tb_ring *ring, struct ring_frame *frame,
 				tbv_path_rx_start_raw(path, &hdr);
 			}
 		} else {
-			tbv_ibdev_rx_frame(state, f->buf, len);
+			tbv_ibdev_rx_frame(state, path, f->buf, len);
 		}
 	} else if (state) {
 		atomic64_inc(&state->data_rx_bad_frame);
