@@ -299,6 +299,7 @@ struct tbv_read_req_work {
 	struct work_struct work;
 	struct tbv_state *state;
 	struct tbv_qp *tqp;
+	struct tbv_path *rx_path;
 	struct tbv_native_data_header hdr;
 };
 
@@ -945,6 +946,51 @@ static void tbv_release_path_refs(struct tbv_path **paths, u32 path_count)
 		if (paths[i] && paths[i]->rail)
 			tbv_rail_put(paths[i]->rail);
 	}
+}
+
+static struct tbv_path *tbv_path_get_for_response(struct tbv_path *path)
+{
+	struct tbv_rail *rail;
+
+	if (!path)
+		return NULL;
+
+	rail = path->rail;
+	if (!rail || !refcount_inc_not_zero(&rail->refcnt))
+		return NULL;
+
+	if (!tbv_rail_data_ready(rail) || rail->removing) {
+		tbv_rail_put(rail);
+		return NULL;
+	}
+
+	return path;
+}
+
+static void tbv_path_put_response(struct tbv_path *path)
+{
+	if (path && path->rail)
+		tbv_rail_put(path->rail);
+}
+
+static struct tbv_path *
+tbv_select_read_response_path(struct tbv_state *state, struct tbv_path *rx_path,
+			      u32 selector, bool *selected_ref)
+{
+	struct tbv_path *path;
+
+	*selected_ref = false;
+
+	if (rx_path && rx_path->rail && tbv_rail_data_ready(rx_path->rail) &&
+	    !rx_path->rail->removing)
+		return rx_path;
+
+	mutex_lock(&state->lock);
+	path = tbv_select_native_data_path_get_locked(state, selector);
+	mutex_unlock(&state->lock);
+	if (path)
+		*selected_ref = true;
+	return path;
 }
 
 static void tbv_kick_paths(struct tbv_path **paths, u32 path_count)
@@ -3467,14 +3513,6 @@ static void tbv_send_read_status_on_path(struct tbv_state *state,
 	tbv_send_control_frame_on_path(state, rx_path, frame, len);
 }
 
-static void tbv_send_read_status(struct tbv_state *state, u32 dest_qp,
-				 u32 src_qp, u32 psn, u32 total_len,
-				 int status)
-{
-	tbv_send_read_status_on_path(state, NULL, dest_qp, src_qp, psn,
-				     total_len, status);
-}
-
 static int tbv_send_recv_credit(struct tbv_state *state, u32 dest_qp,
 				u32 src_qp, u32 credits)
 {
@@ -4410,11 +4448,13 @@ static int tbv_read_resp_next_page(void *ctx, struct page **page,
 
 static int tbv_send_read_response_zcopy(struct tbv_state *state,
 					const struct tbv_native_data_header *req,
-					struct tbv_mr *mr)
+					struct tbv_mr *mr,
+					struct tbv_path *rx_path)
 {
 	struct tbv_read_resp_stream *stream;
 	struct tbv_native_data_header resp = {};
 	struct tbv_path *path;
+	bool selected_ref = false;
 	int ret;
 
 	stream = kzalloc(sizeof(*stream), GFP_KERNEL);
@@ -4432,10 +4472,9 @@ static int tbv_send_read_response_zcopy(struct tbv_state *state,
 	resp.psn = req->psn;
 	resp.imm_data = req->imm_data;
 
-	mutex_lock(&state->lock);
-	path = tbv_select_native_data_path_get_locked(state,
-						     req->src_qp ^ req->psn);
-	mutex_unlock(&state->lock);
+	path = tbv_select_read_response_path(state, rx_path,
+					     req->src_qp ^ req->psn,
+					     &selected_ref);
 	if (!path) {
 		ret = -ENOTCONN;
 		goto out_put_stream;
@@ -4444,7 +4483,8 @@ static int tbv_send_read_response_zcopy(struct tbv_state *state,
 	ret = tbv_path_send_page_stream(path, &resp, req->imm_data, 0,
 					NULL, NULL,
 					tbv_read_resp_next_page, stream);
-	tbv_release_path_refs(&path, 1);
+	if (selected_ref)
+		tbv_release_path_refs(&path, 1);
 
 out_put_stream:
 	tbv_read_resp_stream_put(stream);
@@ -4453,7 +4493,8 @@ out_put_stream:
 
 static int tbv_send_read_response_copy(struct tbv_state *state,
 				       const struct tbv_native_data_header *req,
-				       struct tbv_mr *mr)
+				       struct tbv_mr *mr,
+				       struct tbv_path *rx_path)
 {
 	struct tbv_path *path;
 	u32 total_len = req->imm_data;
@@ -4462,12 +4503,12 @@ static int tbv_send_read_response_copy(struct tbv_state *state,
 	u32 offset = 0;
 	u32 remaining = nfrags;
 	bool sent_any = false;
+	bool selected_ref = false;
 	int ret = 0;
 
-	mutex_lock(&state->lock);
-	path = tbv_select_native_data_path_get_locked(state,
-						     req->src_qp ^ req->psn);
-	mutex_unlock(&state->lock);
+	path = tbv_select_read_response_path(state, rx_path,
+					     req->src_qp ^ req->psn,
+					     &selected_ref);
 	if (!path)
 		return -ENOTCONN;
 
@@ -4527,7 +4568,8 @@ static int tbv_send_read_response_copy(struct tbv_state *state,
 	} while (offset < total_len);
 
 	tbv_path_kick_tx(path);
-	tbv_release_path_refs(&path, 1);
+	if (selected_ref)
+		tbv_release_path_refs(&path, 1);
 	return 0;
 
 out_release_reservation:
@@ -4535,7 +4577,8 @@ out_release_reservation:
 	if (sent_any)
 		tbv_path_kick_tx(path);
 out_put_path:
-	tbv_release_path_refs(&path, 1);
+	if (selected_ref)
+		tbv_release_path_refs(&path, 1);
 	return ret;
 }
 
@@ -4546,6 +4589,7 @@ static void tbv_read_req_workfn(struct work_struct *work)
 	struct tbv_native_data_header *req = &req_work->hdr;
 	struct tbv_state *state = req_work->state;
 	struct tbv_qp *tqp = req_work->tqp;
+	struct tbv_path *rx_path = req_work->rx_path;
 	struct tbv_mr *mr;
 	u64 addr;
 	int ret = 0;
@@ -4577,18 +4621,19 @@ static void tbv_read_req_workfn(struct work_struct *work)
 		goto out_put_mr_status;
 
 	if (!req->imm_data) {
-		tbv_send_read_status(state, req->src_qp, req->dest_qp,
-				     req->psn, 0, 0);
+		tbv_send_read_status_on_path(state, rx_path, req->src_qp,
+					     req->dest_qp, req->psn, 0, 0);
 		goto out_put_mr;
 	}
 
 	if (!zcopy_min_bytes || req->imm_data < zcopy_min_bytes)
-		ret = tbv_send_read_response_copy(state, req, mr);
+		ret = tbv_send_read_response_copy(state, req, mr, rx_path);
 	else
-		ret = tbv_send_read_response_zcopy(state, req, mr);
+		ret = tbv_send_read_response_zcopy(state, req, mr, rx_path);
 	if (ret)
-		tbv_send_read_status(state, req->src_qp, req->dest_qp,
-				     req->psn, req->imm_data, ret);
+		tbv_send_read_status_on_path(state, rx_path, req->src_qp,
+					     req->dest_qp, req->psn,
+					     req->imm_data, ret);
 
 out_put_mr:
 	tbv_mr_put(mr);
@@ -4597,10 +4642,12 @@ out_put_mr:
 out_put_mr_status:
 	tbv_mr_put(mr);
 out_put_qp_status:
-	tbv_send_read_status(state, req->src_qp, req->dest_qp, req->psn,
-			     req->imm_data, ret);
+	tbv_send_read_status_on_path(state, rx_path, req->src_qp,
+				     req->dest_qp, req->psn, req->imm_data,
+				     ret);
 out_free:
 	tbv_qp_put(tqp);
+	tbv_path_put_response(rx_path);
 	kfree(req_work);
 }
 
@@ -4633,6 +4680,7 @@ static void tbv_rx_handle_rdma_read_req(struct tbv_state *state,
 	INIT_WORK(&work->work, tbv_read_req_workfn);
 	work->state = state;
 	work->tqp = tqp;
+	work->rx_path = tbv_path_get_for_response(rx_path);
 	work->hdr = *hdr;
 	queue_work(state->workqueue ? state->workqueue : system_unbound_wq,
 		   &work->work);
