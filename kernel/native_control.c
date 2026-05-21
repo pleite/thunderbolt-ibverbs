@@ -287,6 +287,50 @@ out:
 	return ret;
 }
 
+static int tbv_native_control_mark_local_ready_sent(
+	struct tbv_state *state, const struct tb_xdomain *source_xd,
+	const struct tbv_native_wire_info *info, u32 rail_id)
+{
+	struct tbv_peer *peer;
+	int ret = -ENOENT;
+
+	mutex_lock(&state->lock);
+	list_for_each_entry(peer, &state->peers, node) {
+		struct tbv_rail *rail;
+
+		if (peer->backend != TBV_BACKEND_NATIVE)
+			continue;
+		if (!tbv_native_control_peer_matches_source(peer, source_xd))
+			continue;
+
+		list_for_each_entry(rail, &peer->rails, node) {
+			if (rail->key.route != info->route ||
+			    rail->rail_id != rail_id)
+				continue;
+
+			rail->native_ready_sent = true;
+			rail->native_last_error = 0;
+			ret = 0;
+			goto out;
+		}
+	}
+
+out:
+	mutex_unlock(&state->lock);
+	return ret;
+}
+
+static bool tbv_native_control_rail_data_ready(struct tbv_state *state,
+					       const struct tbv_rail *rail)
+{
+	bool ready;
+
+	mutex_lock(&state->lock);
+	ready = tbv_rail_data_ready(rail);
+	mutex_unlock(&state->lock);
+	return ready;
+}
+
 int tbv_native_control_handle_packet(struct tbv_state *state,
 				     struct tb_xdomain *source_xd,
 				     const void *buf, size_t size)
@@ -329,11 +373,25 @@ int tbv_native_control_handle_packet(struct tbv_state *state,
 		memset(&local, 0, sizeof(local));
 		ret = tbv_native_control_snapshot(state, source_xd, &info,
 						  remote.rail_id, true,
+						  false,
+						  &local, &xd);
+		if (ret) {
+			pr_warn_ratelimited("native READY route=0x%llx rail=0x%x has no matching peer rail\n",
+					    info.route, remote.rail_id);
+			return 1;
+		}
+		tb_xdomain_put(xd);
+		xd = NULL;
+		ret = tbv_native_control_snapshot(state, source_xd, &info,
+						  remote.rail_id, true,
 						  true,
 						  &local, &xd);
 		if (ret) {
-			pr_warn_ratelimited("native READY route=0x%llx rail=0x%x has no tunnel-enabled peer rail\n",
-					    info.route, remote.rail_id);
+			tbv_native_control_mark_remote_ready(state, source_xd,
+							    &info, &remote);
+			tbv_native_control_kick_matching_rail(state, source_xd,
+							      &info,
+							      remote.rail_id);
 			return 1;
 		}
 
@@ -355,6 +413,10 @@ int tbv_native_control_handle_packet(struct tbv_state *state,
 		if (ret < 0)
 			pr_warn("native READY_ACK route=0x%llx rail=0x%x failed: %d\n",
 				info.route, remote.rail_id, ret);
+		else
+			tbv_native_control_mark_local_ready_sent(state,
+								source_xd, &info,
+								local.rail_id);
 
 		tb_xdomain_put(xd);
 		tbv_native_control_kick_matching_rail(state, source_xd, &info,
@@ -639,6 +701,8 @@ static void tbv_native_control_work(struct work_struct *work)
 	    !rail->native_ready_sent) {
 		attempt = ++rail->native_ready_attempts;
 		ret = tbv_native_control_ready_once(state, peer, rail);
+		if (ret && tbv_native_control_rail_data_ready(state, rail))
+			ret = 0;
 		rail->native_last_error = ret;
 		if (ret) {
 			if (attempt < TBV_NATIVE_READY_RETRIES) {
