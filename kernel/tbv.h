@@ -430,6 +430,18 @@ struct tbv_state {
 	atomic64_t data_read_resp_drop;
 	atomic64_t data_rx_read_resp_duplicate;
 	atomic64_t data_rx_read_resp_gap;
+	atomic64_t data_rx_read_resp_remote_error;
+	atomic64_t data_rx_read_resp_bad_header;
+	atomic64_t data_rx_read_resp_copy_error;
+	atomic64_t data_rx_read_resp_short;
+	atomic64_t data_rx_read_req_no_access;
+	atomic64_t data_rx_read_req_no_mr;
+	atomic64_t data_rx_read_req_mr_access;
+	atomic64_t data_rx_read_req_too_large;
+	atomic64_t data_rx_read_req_bad_iova;
+	atomic64_t data_rx_read_req_alloc_error;
+	atomic64_t data_rx_read_req_resp_busy;
+	atomic64_t data_rx_read_req_resp_error;
 	atomic64_t data_rx_no_qp;
 	atomic64_t data_rx_bad_peer;
 	atomic64_t data_rx_unconnected_qp;

@@ -331,6 +331,7 @@ struct tbv_read_resp_ctx {
 	refcount_t refs;
 	unsigned long queued_jiffies;
 	u8 retries;
+	bool response_sent;
 	bool retrying;
 	bool closing;
 	struct tbv_native_data_header req;
@@ -766,6 +767,20 @@ static void tbv_qp_arm_read_resp_timeout(struct tbv_qp *tqp,
 
 	spin_lock_irqsave(&tqp->lock, flags);
 	if (!list_empty(&ctx->node) && !ctx->queued_jiffies) {
+		ctx->queued_jiffies = jiffies;
+		tbv_qp_schedule_timeout_locked(tqp);
+	}
+	spin_unlock_irqrestore(&tqp->lock, flags);
+}
+
+static void tbv_qp_note_read_resp_sent(struct tbv_qp *tqp,
+				       struct tbv_read_resp_ctx *ctx)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&tqp->lock, flags);
+	if (!list_empty(&ctx->node) && !ctx->closing) {
+		ctx->response_sent = true;
 		ctx->queued_jiffies = jiffies;
 		tbv_qp_schedule_timeout_locked(tqp);
 	}
@@ -2002,7 +2017,6 @@ static bool tbv_qp_timeout_reap_read_resps(struct tbv_qp *tqp,
 		}
 
 		ctx->retrying = true;
-		ctx->retries++;
 		ctx->queued_jiffies = now;
 		tbv_read_resp_ctx_get(ctx);
 		list_add_tail(&ctx->retry_node, retry);
@@ -2072,18 +2086,46 @@ static void tbv_qp_timeout_work(struct work_struct *work)
 			list_first_entry(&retry_read_resps,
 					 struct tbv_read_resp_ctx,
 					 retry_node);
+		struct tbv_state *state = tqp->owner;
 		bool closing;
+		bool attempted = false;
+		bool was_sent = false;
 		int ret = 0;
 
 		list_del_init(&ctx->retry_node);
-		if (!READ_ONCE(ctx->closing)) {
-			atomic64_inc(&tqp->owner->data_read_resp_retransmit);
+		spin_lock_irqsave(&tqp->lock, flags);
+		closing = ctx->closing;
+		was_sent = ctx->response_sent;
+		spin_unlock_irqrestore(&tqp->lock, flags);
+		if (!closing) {
+			attempted = true;
 			ret = tbv_send_read_response_ctx(ctx);
 		}
-		if (ret)
-			atomic64_inc(&tqp->owner->data_wr_path_send_error);
+
+		if (attempted) {
+			if (!ret && was_sent)
+				atomic64_inc(&state->data_read_resp_retransmit);
+			else if (ret == -ENOMEM)
+				atomic64_inc(&state->data_rx_read_req_resp_busy);
+			else if (ret)
+				atomic64_inc(&state->data_wr_path_send_error);
+		}
 
 		spin_lock_irqsave(&tqp->lock, flags);
+		if (!ctx->closing) {
+			if (!ret) {
+				if (was_sent && ctx->retries < U8_MAX)
+					ctx->retries++;
+				ctx->response_sent = true;
+				ctx->queued_jiffies = jiffies;
+			} else if (ret != -ENOMEM) {
+				if (ctx->retries < U8_MAX)
+					ctx->retries++;
+				ctx->queued_jiffies = jiffies;
+			} else {
+				ctx->queued_jiffies = jiffies;
+			}
+		}
 		ctx->retrying = false;
 		closing = ctx->closing;
 		spin_unlock_irqrestore(&tqp->lock, flags);
@@ -4912,27 +4954,33 @@ static void tbv_read_req_workfn(struct work_struct *work)
 		goto out_free;
 
 	if (!(tqp->attr.qp_access_flags & IB_ACCESS_REMOTE_READ)) {
+		atomic64_inc(&state->data_rx_read_req_no_access);
 		ret = -EACCES;
 		goto out_put_qp_status;
 	}
 
 	mr = tbv_mr_get(state, req->rkey);
 	if (!mr) {
+		atomic64_inc(&state->data_rx_read_req_no_mr);
 		ret = -EACCES;
 		goto out_put_qp_status;
 	}
 	if (!(mr->access & IB_ACCESS_REMOTE_READ)) {
+		atomic64_inc(&state->data_rx_read_req_mr_access);
 		ret = -EACCES;
 		goto out_put_mr_status;
 	}
 	if (req->imm_data > TBV_NATIVE_DATA_MAX_MSG_SIZE) {
+		atomic64_inc(&state->data_rx_read_req_too_large);
 		ret = -EMSGSIZE;
 		goto out_put_mr_status;
 	}
 	ret = tbv_umem_iova_to_addr(mr, req->remote_addr, req->imm_data,
 				    &addr);
-	if (ret)
+	if (ret) {
+		atomic64_inc(&state->data_rx_read_req_bad_iova);
 		goto out_put_mr_status;
+	}
 
 	if (!req->imm_data) {
 		tbv_send_read_status_on_path(state, rx_path, req->src_qp,
@@ -4946,6 +4994,7 @@ static void tbv_read_req_workfn(struct work_struct *work)
 
 		resp = tbv_read_resp_ctx_alloc(tqp, mr, rx_path, req);
 		if (!resp) {
+			atomic64_inc(&state->data_rx_read_req_alloc_error);
 			ret = -ENOMEM;
 			goto out_send_status;
 		}
@@ -4953,15 +5002,29 @@ static void tbv_read_req_workfn(struct work_struct *work)
 		tbv_qp_queue_read_resp(tqp, resp);
 		ret = tbv_send_read_response_ctx(resp);
 		if (!ret)
-			tbv_qp_arm_read_resp_timeout(tqp, resp);
+			tbv_qp_note_read_resp_sent(tqp, resp);
 		if (ret) {
-			taken = tbv_qp_take_read_resp(tqp, req->psn);
-			if (taken)
-				tbv_read_resp_ctx_put(taken);
+			if (ret == -ENOMEM) {
+				/*
+				 * Transient responder TX pressure: keep the
+				 * response queued and let the retry timer send it.
+				 */
+				atomic64_inc(&state->data_rx_read_req_resp_busy);
+				tbv_qp_arm_read_resp_timeout(tqp, resp);
+				ret = 0;
+			} else {
+				taken = tbv_qp_take_read_resp(tqp, req->psn);
+				if (taken)
+					tbv_read_resp_ctx_put(taken);
+			}
 		}
 		tbv_read_resp_ctx_put(resp);
 	}
 	if (ret) {
+		if (ret == -ENOMEM)
+			atomic64_inc(&state->data_rx_read_req_resp_busy);
+		else
+			atomic64_inc(&state->data_rx_read_req_resp_error);
 out_send_status:
 		tbv_send_read_status_on_path(state, rx_path, req->src_qp,
 					     req->dest_qp, req->psn,
@@ -5041,6 +5104,7 @@ static void tbv_rx_handle_rdma_read_resp(struct tbv_state *state,
 
 	mutex_lock(&read->data_lock);
 	if (hdr->rkey) {
+		atomic64_inc(&state->data_rx_read_resp_remote_error);
 		ret = -EIO;
 		goto complete_ack;
 	}
@@ -5050,6 +5114,7 @@ static void tbv_rx_handle_rdma_read_resp(struct tbv_state *state,
 			       &next_received) ||
 	    next_received > read->total_len ||
 	    (hdr->flags & ~(TBV_NATIVE_DATA_F_LAST | TBV_NATIVE_DATA_F_SOLICITED))) {
+		atomic64_inc(&state->data_rx_read_resp_bad_header);
 		ret = -EINVAL;
 		goto complete_ack;
 	}
@@ -5071,8 +5136,10 @@ static void tbv_rx_handle_rdma_read_resp(struct tbv_state *state,
 
 	ret = tbv_copy_to_read_segments(read, hdr->remote_addr, payload,
 					hdr->length);
-	if (ret)
+	if (ret) {
+		atomic64_inc(&state->data_rx_read_resp_copy_error);
 		goto complete_ack;
+	}
 
 	read->received = next_received;
 	if (!last) {
@@ -5080,8 +5147,10 @@ static void tbv_rx_handle_rdma_read_resp(struct tbv_state *state,
 		tbv_read_ctx_put(read);
 		return;
 	}
-	if (read->received != read->total_len)
+	if (read->received != read->total_len) {
+		atomic64_inc(&state->data_rx_read_resp_short);
 		ret = -EINVAL;
+	}
 
 complete_ack:
 	tbv_send_read_ack_on_path(state, rx_path, hdr->src_qp, hdr->dest_qp,

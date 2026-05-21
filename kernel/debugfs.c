@@ -217,6 +217,30 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_read_resp_duplicate));
 	seq_printf(s, "data_rx_read_resp_gap: %lld\n",
 		   atomic64_read(&state->data_rx_read_resp_gap));
+	seq_printf(s, "data_rx_read_resp_remote_error: %lld\n",
+		   atomic64_read(&state->data_rx_read_resp_remote_error));
+	seq_printf(s, "data_rx_read_resp_bad_header: %lld\n",
+		   atomic64_read(&state->data_rx_read_resp_bad_header));
+	seq_printf(s, "data_rx_read_resp_copy_error: %lld\n",
+		   atomic64_read(&state->data_rx_read_resp_copy_error));
+	seq_printf(s, "data_rx_read_resp_short: %lld\n",
+		   atomic64_read(&state->data_rx_read_resp_short));
+	seq_printf(s, "data_rx_read_req_no_access: %lld\n",
+		   atomic64_read(&state->data_rx_read_req_no_access));
+	seq_printf(s, "data_rx_read_req_no_mr: %lld\n",
+		   atomic64_read(&state->data_rx_read_req_no_mr));
+	seq_printf(s, "data_rx_read_req_mr_access: %lld\n",
+		   atomic64_read(&state->data_rx_read_req_mr_access));
+	seq_printf(s, "data_rx_read_req_too_large: %lld\n",
+		   atomic64_read(&state->data_rx_read_req_too_large));
+	seq_printf(s, "data_rx_read_req_bad_iova: %lld\n",
+		   atomic64_read(&state->data_rx_read_req_bad_iova));
+	seq_printf(s, "data_rx_read_req_alloc_error: %lld\n",
+		   atomic64_read(&state->data_rx_read_req_alloc_error));
+	seq_printf(s, "data_rx_read_req_resp_busy: %lld\n",
+		   atomic64_read(&state->data_rx_read_req_resp_busy));
+	seq_printf(s, "data_rx_read_req_resp_error: %lld\n",
+		   atomic64_read(&state->data_rx_read_req_resp_error));
 	seq_printf(s, "data_rx_no_qp: %lld\n",
 		   atomic64_read(&state->data_rx_no_qp));
 	seq_printf(s, "data_rx_bad_peer: %lld\n",
