@@ -6016,7 +6016,6 @@ int tbv_ibdev_start(struct tbv_state *state, bool register_verbs)
 	 */
 	for (;;) {
 		bool ready;
-		bool skip;
 
 		catchup = NULL;
 		mutex_lock(&state->lock);
@@ -6024,11 +6023,18 @@ int tbv_ibdev_start(struct tbv_state *state, bool register_verbs)
 			struct tbv_rail *rail;
 
 			list_for_each_entry(rail, &peer->rails, node) {
-				mutex_lock(&state->rail_register_lock);
-				skip = rail->ibdev ||
-				       rail->ibdev_register_failed;
-				mutex_unlock(&state->rail_register_lock);
-				if (skip)
+				/*
+				 * Read ibdev / ibdev_register_failed without
+				 * rail_register_lock: this is only a hint to
+				 * avoid waking the event on rails that have
+				 * obviously already been handled. The real
+				 * gates are re-checked inside the event under
+				 * rail_register_lock. Taking rail_register_lock
+				 * here would invert the lock order we use in
+				 * tbv_ibdev_rail_event (register-then-state).
+				 */
+				if (READ_ONCE(rail->ibdev) ||
+				    READ_ONCE(rail->ibdev_register_failed))
 					continue;
 				if (peer->backend == TBV_BACKEND_NATIVE)
 					ready = tbv_rail_data_ready(rail);
@@ -6092,14 +6098,20 @@ void tbv_ibdev_stop(struct tbv_state *state)
 			struct tbv_rail *rail;
 
 			list_for_each_entry(rail, &peer->rails, node) {
-				mutex_lock(&state->rail_register_lock);
-				if (rail->ibdev) {
-					target = rail;
-					refcount_inc(&rail->refcnt);
-				}
-				mutex_unlock(&state->rail_register_lock);
-				if (target)
-					break;
+				/*
+				 * Sample rail->ibdev with READ_ONCE; nested
+				 * rail_register_lock under state->lock would
+				 * invert the order used in tbv_ibdev_rail_event.
+				 * register_enabled is already false above, so no
+				 * new ibdev can appear; the event itself
+				 * re-checks under the registration lock and is
+				 * a no-op for already-cleared rails.
+				 */
+				if (!READ_ONCE(rail->ibdev))
+					continue;
+				target = rail;
+				refcount_inc(&rail->refcnt);
+				break;
 			}
 			if (target)
 				break;
