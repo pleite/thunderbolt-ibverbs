@@ -6,6 +6,12 @@
   outputs = { self, nixpkgs }:
     let
       lib = nixpkgs.lib;
+      optionalKernelPatches = [
+        {
+          name = "thunderbolt-nhi-ring-throttling-helper";
+          patch = ./patches/linux/0001-thunderbolt-nhi-add-per-ring-interrupt-throttling-helper.patch;
+        }
+      ];
       systems = [
         "x86_64-linux"
         "aarch64-linux"
@@ -26,6 +32,12 @@
         thunderbolt-ibverbs =
           final.linuxPackages.callPackage ./nix/module.nix { };
       };
+
+      lib.kernelPatches = optionalKernelPatches;
+
+      legacyPackages = forAllSystems (_pkgs: {
+        kernelPatches = optionalKernelPatches;
+      });
 
       nixosModules.default = { config, lib, ... }:
         let
