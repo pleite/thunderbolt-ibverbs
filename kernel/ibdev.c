@@ -243,10 +243,10 @@ struct tbv_qp {
 	struct tbv_state *owner;
 	enum tbv_backend_type backend;
 	/*
-	 * When non-NULL the QP is bound to a single rail (per-lane mode):
-	 * the TX path selectors must consider only this rail, never another.
-	 * Held with a refcount taken in tbv_create_qp and dropped in
-	 * tbv_destroy_qp. NULL in legacy aggregate mode.
+	 * Per-rail invariant: every QP is bound to exactly one rail at
+	 * create time and unbound at destroy time. The TX path selectors
+	 * only ever consider this rail. The reference is taken in
+	 * tbv_create_qp() and dropped in tbv_destroy_qp().
 	 */
 	struct tbv_rail *rail;
 	spinlock_t lock;
@@ -313,11 +313,9 @@ struct tbv_ibdev {
 	struct tbv_state *state;
 	enum tbv_backend_type backend;
 	/*
-	 * When NULL this ib_device aggregates over all rails of `backend`
-	 * (the legacy single-HCA mode). When non-NULL this ib_device is
-	 * pinned to a single rail (per-lane mode) and only the matching rail
-	 * is used for both TX path selection and as the routing target for
-	 * QPs created on it. Stable for the device's lifetime.
+	 * Per-rail invariant: every ib_device is pinned to exactly one rail
+	 * for its entire lifetime. It is the only rail used for TX path
+	 * selection and the only routing target for QPs created on it.
 	 */
 	struct tbv_rail *rail;
 };
@@ -435,12 +433,12 @@ static void tbv_apple_rx_drain_pending_locked(struct tbv_state *state,
 static void tbv_qp_advertise_recv_credits(struct tbv_qp *tqp);
 static int tbv_qp_consume_remote_recv_credit(struct tbv_qp *tqp);
 static void tbv_qp_return_remote_recv_credit(struct tbv_qp *tqp);
-static void tbv_send_ack(struct tbv_state *state, u32 dest_qp, u32 src_qp,
+static void tbv_send_ack(struct tbv_qp *tqp, u32 dest_qp, u32 src_qp,
 			 u32 psn, int status);
-static void tbv_send_ack_on_path(struct tbv_state *state,
+static void tbv_send_ack_on_path(struct tbv_qp *tqp,
 				 struct tbv_path *rx_path, u32 dest_qp,
 				 u32 src_qp, u32 psn, int status);
-static void tbv_send_read_ack_on_path(struct tbv_state *state,
+static void tbv_send_read_ack_on_path(struct tbv_qp *tqp,
 				      struct tbv_path *rx_path, u32 dest_qp,
 				      u32 src_qp, u32 psn, int status);
 static void tbv_qp_timeout_work(struct work_struct *work);
@@ -964,65 +962,29 @@ static void tbv_qp_flush_reads(struct tbv_qp *tqp, struct list_head *flush)
 	spin_unlock_irqrestore(&tqp->lock, flags);
 }
 
-static void tbv_cancel_send_ctx_packets(struct tbv_state *state,
-					struct tbv_send_ctx *send)
+static void tbv_cancel_send_ctx_packets(struct tbv_send_ctx *send)
 {
-	struct tbv_peer *peer;
-
-	if (!state || !send)
+	/*
+	 * Per-rail invariant: a send_ctx's QP is pinned to exactly one rail,
+	 * and that rail's path is the only place this send_ctx could have
+	 * been queued for TX. The QP holds a refcount on the rail until
+	 * tbv_destroy_qp() returns, so direct dereference is safe without
+	 * state->lock.
+	 */
+	if (!send || !send->tqp || !send->tqp->rail)
 		return;
-
-	mutex_lock(&state->lock);
-	list_for_each_entry(peer, &state->peers, node) {
-		struct tbv_rail *rail;
-
-		if (peer->backend != TBV_BACKEND_NATIVE &&
-		    peer->backend != TBV_BACKEND_APPLE)
-			continue;
-		list_for_each_entry(rail, &peer->rails, node) {
-			tbv_path_cancel_data_owner_ctx(&rail->path, send);
-		}
-	}
-	mutex_unlock(&state->lock);
+	tbv_path_cancel_data_owner_ctx(&send->tqp->rail->path, send);
 }
 
-static void tbv_cancel_read_ctx_packets(struct tbv_state *state,
-					struct tbv_read_ctx *read)
+static void tbv_cancel_read_ctx_packets(struct tbv_read_ctx *read)
 {
-	struct tbv_peer *peer;
-
-	if (!state || !read)
+	/* See tbv_cancel_send_ctx_packets() for the per-rail invariant. */
+	if (!read || !read->tqp || !read->tqp->rail)
 		return;
-
-	mutex_lock(&state->lock);
-	list_for_each_entry(peer, &state->peers, node) {
-		struct tbv_rail *rail;
-
-		if (peer->backend != TBV_BACKEND_NATIVE)
-			continue;
-		list_for_each_entry(rail, &peer->rails, node)
-			tbv_path_cancel_data_done_ctx(&rail->path,
-						      tbv_read_tx_done, read);
-	}
-	mutex_unlock(&state->lock);
-}
-
-static struct tbv_path *tbv_first_active_native_path_locked(struct tbv_state *state)
-{
-	struct tbv_peer *peer;
-
-	list_for_each_entry(peer, &state->peers, node) {
-		struct tbv_rail *rail;
-
-		if (peer->backend != TBV_BACKEND_NATIVE)
-			continue;
-		list_for_each_entry(rail, &peer->rails, node) {
-			if (tbv_rail_data_ready(rail))
-				return &rail->path;
-		}
-	}
-
-	return NULL;
+	if (read->tqp->rail->peer->backend != TBV_BACKEND_NATIVE)
+		return;
+	tbv_path_cancel_data_done_ctx(&read->tqp->rail->path,
+				      tbv_read_tx_done, read);
 }
 
 static bool tbv_rail_get_data_ready_locked(struct tbv_rail *rail)
@@ -1043,59 +1005,18 @@ static bool tbv_rail_get_apple_data_ready_locked(struct tbv_rail *rail)
 	return true;
 }
 
-static struct tbv_path *tbv_first_active_apple_path_locked(struct tbv_state *state)
-{
-	struct tbv_peer *peer;
-
-	list_for_each_entry(peer, &state->peers, node) {
-		struct tbv_rail *rail;
-
-		if (peer->backend != TBV_BACKEND_APPLE)
-			continue;
-		list_for_each_entry(rail, &peer->rails, node) {
-			if (tbv_rail_get_apple_data_ready_locked(rail))
-				return &rail->path;
-		}
-	}
-
-	return NULL;
-}
-
-static u32 tbv_collect_native_data_paths_get_locked(struct tbv_state *state,
-						   struct tbv_path **paths,
-						   u32 max_paths)
-{
-	struct tbv_peer *peer;
-	u32 count = 0;
-
-	list_for_each_entry(peer, &state->peers, node) {
-		struct tbv_rail *rail;
-
-		if (peer->backend != TBV_BACKEND_NATIVE)
-			continue;
-		list_for_each_entry(rail, &peer->rails, node) {
-			if (!tbv_rail_data_ready(rail) || rail->removing)
-				continue;
-			if (WARN_ON_ONCE(count >= max_paths))
-				return count;
-			if (!tbv_rail_get_data_ready_locked(rail))
-				continue;
-			paths[count++] = &rail->path;
-		}
-	}
-
-	return count;
-}
-
 /*
- * Per-lane variant: only the QP's bound rail is eligible. Returns 0 or 1
- * paths. Refcount semantics match tbv_collect_native_data_paths_get_locked.
+ * Per-rail invariant: every QP is bound to exactly one rail at create time
+ * (tbv_create_qp), so each of the selectors below boils down to
+ * "is my one rail ready?".
  */
-static u32 tbv_collect_pinned_native_data_path_get_locked(struct tbv_rail *rail,
-							  struct tbv_path **paths,
-							  u32 max_paths)
+static u32 tbv_collect_native_data_paths_for_qp_locked(struct tbv_qp *tqp,
+						       struct tbv_path **paths,
+						       u32 max_paths)
 {
-	if (!rail || max_paths == 0)
+	struct tbv_rail *rail = tqp->rail;
+
+	if (max_paths == 0)
 		return 0;
 	if (rail->peer->backend != TBV_BACKEND_NATIVE)
 		return 0;
@@ -1106,10 +1027,10 @@ static u32 tbv_collect_pinned_native_data_path_get_locked(struct tbv_rail *rail,
 }
 
 static struct tbv_path *
-tbv_select_pinned_native_data_path_get_locked(struct tbv_rail *rail)
+tbv_select_native_data_path_for_qp_locked(struct tbv_qp *tqp)
 {
-	if (!rail)
-		return NULL;
+	struct tbv_rail *rail = tqp->rail;
+
 	if (rail->peer->backend != TBV_BACKEND_NATIVE)
 		return NULL;
 	if (!tbv_rail_get_data_ready_locked(rail))
@@ -1118,10 +1039,10 @@ tbv_select_pinned_native_data_path_get_locked(struct tbv_rail *rail)
 }
 
 static struct tbv_path *
-tbv_select_pinned_apple_data_path_get_locked(struct tbv_rail *rail)
+tbv_first_active_apple_path_for_qp_locked(struct tbv_qp *tqp)
 {
-	if (!rail)
-		return NULL;
+	struct tbv_rail *rail = tqp->rail;
+
 	if (rail->peer->backend != TBV_BACKEND_APPLE)
 		return NULL;
 	if (!tbv_rail_get_apple_data_ready_locked(rail))
@@ -1129,91 +1050,13 @@ tbv_select_pinned_apple_data_path_get_locked(struct tbv_rail *rail)
 	return &rail->path;
 }
 
-/* Forward declarations for the wrappers — defined further below. */
-static struct tbv_path *
-tbv_select_native_data_path_get_locked(struct tbv_state *state, u32 selector);
-
-/*
- * QP-aware wrappers. When tqp->rail is set (per-lane IB device mode), every
- * data-path selection is constrained to that rail; otherwise we fall back to
- * the legacy aggregate-over-all-rails selectors. Centralizing the branch
- * here means individual TX-path call sites stay unchanged.
- */
-static u32 tbv_collect_native_data_paths_for_qp_locked(struct tbv_qp *tqp,
-						       struct tbv_path **paths,
-						       u32 max_paths)
-{
-	if (tqp && tqp->rail)
-		return tbv_collect_pinned_native_data_path_get_locked(
-			tqp->rail, paths, max_paths);
-	return tbv_collect_native_data_paths_get_locked(tqp->owner, paths,
-							max_paths);
-}
-
-static struct tbv_path *
-tbv_select_native_data_path_for_qp_locked(struct tbv_qp *tqp, u32 selector)
-{
-	if (tqp && tqp->rail)
-		return tbv_select_pinned_native_data_path_get_locked(tqp->rail);
-	return tbv_select_native_data_path_get_locked(tqp->owner, selector);
-}
-
-static struct tbv_path *
-tbv_first_active_apple_path_for_qp_locked(struct tbv_qp *tqp)
-{
-	if (tqp && tqp->rail)
-		return tbv_select_pinned_apple_data_path_get_locked(tqp->rail);
-	return tbv_first_active_apple_path_locked(tqp->owner);
-}
-
-/* The selector is either the QPN for stable-QP routing or the PSN for WR striping. */
-static struct tbv_path *
-tbv_select_native_data_path_get_locked(struct tbv_state *state, u32 selector)
-{
-	struct tbv_peer *peer;
-	u32 active = 0;
-	u32 target;
-	u32 idx = 0;
-
-	list_for_each_entry(peer, &state->peers, node) {
-		struct tbv_rail *rail;
-
-		if (peer->backend != TBV_BACKEND_NATIVE)
-			continue;
-		list_for_each_entry(rail, &peer->rails, node) {
-			if (tbv_rail_data_ready(rail) && !rail->removing)
-				active++;
-		}
-	}
-
-	if (!active)
-		return NULL;
-
-	target = selector % active;
-
-	list_for_each_entry(peer, &state->peers, node) {
-		struct tbv_rail *rail;
-
-		if (peer->backend != TBV_BACKEND_NATIVE)
-			continue;
-		list_for_each_entry(rail, &peer->rails, node) {
-			if (!tbv_rail_data_ready(rail) || rail->removing)
-				continue;
-			if (idx++ == target &&
-			    tbv_rail_get_data_ready_locked(rail))
-				return &rail->path;
-		}
-	}
-
-	return NULL;
-}
-
 static void tbv_release_path_refs(struct tbv_path **paths, u32 path_count)
 {
 	u32 i;
 
+	/* Per-rail invariant: every path is owned by exactly one rail. */
 	for (i = 0; i < path_count; i++) {
-		if (paths[i] && paths[i]->rail)
+		if (paths[i])
 			tbv_rail_put(paths[i]->rail);
 	}
 }
@@ -1225,8 +1068,9 @@ static struct tbv_path *tbv_path_get_for_response(struct tbv_path *path)
 	if (!path)
 		return NULL;
 
+	/* Per-rail invariant: every path is owned by exactly one rail. */
 	rail = path->rail;
-	if (!rail || !refcount_inc_not_zero(&rail->refcnt))
+	if (!refcount_inc_not_zero(&rail->refcnt))
 		return NULL;
 
 	if (!tbv_rail_data_ready(rail) || rail->removing) {
@@ -1239,35 +1083,34 @@ static struct tbv_path *tbv_path_get_for_response(struct tbv_path *path)
 
 static void tbv_path_put_response(struct tbv_path *path)
 {
-	if (path && path->rail)
+	if (path)
 		tbv_rail_put(path->rail);
 }
 
 static struct tbv_path *
 tbv_select_read_response_path(struct tbv_state *state, struct tbv_qp *tqp,
-			      struct tbv_path *rx_path, u32 selector,
-			      bool *selected_ref)
+			      struct tbv_path *rx_path, bool *selected_ref)
 {
 	struct tbv_path *path;
 
 	*selected_ref = false;
 
-	if (rx_path && rx_path->rail && tbv_rail_data_ready(rx_path->rail) &&
+	if (rx_path && tbv_rail_data_ready(rx_path->rail) &&
 	    !rx_path->rail->removing) {
 		/*
-		 * The QP may be pinned to a rail (per-lane mode). Refuse to
-		 * piggy-back the response on a foreign rail; the requester
-		 * keys its read tracking on the inbound rail too, so the only
-		 * correct fallback when rx_path's rail differs from ours is
-		 * "ENOTCONN" (caller retries).
+		 * Per-rail invariant: the QP is pinned to exactly one rail.
+		 * Refuse to piggy-back the response on a foreign rail; the
+		 * requester keys its read tracking on the inbound rail too,
+		 * so the only correct fallback when rx_path's rail differs
+		 * from ours is "ENOTCONN" (caller retries on our rail).
 		 */
-		if (tqp && tqp->rail && tqp->rail != rx_path->rail)
+		if (tqp->rail != rx_path->rail)
 			return NULL;
 		return rx_path;
 	}
 
 	mutex_lock(&state->lock);
-	path = tbv_select_native_data_path_for_qp_locked(tqp, selector);
+	path = tbv_select_native_data_path_for_qp_locked(tqp);
 	mutex_unlock(&state->lock);
 	if (path)
 		*selected_ref = true;
@@ -1557,23 +1400,23 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 		return -EOPNOTSUPP;
 
 	/*
-	 * Bind the QP to the ib_device's rail (per-lane mode). The rail is
-	 * not allowed to disappear while we hold a refcount; tbv_destroy_qp
-	 * drops it. Refusing to bind when the rail is already on its way out
-	 * matches what tbv_path_destroy expects and prevents post_send from
-	 * racing with rail teardown.
+	 * Per-rail invariant: every ib_device is pinned to exactly one rail.
+	 * Bind the QP to that rail and hold a refcount on it until destroy.
+	 * Refusing to bind when the rail is already on its way out matches
+	 * what tbv_path_destroy expects and prevents post_send from racing
+	 * with rail teardown.
 	 */
+	if (WARN_ON_ONCE(!dev->rail))
+		return -ENODEV;
 	tqp->rail = dev->rail;
-	if (tqp->rail) {
-		mutex_lock(&state->lock);
-		if (tqp->rail->removing) {
-			mutex_unlock(&state->lock);
-			tqp->rail = NULL;
-			return -ENOTCONN;
-		}
-		refcount_inc(&tqp->rail->refcnt);
+	mutex_lock(&state->lock);
+	if (tqp->rail->removing) {
 		mutex_unlock(&state->lock);
+		tqp->rail = NULL;
+		return -ENOTCONN;
 	}
+	refcount_inc(&tqp->rail->refcnt);
+	mutex_unlock(&state->lock);
 	if (init_attr->cap.max_send_wr > TBV_IBDEV_MAX_QP_WR ||
 	    init_attr->cap.max_recv_wr > TBV_IBDEV_MAX_QP_WR ||
 	    init_attr->cap.max_send_sge > TBV_IBDEV_MAX_SGE ||
@@ -1657,10 +1500,8 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	return 0;
 
 err_put_rail:
-	if (tqp->rail) {
-		tbv_rail_put(tqp->rail);
-		tqp->rail = NULL;
-	}
+	tbv_rail_put(tqp->rail);
+	tqp->rail = NULL;
 	return ret;
 }
 
@@ -1690,7 +1531,7 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 			list_first_entry(&flush, struct tbv_send_ctx, node);
 
 		list_del_init(&send->node);
-		tbv_cancel_send_ctx_packets(tqp->owner, send);
+		tbv_cancel_send_ctx_packets(send);
 		tbv_send_complete(send, -ECANCELED);
 		tbv_send_ctx_put(send);
 	}
@@ -1701,7 +1542,7 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 			list_first_entry(&flush, struct tbv_read_ctx, node);
 
 		list_del_init(&read->node);
-		tbv_cancel_read_ctx_packets(tqp->owner, read);
+		tbv_cancel_read_ctx_packets(read);
 		tbv_read_complete(read, -ECANCELED);
 		tbv_read_ctx_put(read);
 	}
@@ -1747,10 +1588,9 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 	}
 	if (tqp->owner)
 		atomic_dec(&tqp->owner->verbs_qps);
-	if (tqp->rail) {
-		tbv_rail_put(tqp->rail);
-		tqp->rail = NULL;
-	}
+	/* Per-rail invariant: tqp->rail was pinned at create time. */
+	tbv_rail_put(tqp->rail);
+	tqp->rail = NULL;
 	return 0;
 }
 
@@ -2236,7 +2076,7 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 		atomic64_inc(&state->data_rx_reorder_timeout);
 		if (expected)
 			tqp->rx_expected_psn = tbv_psn_next(psn);
-		tbv_send_ack(state, src_qp, tqp->base.qp_num, psn, 1);
+		tbv_send_ack(tqp, src_qp, tqp->base.qp_num, psn, 1);
 		timed_out = true;
 		if (expected)
 			tbv_rx_drain_reorder_locked(state, tqp, NULL);
@@ -2327,7 +2167,7 @@ static void tbv_qp_timeout_work(struct work_struct *work)
 					 struct tbv_send_ctx, node);
 
 		list_del_init(&send->node);
-		tbv_cancel_send_ctx_packets(tqp->owner, send);
+		tbv_cancel_send_ctx_packets(send);
 		atomic64_inc(&tqp->owner->data_wr_timeout);
 		tbv_send_complete(send, -ETIMEDOUT);
 		tbv_send_ctx_put(send);
@@ -2339,7 +2179,7 @@ static void tbv_qp_timeout_work(struct work_struct *work)
 					 struct tbv_read_ctx, node);
 
 		list_del_init(&read->node);
-		tbv_cancel_read_ctx_packets(tqp->owner, read);
+		tbv_cancel_read_ctx_packets(read);
 		atomic64_inc(&tqp->owner->data_wr_timeout);
 		tbv_read_complete(read, -ETIMEDOUT);
 		tbv_read_ctx_put(read);
@@ -2956,8 +2796,7 @@ static int tbv_post_rdma_read(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	}
 
 	mutex_lock(&tqp->owner->lock);
-	path = tbv_select_native_data_path_for_qp_locked(tqp,
-							tqp->base.qp_num ^ psn);
+	path = tbv_select_native_data_path_for_qp_locked(tqp);
 	mutex_unlock(&tqp->owner->lock);
 	if (!path) {
 		kfree(frame);
@@ -3013,7 +2852,6 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	u32 list_idx;
 	int nsegs = 0;
 	bool fragment_striping;
-	bool wr_striping;
 	bool credit_consumed = false;
 	bool sent_any = false;
 	bool is_send = wr->opcode == IB_WR_SEND ||
@@ -3063,7 +2901,6 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	nfrags = total_len ? DIV_ROUND_UP(total_len,
 					  TBV_NATIVE_DATA_MAX_PAYLOAD) : 1;
 	fragment_striping = tqp->owner->native_fragment_striping;
-	wr_striping = tqp->owner->native_wr_striping;
 	if (fragment_striping && nfrags > 1) {
 		atomic64_inc(&tqp->owner->data_wr_op_unsupported);
 		ret = -EOPNOTSUPP;
@@ -3164,8 +3001,7 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 		}
 
 		mutex_lock(&tqp->owner->lock);
-		path = tbv_select_native_data_path_for_qp_locked(
-			tqp, wr_striping ? psn : tqp->base.qp_num);
+		path = tbv_select_native_data_path_for_qp_locked(tqp);
 		mutex_unlock(&tqp->owner->lock);
 		if (!path) {
 			atomic64_inc(&tqp->owner->data_wr_no_path);
@@ -3230,8 +3066,7 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 		for (i = 0; i < nfrags; i++)
 			reservations[(psn + i) % path_count]++;
 	} else {
-		path = tbv_select_native_data_path_for_qp_locked(
-			tqp, wr_striping ? psn : tqp->base.qp_num);
+		path = tbv_select_native_data_path_for_qp_locked(tqp);
 		if (!path) {
 			ret = -ENOTCONN;
 			goto out_unlock_paths;
@@ -3988,23 +3823,37 @@ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 	tbv_qp_put(tqp);
 }
 
-static int tbv_send_control_frame(struct tbv_state *state, const void *frame,
-				  u32 len)
+/*
+ * Send a control frame on a QP's pinned rail. Greenfield per-rail mode means
+ * every QP has a single carrier — there is no aggregate "any active path"
+ * fallback. If the rail isn't currently data-ready the send fails with
+ * -ENOTCONN; the caller is expected to retry/abort on its own.
+ */
+static int tbv_send_control_frame_on_qp(struct tbv_qp *tqp, const void *frame,
+					u32 len)
 {
-	int ret = -ENOTCONN;
+	struct tbv_state *state = tqp->owner;
 	struct tbv_path *path;
+	int ret;
 
 	mutex_lock(&state->lock);
-	path = tbv_first_active_native_path_locked(state);
-	if (path)
-		ret = tbv_path_send(path, frame, len, TBV_PATH_SEND_CONTROL,
-				    NULL, NULL);
+	path = tbv_select_native_data_path_for_qp_locked(tqp);
 	mutex_unlock(&state->lock);
+	if (!path)
+		return -ENOTCONN;
 
+	ret = tbv_path_send(path, frame, len, TBV_PATH_SEND_CONTROL, NULL, NULL);
+	tbv_rail_put(path->rail);
 	return ret;
 }
 
-static int tbv_send_control_frame_on_path(struct tbv_state *state,
+/*
+ * Prefer to ack on the path the request arrived on (saves a selector roundtrip
+ * and keeps ordering on the same wire). Fall back to the QP's pinned rail if
+ * the incoming path is not safe to reuse (rare; usually means the rail is
+ * being torn down).
+ */
+static int tbv_send_control_frame_on_path(struct tbv_qp *tqp,
 					  struct tbv_path *rx_path,
 					  const void *frame, u32 len)
 {
@@ -4012,10 +3861,10 @@ static int tbv_send_control_frame_on_path(struct tbv_state *state,
 		return tbv_path_send(rx_path, frame, len,
 				     TBV_PATH_SEND_CONTROL, NULL, NULL);
 
-	return tbv_send_control_frame(state, frame, len);
+	return tbv_send_control_frame_on_qp(tqp, frame, len);
 }
 
-static void tbv_send_ack_on_path(struct tbv_state *state,
+static void tbv_send_ack_on_path(struct tbv_qp *tqp,
 				 struct tbv_path *rx_path, u32 dest_qp,
 				 u32 src_qp, u32 psn, int status)
 {
@@ -4033,13 +3882,13 @@ static void tbv_send_ack_on_path(struct tbv_state *state,
 	if (len < 0)
 		return;
 
-	tbv_send_control_frame_on_path(state, rx_path, frame, len);
+	tbv_send_control_frame_on_path(tqp, rx_path, frame, len);
 }
 
-static void tbv_send_ack(struct tbv_state *state, u32 dest_qp, u32 src_qp,
+static void tbv_send_ack(struct tbv_qp *tqp, u32 dest_qp, u32 src_qp,
 			 u32 psn, int status)
 {
-	tbv_send_ack_on_path(state, NULL, dest_qp, src_qp, psn, status);
+	tbv_send_ack_on_path(tqp, NULL, dest_qp, src_qp, psn, status);
 }
 
 static void tbv_count_tx_read_ack(struct tbv_state *state, int status)
@@ -4072,7 +3921,7 @@ static void tbv_count_rx_read_ack(struct tbv_state *state, u32 status)
 	}
 }
 
-static void tbv_send_read_ack_on_path(struct tbv_state *state,
+static void tbv_send_read_ack_on_path(struct tbv_qp *tqp,
 				      struct tbv_path *rx_path, u32 dest_qp,
 				      u32 src_qp, u32 psn, int status)
 {
@@ -4091,12 +3940,12 @@ static void tbv_send_read_ack_on_path(struct tbv_state *state,
 	if (len < 0)
 		return;
 
-	ret = tbv_send_control_frame_on_path(state, rx_path, frame, len);
+	ret = tbv_send_control_frame_on_path(tqp, rx_path, frame, len);
 	if (!ret)
-		tbv_count_tx_read_ack(state, status);
+		tbv_count_tx_read_ack(tqp->owner, status);
 }
 
-static void tbv_send_read_status_on_path(struct tbv_state *state,
+static void tbv_send_read_status_on_path(struct tbv_qp *tqp,
 					 struct tbv_path *rx_path,
 					 u32 dest_qp, u32 src_qp, u32 psn,
 					 u32 total_len, int status)
@@ -4117,13 +3966,12 @@ static void tbv_send_read_status_on_path(struct tbv_state *state,
 	if (len < 0)
 		return;
 
-	tbv_send_control_frame_on_path(state, rx_path, frame, len);
+	tbv_send_control_frame_on_path(tqp, rx_path, frame, len);
 }
 
 static int tbv_send_recv_credit(struct tbv_qp *tqp, u32 dest_qp,
 				u32 src_qp, u32 credits)
 {
-	struct tbv_state *state = tqp->owner;
 	struct tbv_native_data_header hdr = {};
 	u8 frame[TBV_NATIVE_DATA_HDR_SIZE];
 	int len;
@@ -4141,27 +3989,11 @@ static int tbv_send_recv_credit(struct tbv_qp *tqp, u32 dest_qp,
 		return len;
 
 	/*
-	 * In per-lane mode the QP's pinned rail is the only valid carrier for
-	 * its credit advertisement; the peer keys recv-credit accounting on
-	 * which ib_device received it. The aggregate fallback below preserves
-	 * legacy behavior when the QP is not pinned.
+	 * The QP's pinned rail is the only valid carrier for its credit
+	 * advertisement; the peer keys recv-credit accounting on which
+	 * ib_device received it.
 	 */
-	if (tqp->rail) {
-		struct tbv_path *path;
-		int ret = -ENOTCONN;
-
-		mutex_lock(&state->lock);
-		path = tbv_select_pinned_native_data_path_get_locked(tqp->rail);
-		mutex_unlock(&state->lock);
-		if (path) {
-			ret = tbv_path_send(path, frame, len,
-					    TBV_PATH_SEND_CONTROL, NULL, NULL);
-			tbv_rail_put(path->rail);
-		}
-		return ret;
-	}
-
-	return tbv_send_control_frame(state, frame, len);
+	return tbv_send_control_frame_on_qp(tqp, frame, len);
 }
 
 static void tbv_qp_advertise_recv_credits(struct tbv_qp *tqp)
@@ -4914,7 +4746,7 @@ static void tbv_rx_finish_send(struct tbv_state *state, struct tbv_qp *tqp,
 
 	memset(msg, 0, sizeof(*msg));
 	tqp->rx_expected_psn = tbv_psn_next(psn);
-	tbv_send_ack_on_path(state, rx_path, src_qp, tqp->base.qp_num, psn,
+	tbv_send_ack_on_path(tqp, rx_path, src_qp, tqp->base.qp_num, psn,
 			     ack_status);
 }
 
@@ -5004,7 +4836,7 @@ static bool tbv_rx_deliver_reorder_msg_locked(struct tbv_state *state,
 		ack_status = 1;
 
 	tqp->rx_expected_psn = tbv_psn_next(msg->psn);
-	tbv_send_ack_on_path(state, rx_path, msg->src_qp, tqp->base.qp_num,
+	tbv_send_ack_on_path(tqp, rx_path, msg->src_qp, tqp->base.qp_num,
 			     msg->psn, ack_status);
 	atomic64_inc(&state->data_rx_reorder_delivered);
 	tbv_rx_reorder_free_msg(msg);
@@ -5052,19 +4884,19 @@ static void tbv_rx_buffer_fragment_locked(struct tbv_state *state,
 	int ret;
 
 	if (delta < 0) {
-		tbv_send_ack_on_path(state, rx_path, hdr->src_qp,
+		tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
 				     hdr->dest_qp, psn, 1);
 		return;
 	}
 	if (delta >= TBV_RX_REORDER_MAX_MESSAGES) {
 		atomic64_inc(&state->data_rx_reorder_window);
-		tbv_send_ack_on_path(state, rx_path, hdr->src_qp,
+		tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
 				     hdr->dest_qp, psn, 1);
 		return;
 	}
 	if (!tbv_rx_fragment_shape(total_len, offset, hdr->length, last,
 				   &frag_idx, &frag_count)) {
-		tbv_send_ack_on_path(state, rx_path, hdr->src_qp,
+		tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
 				     hdr->dest_qp, psn, 1);
 		return;
 	}
@@ -5073,14 +4905,14 @@ static void tbv_rx_buffer_fragment_locked(struct tbv_state *state,
 	if (!msg) {
 		if (tqp->rx_reorder_count >= TBV_RX_REORDER_MAX_MESSAGES) {
 			atomic64_inc(&state->data_rx_reorder_window);
-			tbv_send_ack_on_path(state, rx_path, hdr->src_qp,
+			tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
 					     hdr->dest_qp, psn, 1);
 			return;
 		}
 
 		msg = kzalloc(sizeof(*msg), GFP_KERNEL);
 		if (!msg) {
-			tbv_send_ack_on_path(state, rx_path, hdr->src_qp,
+			tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
 					     hdr->dest_qp, psn, 1);
 			return;
 		}
@@ -5105,7 +4937,7 @@ static void tbv_rx_buffer_fragment_locked(struct tbv_state *state,
 		   msg->frag_count != frag_count ||
 		   test_bit(frag_idx, msg->frag_seen)) {
 		tbv_rx_drop_reorder_msg_locked(state, tqp, msg);
-		tbv_send_ack_on_path(state, rx_path, hdr->src_qp,
+		tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
 				     hdr->dest_qp, psn, 1);
 		return;
 	}
@@ -5116,7 +4948,7 @@ static void tbv_rx_buffer_fragment_locked(struct tbv_state *state,
 		if (ret == -ENOSPC)
 			atomic64_inc(&state->data_rx_reorder_window);
 		tbv_rx_drop_reorder_msg_locked(state, tqp, msg);
-		tbv_send_ack_on_path(state, rx_path, hdr->src_qp, hdr->dest_qp,
+		tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp, hdr->dest_qp,
 				     psn, 1);
 		return;
 	}
@@ -5154,7 +4986,7 @@ static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 			    TBV_NATIVE_DATA_F_SOLICITED)) ||
 	    (!with_imm && hdr->rkey) ||
 	    last != (frag_end64 == total_len)) {
-		tbv_send_ack_on_path(state, rx_path, hdr->src_qp, hdr->dest_qp,
+		tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp, hdr->dest_qp,
 				     psn, 1);
 		return;
 	}
@@ -5188,7 +5020,7 @@ static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 			tbv_rx_fail_active_send(state, tqp, rx_path,
 						IB_WC_LOC_PROT_ERR);
 			mutex_unlock(&tqp->rx_lock);
-			tbv_send_ack_on_path(state, rx_path, hdr->src_qp,
+			tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
 					     hdr->dest_qp, psn, 1);
 			return;
 		}
@@ -5202,7 +5034,7 @@ static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 	} else {
 		if (offset) {
 			mutex_unlock(&tqp->rx_lock);
-			tbv_send_ack_on_path(state, rx_path, hdr->src_qp,
+			tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
 					     hdr->dest_qp, psn, 1);
 			return;
 		}
@@ -5284,7 +5116,7 @@ static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
 	    (!last && !hdr->length) ||
 	    !(tqp->attr.qp_access_flags & IB_ACCESS_REMOTE_WRITE)) {
 		atomic64_inc(&state->data_rx_bad_header);
-		tbv_send_ack_on_path(state, rx_path, hdr->src_qp,
+		tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
 				     hdr->dest_qp, hdr->psn, 1);
 		return;
 	}
@@ -5292,7 +5124,7 @@ static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
 	mr = tbv_mr_get(state, hdr->rkey);
 	if (!mr) {
 		atomic64_inc(&state->data_rx_copy_error);
-		tbv_send_ack_on_path(state, rx_path, hdr->src_qp,
+		tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
 				     hdr->dest_qp, hdr->psn, 1);
 		return;
 	}
@@ -5300,7 +5132,7 @@ static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
 	if (!(mr->access & IB_ACCESS_REMOTE_WRITE)) {
 		atomic64_inc(&state->data_rx_copy_error);
 		tbv_mr_put(mr);
-		tbv_send_ack_on_path(state, rx_path, hdr->src_qp,
+		tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
 				     hdr->dest_qp, hdr->psn, 1);
 		return;
 	}
@@ -5310,7 +5142,7 @@ static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
 	tbv_mr_put(mr);
 	if (ret) {
 		atomic64_inc(&state->data_rx_copy_error);
-		tbv_send_ack_on_path(state, rx_path, hdr->src_qp,
+		tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
 				     hdr->dest_qp, hdr->psn, 1);
 		return;
 	}
@@ -5318,7 +5150,7 @@ static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
 	if (last) {
 		if (with_imm)
 			ret = tbv_rx_complete_write_imm(state, tqp, hdr);
-		tbv_send_ack_on_path(state, rx_path, hdr->src_qp,
+		tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
 				     hdr->dest_qp, hdr->psn, ret ? 1 : 0);
 	}
 }
@@ -5367,7 +5199,6 @@ static int tbv_send_read_response_ctx(struct tbv_read_resp_ctx *ctx)
 	int ret = 0;
 
 	path = tbv_select_read_response_path(state, tqp, ctx->rx_path,
-					     req->src_qp ^ req->psn,
 					     &selected_ref);
 	if (!path)
 		return -ENOTCONN;
@@ -5487,7 +5318,7 @@ static void tbv_read_req_workfn(struct work_struct *work)
 	}
 
 	if (!req->imm_data) {
-		tbv_send_read_status_on_path(state, rx_path, req->src_qp,
+		tbv_send_read_status_on_path(tqp, rx_path, req->src_qp,
 					     req->dest_qp, req->psn, 0, 0);
 		goto out_put_mr;
 	}
@@ -5530,7 +5361,7 @@ static void tbv_read_req_workfn(struct work_struct *work)
 		else
 			atomic64_inc(&state->data_rx_read_req_resp_error);
 out_send_status:
-		tbv_send_read_status_on_path(state, rx_path, req->src_qp,
+		tbv_send_read_status_on_path(tqp, rx_path, req->src_qp,
 					     req->dest_qp, req->psn,
 					     req->imm_data, ret);
 	}
@@ -5542,7 +5373,7 @@ out_put_mr:
 out_put_mr_status:
 	tbv_mr_put(mr);
 out_put_qp_status:
-	tbv_send_read_status_on_path(state, rx_path, req->src_qp,
+	tbv_send_read_status_on_path(tqp, rx_path, req->src_qp,
 				     req->dest_qp, req->psn, req->imm_data,
 				     ret);
 out_free:
@@ -5560,7 +5391,7 @@ static void tbv_rx_handle_rdma_read_req(struct tbv_state *state,
 
 	if (hdr->length || !(hdr->flags & TBV_NATIVE_DATA_F_LAST)) {
 		atomic64_inc(&state->data_rx_bad_header);
-		tbv_send_read_status_on_path(state, rx_path, hdr->src_qp,
+		tbv_send_read_status_on_path(tqp, rx_path, hdr->src_qp,
 					     hdr->dest_qp, hdr->psn,
 					     hdr->imm_data, -EINVAL);
 		return;
@@ -5568,7 +5399,7 @@ static void tbv_rx_handle_rdma_read_req(struct tbv_state *state,
 
 	work = kzalloc(sizeof(*work), GFP_ATOMIC);
 	if (!work) {
-		tbv_send_read_status_on_path(state, rx_path, hdr->src_qp,
+		tbv_send_read_status_on_path(tqp, rx_path, hdr->src_qp,
 					     hdr->dest_qp, hdr->psn,
 					     hdr->imm_data, -ENOMEM);
 		return;
@@ -5600,7 +5431,7 @@ static void tbv_rx_handle_rdma_read_resp(struct tbv_state *state,
 	read = tbv_qp_find_read_get(tqp, hdr->psn);
 	if (!read) {
 		atomic64_inc(&state->data_rx_read_resp_duplicate);
-		tbv_send_read_ack_on_path(state, rx_path, hdr->src_qp,
+		tbv_send_read_ack_on_path(tqp, rx_path, hdr->src_qp,
 					  hdr->dest_qp, hdr->psn,
 					  TBV_NATIVE_READ_ACK_OK);
 		return;
@@ -5630,7 +5461,7 @@ static void tbv_rx_handle_rdma_read_resp(struct tbv_state *state,
 	}
 	if (hdr->remote_addr != read->received) {
 		atomic64_inc(&state->data_rx_read_resp_gap);
-		tbv_send_read_ack_on_path(state, rx_path, hdr->src_qp,
+		tbv_send_read_ack_on_path(tqp, rx_path, hdr->src_qp,
 					  hdr->dest_qp, hdr->psn,
 					  TBV_NATIVE_READ_ACK_RETRY);
 		mutex_unlock(&read->data_lock);
@@ -5657,7 +5488,7 @@ static void tbv_rx_handle_rdma_read_resp(struct tbv_state *state,
 	}
 
 complete_ack:
-	tbv_send_read_ack_on_path(state, rx_path, hdr->src_qp, hdr->dest_qp,
+	tbv_send_read_ack_on_path(tqp, rx_path, hdr->src_qp, hdr->dest_qp,
 				  hdr->psn, ret ? TBV_NATIVE_READ_ACK_ERROR :
 						 TBV_NATIVE_READ_ACK_OK);
 	if (tbv_qp_unqueue_read(tqp, read)) {
@@ -5743,10 +5574,10 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 		    hdr->opcode == TBV_NATIVE_DATA_OP_SEND_IMM ||
 		    hdr->opcode == TBV_NATIVE_DATA_OP_RDMA_WRITE ||
 		    hdr->opcode == TBV_NATIVE_DATA_OP_RDMA_WRITE_IMM)
-			tbv_send_ack_on_path(state, rx_path, hdr->src_qp,
+			tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
 					     hdr->dest_qp, hdr->psn, 1);
 		else if (hdr->opcode == TBV_NATIVE_DATA_OP_RDMA_READ_REQ)
-			tbv_send_read_status_on_path(state, rx_path,
+			tbv_send_read_status_on_path(tqp, rx_path,
 						     hdr->src_qp,
 						     hdr->dest_qp, hdr->psn,
 						     hdr->imm_data, -EINVAL);
