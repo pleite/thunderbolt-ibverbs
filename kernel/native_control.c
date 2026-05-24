@@ -717,6 +717,23 @@ static void tbv_native_control_work(struct work_struct *work)
 			rail->path.local_transmit_path,
 			rail->remote_transmit_path,
 			rail->path.tx_ring->hop, rail->path.rx_ring->hop);
+
+		/*
+		 * Tunnel-enable is the third edge that can complete data-readiness
+		 * (alongside local READY sent + remote READY received). If both
+		 * READYs already arrived during HELLO retries, neither
+		 * mark_local_ready_sent nor mark_remote_ready will fire again —
+		 * publish synchronously here so the rail's ib_device appears.
+		 */
+		mutex_lock(&state->lock);
+		if (tbv_rail_data_ready(rail) && !rail->removing) {
+			refcount_inc(&rail->refcnt);
+			mutex_unlock(&state->lock);
+			tbv_ibdev_rail_event(state, rail, true);
+			tbv_rail_put(rail);
+		} else {
+			mutex_unlock(&state->lock);
+		}
 	}
 
 	if (state->enable_tunnels &&
