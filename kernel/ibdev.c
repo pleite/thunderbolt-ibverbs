@@ -1313,31 +1313,23 @@ static void tbv_release_owned_frame_lists(struct list_head *lists, u32 count)
 	}
 }
 
-static bool tbv_ibdev_port_active(struct tbv_state *state,
-				  enum tbv_backend_type backend)
+static bool tbv_ibdev_port_active(struct tbv_ibdev *dev)
 {
-	struct tbv_peer *peer;
-	bool active = false;
+	struct tbv_rail *rail = dev->rail;
+	bool active;
 
-	mutex_lock(&state->lock);
-	list_for_each_entry(peer, &state->peers, node) {
-		struct tbv_rail *rail;
-
-		if (peer->backend != backend)
-			continue;
-
-		list_for_each_entry(rail, &peer->rails, node) {
-			if ((peer->backend == TBV_BACKEND_APPLE ?
-			     tbv_rail_apple_data_ready(rail) :
-			     tbv_rail_data_ready(rail))) {
-				active = true;
-				goto out;
-			}
-		}
-	}
-
-out:
-	mutex_unlock(&state->lock);
+	/*
+	 * Per-rail ib_device: port state must reflect *this* rail only,
+	 * never aggregate over sibling rails. Otherwise a device pinned to a
+	 * dead lane could report ACTIVE because some other lane on the same
+	 * backend is still up, which lies to userspace and to RCCL/UCX.
+	 */
+	mutex_lock(&dev->state->lock);
+	active = !rail->removing &&
+		 (rail->peer->backend == TBV_BACKEND_APPLE ?
+			tbv_rail_apple_data_ready(rail) :
+			tbv_rail_data_ready(rail));
+	mutex_unlock(&dev->state->lock);
 	return active;
 }
 
@@ -1387,7 +1379,7 @@ static int tbv_query_port(struct ib_device *ibdev, u32 port_num,
 		return -EINVAL;
 
 	memset(attr, 0, sizeof(*attr));
-	active = tbv_ibdev_port_active(dev->state, dev->backend);
+	active = tbv_ibdev_port_active(dev);
 	attr->state = active ? IB_PORT_ACTIVE : IB_PORT_DOWN;
 	attr->phys_state = active ? IB_PORT_PHYS_STATE_LINK_UP :
 				    IB_PORT_PHYS_STATE_DISABLED;
