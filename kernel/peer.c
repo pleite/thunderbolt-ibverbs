@@ -267,19 +267,14 @@ void tbv_peer_remove_rail(struct tbv_rail *rail)
 	peer = rail->peer;
 
 	/*
-	 * Mark the rail as removing but leave it on peer->rails. The
-	 * tbv_destroy_qp() cancel walks (tbv_cancel_send_ctx_packets,
-	 * tbv_cancel_read_ctx_packets) traverse state->peers->rails to find
-	 * pinned QP packets that need cancellation; removing the rail before
-	 * ib_unregister_device() drains those callbacks would hide the path
-	 * from the cancel walks, leaving in-flight WRs queued. Their packet
-	 * refs would keep tqp->refs alive, and the QP's hold on rail->refcnt
-	 * would stop wait_for_completion(&rail->refs_zero) from returning ->
-	 * indefinite teardown hang.
-	 *
-	 * "removing" is honored by every selector that picks a path for new
-	 * traffic, so even while the rail is still on the list no fresh
-	 * sends/reads can pick it.
+	 * Mark the rail as removing but leave it on peer->rails. Selectors
+	 * (tbv_select_native_data_path_for_qp_locked et al.) all honor
+	 * removing=true so no new TX targets pick this rail. Keeping the
+	 * rail visible while ib_unregister_device() drains in-flight verbs
+	 * callbacks means debugfs, native control, and any other observer
+	 * sees a consistent topology snapshot until teardown actually
+	 * completes -- there is never a window where a rail "exists but
+	 * isn't reachable through peer->rails".
 	 */
 	mutex_lock(&peer->state->lock);
 	rail->removing = true;
