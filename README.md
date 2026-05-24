@@ -1,23 +1,95 @@
-# Thunderbolt IB Verbs
+# thunderbolt-ibverbs
 
-This repository contains an out-of-tree Thunderbolt/USB4 host-to-host RDMA
-verbs kernel module. It builds against stock kernels; the kernel patch in
-`patches/linux/` is optional and only enables lower-level NHI interrupt
-throttling control.
+Experimental Linux kernel module exposing an RDMA verbs device over
+Thunderbolt/USB4 host-to-host links.
 
-## Build The Module
+This is a research driver. It is useful for controlled Linux-to-Linux testing,
+but it is not a production storage, cluster, or security boundary. Use it on
+machines you can reboot, over links to machines you trust.
+
+For the background, hardware notes, and benchmark narrative, see the Hellas
+blog post:
+
+https://blog.hellas.ai/blog/thunderbolt-ibverbs/
+
+## Status
+
+- Native Linux-to-Linux verbs transport is the main path.
+- Apple-compatible transport exists, but is still experimental.
+- The module builds against stock kernels.
+- The patch in `patches/linux/` is optional. It only enables the
+  `nhi_interrupt_throttle_ns` tuning parameter.
+- Debian, Fedora, Arch, and Nix builds are exercised in CI.
+
+## License
+
+The kernel module is licensed under GPL-2.0-only, matching the SPDX tags in the
+kernel sources and `MODULE_LICENSE("GPL")`.
+
+Small userspace-facing test and protocol helper files that say
+`GPL-2.0 OR BSD-3-Clause` may be used under either license. Full license texts
+are in `LICENSE` and `LICENSES/preferred/`.
+
+## Requirements
+
+Install matching kernel headers and the basic module build tools.
+
+Debian or Ubuntu:
 
 ```sh
-make KDIR=/lib/modules/$(uname -r)/build
+sudo apt install build-essential dkms git kmod "linux-headers-$(uname -r)" rdma-core perftest
 ```
 
-With Nix:
+Fedora:
 
 ```sh
-nix build .#thunderbolt-ibverbs
+sudo dnf install dkms gcc git kernel-devel kernel-headers kmod make rdma-core perftest
 ```
 
-On NixOS, import the module and enable it:
+Arch Linux:
+
+```sh
+sudo pacman -S --needed base-devel dkms git kmod linux-headers rdma-core perftest
+```
+
+## Install With DKMS
+
+```sh
+git clone https://github.com/hellas-ai/thunderbolt-ibverbs.git
+cd thunderbolt-ibverbs
+
+sudo make dkms-add
+sudo make dkms-build
+sudo make dkms-install
+```
+
+After a kernel upgrade, DKMS should rebuild the module for the new kernel.
+
+To remove it:
+
+```sh
+sudo make dkms-remove
+```
+
+## Build Without DKMS
+
+For a one-off build against the running kernel:
+
+```sh
+make KVER="$(uname -r)"
+sudo make KVER="$(uname -r)" modules_install
+sudo depmod -a
+```
+
+## Nix
+
+Build the module package:
+
+```sh
+nix build github:hellas-ai/thunderbolt-ibverbs#thunderbolt-ibverbs
+```
+
+On NixOS, add the flake input and import the module:
 
 ```nix
 {
@@ -37,30 +109,101 @@ On NixOS, import the module and enable it:
 }
 ```
 
-## Optional Kernel Patch
+## Load And Use
 
-`patches/linux/0001-thunderbolt-nhi-add-per-ring-interrupt-throttling-helper.patch`
-adds `tb_ring_throttling()` to the Thunderbolt core. The module detects this
-symbol at load time. If the patch is not present, the module still loads and
-uses the stock NHI interrupt behavior.
+Connect the Thunderbolt/USB4 hosts first. On both Linux peers, load the module
+with the native Linux transport enabled:
 
-The patch is useful when tuning:
+```sh
+sudo modprobe thunderbolt_ibverbs \
+  profile=linux_perf \
+  bind_services=1 \
+  allocate_rings=1 \
+  start_rings=1 \
+  negotiate_native=1 \
+  enable_tunnels=1 \
+  register_verbs=1
+```
+
+If userspace needs a RoCE netdev for GID metadata, pass one explicitly:
+
+```sh
+sudo modprobe thunderbolt_ibverbs \
+  profile=linux_perf \
+  bind_services=1 allocate_rings=1 start_rings=1 \
+  negotiate_native=1 enable_tunnels=1 register_verbs=1 \
+  roce_netdev=thunderbolt0
+```
+
+Check that the device registered:
+
+```sh
+dmesg | grep thunderbolt_ibverbs
+ibv_devices
+rdma link
+```
+
+With `perftest` installed, select the reported RDMA device explicitly:
+
+```sh
+# peer A
+ib_write_bw -d usb4_rdma0
+
+# peer B
+ib_write_bw -d usb4_rdma0 <peer-a-address>
+```
+
+Unload the module before changing static load parameters:
+
+```sh
+sudo modprobe -r thunderbolt_ibverbs
+```
+
+To make a known-good configuration persistent, put the options in
+`/etc/modprobe.d/thunderbolt-ibverbs.conf`.
+
+## Useful Parameters
 
 ```text
+profile=linux_perf|mac_compat|mixed
+tbnet=auto|allow|prefer_rdma|block
+lanes=auto|N|MIN-MAX
+register_verbs=0|1
+native_wr_striping=0|1
+native_fragment_striping=0|1
+zcopy_min_bytes=<bytes>
+qp_timeout_ms=<ms>
 nhi_interrupt_throttle_ns=<ns>
 ```
 
-`0` disables throttling for the module's data rings. Non-zero values request
-that interrupt moderation interval in nanoseconds. The kernel helper accepts
-the setting only while each ring is stopped.
+Run `make -C kernel help` for the full parameter list.
 
-### NixOS Kernel Patch
+## Optional Kernel Patch
 
-The flake exposes the patch in `lib.kernelPatches` and
-`legacyPackages.${system}.kernelPatches`.
+The module loads without any kernel patch. Without the patch, it uses the
+stock Thunderbolt NHI interrupt behavior and ignores non-zero
+`nhi_interrupt_throttle_ns` values.
+
+To enable that tuning knob, apply:
+
+```text
+patches/linux/0001-thunderbolt-nhi-add-per-ring-interrupt-throttling-helper.patch
+```
+
+For a local kernel tree:
+
+```sh
+cd linux
+git am /path/to/thunderbolt-ibverbs/patches/linux/0001-thunderbolt-nhi-add-per-ring-interrupt-throttling-helper.patch
+make olddefconfig
+make -j"$(nproc)"
+```
+
+For NixOS, the flake exposes the patch as
+`inputs.thunderbolt-ibverbs.lib.kernelPatches`:
 
 ```nix
-{ pkgs, lib, inputs, ... }:
+{ pkgs, inputs, ... }:
 let
   linuxPackagesTbv = pkgs.linuxPackages_latest.extend (_self: super: {
     kernel = super.kernel.override {
@@ -70,40 +213,9 @@ let
     };
   });
 in {
-  imports = [
-    inputs.thunderbolt-ibverbs.nixosModules.default
-  ];
-
   boot.kernelPackages = linuxPackagesTbv;
   hardware.thunderbolt-ibverbs.enable = true;
-
-  boot.extraModprobeConfig = ''
-    options thunderbolt_ibverbs nhi_interrupt_throttle_ns=0
-  '';
 }
 ```
 
-Rebuild and reboot into the patched kernel:
-
-```sh
-sudo nixos-rebuild boot --flake .#host
-sudo reboot
-```
-
-### Generic Distro Kernel Source
-
-For a locally built Debian, Ubuntu, Fedora, Arch, or upstream kernel tree:
-
-```sh
-cd linux
-git am /path/to/thunderbolt-ibverbs/patches/linux/0001-thunderbolt-nhi-add-per-ring-interrupt-throttling-helper.patch
-make olddefconfig
-make -j"$(nproc)" bindeb-pkg
-```
-
-Install the generated kernel packages with the distro package manager, reboot
-into that kernel, then build/install this module through DKMS or `make`.
-
-Fedora's kernel dist-git works similarly: apply the patch to the kernel source
-tree or add it to the RPM spec's patch list, build the kernel RPMs, install
-them with `dnf`, reboot, then build this module against the matching headers.
+Reboot into the patched kernel, then rebuild or reload the module.
