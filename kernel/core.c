@@ -33,6 +33,7 @@ int tbv_core_init(struct tbv_state *state,
 	memset(state, 0, sizeof(*state));
 	state->cfg = *cfg;
 	mutex_init(&state->lock);
+	mutex_init(&state->rail_register_lock);
 	INIT_LIST_HEAD(&state->peers);
 	xa_init(&state->verbs_mrs_xa);
 	xa_init(&state->verbs_qps_xa);
@@ -40,6 +41,7 @@ int tbv_core_init(struct tbv_state *state,
 	state->workqueue = alloc_workqueue("tbv_ibdev",
 					   WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
 	if (!state->workqueue) {
+		mutex_destroy(&state->rail_register_lock);
 		mutex_destroy(&state->lock);
 		return -ENOMEM;
 	}
@@ -51,9 +53,8 @@ int tbv_core_init(struct tbv_state *state,
 
 	ret = tbv_tbnet_identity_prepare(&state->tbnet_identity, cfg,
 					 identity_cfg);
-	if (ret) {
+	if (ret)
 		goto err_destroy_wq;
-	}
 
 	ret = tbv_debugfs_init(state);
 	if (ret) {
@@ -75,6 +76,7 @@ int tbv_core_init(struct tbv_state *state,
 err_destroy_wq:
 	destroy_workqueue(state->workqueue);
 	state->workqueue = NULL;
+	mutex_destroy(&state->rail_register_lock);
 	mutex_destroy(&state->lock);
 	return ret;
 }
@@ -108,6 +110,7 @@ void tbv_core_exit(struct tbv_state *state)
 	xa_destroy(&state->verbs_mrs_xa);
 	xa_destroy(&state->verbs_qps_xa);
 	tbv_tbnet_identity_stop(&state->tbnet_identity);
+	mutex_destroy(&state->rail_register_lock);
 	mutex_destroy(&state->lock);
 }
 

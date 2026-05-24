@@ -208,6 +208,14 @@ struct tbv_rail {
 	struct delayed_work native_work;
 	refcount_t refcnt;
 	struct completion refs_zero;
+	/*
+	 * Per-rail IB device when state->register_per_rail is set.  Lifecycle
+	 * is managed by tbv_ibdev_rail_event() (see ibdev.c); protected by
+	 * state->rail_register_lock.  NULL means no IB device is currently
+	 * published for this rail (either single-HCA mode, or this rail has
+	 * not yet reached the data-ready edge).
+	 */
+	struct tbv_ibdev *ibdev;
 	u32 rail_id;
 	u32 link_speed;
 	u32 link_width;
@@ -472,6 +480,17 @@ struct tbv_state {
 	struct xarray verbs_qps_xa;
 	struct device *verbs_parent[2];
 	struct tbv_ibdev *ibdevs[2];
+	/*
+	 * Per-rail IB device registration support (commit grafted from the
+	 * historical module/ tree's ca70710 "usb4_rdma: expose per-lane rail
+	 * devices"). When register_per_rail is set the legacy aggregate
+	 * ib_devices in ibdevs[] are not registered; instead one ib_device is
+	 * published per rail as its data path comes up. The lock protects
+	 * registration/unregistration races between path-bringup paths (work
+	 * queues) and tbv_peer_remove_rail()/module-exit teardown.
+	 */
+	struct mutex rail_register_lock;
+	bool register_per_rail;
 };
 
 struct dentry;
@@ -517,6 +536,14 @@ const char *tbv_backend_name(enum tbv_backend_type type);
 int tbv_ibdev_start(struct tbv_state *state, bool register_verbs);
 void tbv_ibdev_stop(struct tbv_state *state);
 const char *tbv_ibdev_roce_netdev_name(void);
+/*
+ * Notify the verbs layer that rail's data path has come up (joined=true) or
+ * is about to be torn down (joined=false). No-op unless state->register_verbs
+ * and state->register_per_rail are both set. Safe to call repeatedly; only
+ * the rising/falling edge of "ibdev published" causes registration changes.
+ */
+void tbv_ibdev_rail_event(struct tbv_state *state, struct tbv_rail *rail,
+			  bool joined);
 void tbv_ibdev_rx_frame(struct tbv_state *state, struct tbv_path *rx_path,
 			const void *data, u32 len);
 void tbv_ibdev_rx_native_frame(struct tbv_state *state,

@@ -259,6 +259,7 @@ static int tbv_native_control_mark_remote_ready(struct tbv_state *state,
 						const struct tbv_native_wire_info *info,
 						const struct tbv_native_wire_hello *remote)
 {
+	struct tbv_rail *publish = NULL;
 	struct tbv_peer *peer;
 	int ret = -ENOENT;
 
@@ -278,12 +279,25 @@ static int tbv_native_control_mark_remote_ready(struct tbv_state *state,
 
 			rail->native_remote_ready = true;
 			ret = 0;
+			/*
+			 * Take a refcount so we can call tbv_ibdev_rail_event
+			 * after dropping state->lock — ib_register_device may
+			 * sleep and can reach back into our ops.
+			 */
+			if (tbv_rail_data_ready(rail) && !rail->removing) {
+				refcount_inc(&rail->refcnt);
+				publish = rail;
+			}
 			goto out;
 		}
 	}
 
 out:
 	mutex_unlock(&state->lock);
+	if (publish) {
+		tbv_ibdev_rail_event(state, publish, true);
+		tbv_rail_put(publish);
+	}
 	return ret;
 }
 
@@ -291,6 +305,7 @@ static int tbv_native_control_mark_local_ready_sent(
 	struct tbv_state *state, const struct tb_xdomain *source_xd,
 	const struct tbv_native_wire_info *info, u32 rail_id)
 {
+	struct tbv_rail *publish = NULL;
 	struct tbv_peer *peer;
 	int ret = -ENOENT;
 
@@ -311,12 +326,20 @@ static int tbv_native_control_mark_local_ready_sent(
 			rail->native_ready_sent = true;
 			rail->native_last_error = 0;
 			ret = 0;
+			if (tbv_rail_data_ready(rail) && !rail->removing) {
+				refcount_inc(&rail->refcnt);
+				publish = rail;
+			}
 			goto out;
 		}
 	}
 
 out:
 	mutex_unlock(&state->lock);
+	if (publish) {
+		tbv_ibdev_rail_event(state, publish, true);
+		tbv_rail_put(publish);
+	}
 	return ret;
 }
 

@@ -17,6 +17,7 @@
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/thunderbolt.h>
 #include <linux/vmalloc.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
@@ -241,6 +242,13 @@ struct tbv_qp {
 	struct ib_qp base;
 	struct tbv_state *owner;
 	enum tbv_backend_type backend;
+	/*
+	 * When non-NULL the QP is bound to a single rail (per-lane mode):
+	 * the TX path selectors must consider only this rail, never another.
+	 * Held with a refcount taken in tbv_create_qp and dropped in
+	 * tbv_destroy_qp. NULL in legacy aggregate mode.
+	 */
+	struct tbv_rail *rail;
 	spinlock_t lock;
 	struct mutex rx_lock;
 	wait_queue_head_t credit_wait;
@@ -304,6 +312,14 @@ struct tbv_ibdev {
 	struct ib_device base;
 	struct tbv_state *state;
 	enum tbv_backend_type backend;
+	/*
+	 * When NULL this ib_device aggregates over all rails of `backend`
+	 * (the legacy single-HCA mode). When non-NULL this ib_device is
+	 * pinned to a single rail (per-lane mode) and only the matching rail
+	 * is used for both TX path selection and as the routing target for
+	 * QPs created on it. Stable for the device's lifetime.
+	 */
+	struct tbv_rail *rail;
 };
 
 struct tbv_send_ctx {
@@ -1071,6 +1087,85 @@ static u32 tbv_collect_native_data_paths_get_locked(struct tbv_state *state,
 	return count;
 }
 
+/*
+ * Per-lane variant: only the QP's bound rail is eligible. Returns 0 or 1
+ * paths. Refcount semantics match tbv_collect_native_data_paths_get_locked.
+ */
+static u32 tbv_collect_pinned_native_data_path_get_locked(struct tbv_rail *rail,
+							  struct tbv_path **paths,
+							  u32 max_paths)
+{
+	if (!rail || max_paths == 0)
+		return 0;
+	if (rail->peer->backend != TBV_BACKEND_NATIVE)
+		return 0;
+	if (!tbv_rail_get_data_ready_locked(rail))
+		return 0;
+	paths[0] = &rail->path;
+	return 1;
+}
+
+static struct tbv_path *
+tbv_select_pinned_native_data_path_get_locked(struct tbv_rail *rail)
+{
+	if (!rail)
+		return NULL;
+	if (rail->peer->backend != TBV_BACKEND_NATIVE)
+		return NULL;
+	if (!tbv_rail_get_data_ready_locked(rail))
+		return NULL;
+	return &rail->path;
+}
+
+static struct tbv_path *
+tbv_select_pinned_apple_data_path_get_locked(struct tbv_rail *rail)
+{
+	if (!rail)
+		return NULL;
+	if (rail->peer->backend != TBV_BACKEND_APPLE)
+		return NULL;
+	if (!tbv_rail_get_apple_data_ready_locked(rail))
+		return NULL;
+	return &rail->path;
+}
+
+/* Forward declarations for the wrappers — defined further below. */
+static struct tbv_path *
+tbv_select_native_data_path_get_locked(struct tbv_state *state, u32 selector);
+
+/*
+ * QP-aware wrappers. When tqp->rail is set (per-lane IB device mode), every
+ * data-path selection is constrained to that rail; otherwise we fall back to
+ * the legacy aggregate-over-all-rails selectors. Centralizing the branch
+ * here means individual TX-path call sites stay unchanged.
+ */
+static u32 tbv_collect_native_data_paths_for_qp_locked(struct tbv_qp *tqp,
+						       struct tbv_path **paths,
+						       u32 max_paths)
+{
+	if (tqp && tqp->rail)
+		return tbv_collect_pinned_native_data_path_get_locked(
+			tqp->rail, paths, max_paths);
+	return tbv_collect_native_data_paths_get_locked(tqp->owner, paths,
+							max_paths);
+}
+
+static struct tbv_path *
+tbv_select_native_data_path_for_qp_locked(struct tbv_qp *tqp, u32 selector)
+{
+	if (tqp && tqp->rail)
+		return tbv_select_pinned_native_data_path_get_locked(tqp->rail);
+	return tbv_select_native_data_path_get_locked(tqp->owner, selector);
+}
+
+static struct tbv_path *
+tbv_first_active_apple_path_for_qp_locked(struct tbv_qp *tqp)
+{
+	if (tqp && tqp->rail)
+		return tbv_select_pinned_apple_data_path_get_locked(tqp->rail);
+	return tbv_first_active_apple_path_locked(tqp->owner);
+}
+
 /* The selector is either the QPN for stable-QP routing or the PSN for WR striping. */
 static struct tbv_path *
 tbv_select_native_data_path_get_locked(struct tbv_state *state, u32 selector)
@@ -1149,19 +1244,30 @@ static void tbv_path_put_response(struct tbv_path *path)
 }
 
 static struct tbv_path *
-tbv_select_read_response_path(struct tbv_state *state, struct tbv_path *rx_path,
-			      u32 selector, bool *selected_ref)
+tbv_select_read_response_path(struct tbv_state *state, struct tbv_qp *tqp,
+			      struct tbv_path *rx_path, u32 selector,
+			      bool *selected_ref)
 {
 	struct tbv_path *path;
 
 	*selected_ref = false;
 
 	if (rx_path && rx_path->rail && tbv_rail_data_ready(rx_path->rail) &&
-	    !rx_path->rail->removing)
+	    !rx_path->rail->removing) {
+		/*
+		 * The QP may be pinned to a rail (per-lane mode). Refuse to
+		 * piggy-back the response on a foreign rail; the requester
+		 * keys its read tracking on the inbound rail too, so the only
+		 * correct fallback when rx_path's rail differs from ours is
+		 * "ENOTCONN" (caller retries).
+		 */
+		if (tqp && tqp->rail && tqp->rail != rx_path->rail)
+			return NULL;
 		return rx_path;
+	}
 
 	mutex_lock(&state->lock);
-	path = tbv_select_native_data_path_get_locked(state, selector);
+	path = tbv_select_native_data_path_for_qp_locked(tqp, selector);
 	mutex_unlock(&state->lock);
 	if (path)
 		*selected_ref = true;
@@ -1444,6 +1550,7 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 {
 	struct tbv_qp *tqp = container_of(qp, struct tbv_qp, base);
 	struct tbv_state *state = tbv_ibdev_state(qp->device);
+	struct tbv_ibdev *dev = tbv_to_ibdev(qp->device);
 	unsigned long flags;
 	int qpn;
 	int ret;
@@ -1456,22 +1563,46 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	if (tbv_backend_is_apple(tqp->backend) &&
 	    init_attr->qp_type != IB_QPT_UC)
 		return -EOPNOTSUPP;
+
+	/*
+	 * Bind the QP to the ib_device's rail (per-lane mode). The rail is
+	 * not allowed to disappear while we hold a refcount; tbv_destroy_qp
+	 * drops it. Refusing to bind when the rail is already on its way out
+	 * matches what tbv_path_destroy expects and prevents post_send from
+	 * racing with rail teardown.
+	 */
+	tqp->rail = dev->rail;
+	if (tqp->rail) {
+		mutex_lock(&state->lock);
+		if (tqp->rail->removing) {
+			mutex_unlock(&state->lock);
+			tqp->rail = NULL;
+			return -ENOTCONN;
+		}
+		refcount_inc(&tqp->rail->refcnt);
+		mutex_unlock(&state->lock);
+	}
 	if (init_attr->cap.max_send_wr > TBV_IBDEV_MAX_QP_WR ||
 	    init_attr->cap.max_recv_wr > TBV_IBDEV_MAX_QP_WR ||
 	    init_attr->cap.max_send_sge > TBV_IBDEV_MAX_SGE ||
-	    init_attr->cap.max_recv_sge > TBV_IBDEV_MAX_SGE)
-		return -EINVAL;
+	    init_attr->cap.max_recv_sge > TBV_IBDEV_MAX_SGE) {
+		ret = -EINVAL;
+		goto err_put_rail;
+	}
 
 	qpn = tbv_alloc_qpn(state, tqp->backend);
-	if (qpn < 0)
-		return qpn;
+	if (qpn < 0) {
+		ret = qpn;
+		goto err_put_rail;
+	}
 
 	if (init_attr->cap.max_recv_wr) {
 		tqp->recvq = kcalloc(init_attr->cap.max_recv_wr,
 				     sizeof(*tqp->recvq), GFP_KERNEL);
 		if (!tqp->recvq) {
 			ida_free(&tbv_qpn_ida, qpn);
-			return -ENOMEM;
+			ret = -ENOMEM;
+			goto err_put_rail;
 		}
 		tqp->recvq_size = init_attr->cap.max_recv_wr;
 	}
@@ -1489,7 +1620,8 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 			if (!tqp->apple_pending) {
 				kfree(tqp->recvq);
 				ida_free(&tbv_qpn_ida, qpn);
-				return -ENOMEM;
+				ret = -ENOMEM;
+				goto err_put_rail;
 			}
 			tqp->apple_pending_slot_count = slots;
 		}
@@ -1527,10 +1659,17 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 		kfree(tqp->recvq);
 		ida_free(&tbv_qpn_ida, qpn);
 		tqp->qpn_allocated = false;
-		return ret;
+		goto err_put_rail;
 	}
 	atomic_inc(&tqp->owner->verbs_qps);
 	return 0;
+
+err_put_rail:
+	if (tqp->rail) {
+		tbv_rail_put(tqp->rail);
+		tqp->rail = NULL;
+	}
+	return ret;
 }
 
 static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
@@ -1616,6 +1755,10 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 	}
 	if (tqp->owner)
 		atomic_dec(&tqp->owner->verbs_qps);
+	if (tqp->rail) {
+		tbv_rail_put(tqp->rail);
+		tqp->rail = NULL;
+	}
 	return 0;
 }
 
@@ -2821,8 +2964,8 @@ static int tbv_post_rdma_read(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	}
 
 	mutex_lock(&tqp->owner->lock);
-	path = tbv_select_native_data_path_get_locked(tqp->owner,
-						     tqp->base.qp_num ^ psn);
+	path = tbv_select_native_data_path_for_qp_locked(tqp,
+							tqp->base.qp_num ^ psn);
 	mutex_unlock(&tqp->owner->lock);
 	if (!path) {
 		kfree(frame);
@@ -3029,8 +3172,8 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 		}
 
 		mutex_lock(&tqp->owner->lock);
-		path = tbv_select_native_data_path_get_locked(
-			tqp->owner, wr_striping ? psn : tqp->base.qp_num);
+		path = tbv_select_native_data_path_for_qp_locked(
+			tqp, wr_striping ? psn : tqp->base.qp_num);
 		mutex_unlock(&tqp->owner->lock);
 		if (!path) {
 			atomic64_inc(&tqp->owner->data_wr_no_path);
@@ -3086,8 +3229,8 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	if (fragment_striping) {
 		u32 i;
 
-		path_count = tbv_collect_native_data_paths_get_locked(
-			tqp->owner, paths, ARRAY_SIZE(paths));
+		path_count = tbv_collect_native_data_paths_for_qp_locked(
+			tqp, paths, ARRAY_SIZE(paths));
 		if (!path_count) {
 			ret = -ENOTCONN;
 			goto out_unlock_paths;
@@ -3095,8 +3238,8 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 		for (i = 0; i < nfrags; i++)
 			reservations[(psn + i) % path_count]++;
 	} else {
-		path = tbv_select_native_data_path_get_locked(
-			tqp->owner, wr_striping ? psn : tqp->base.qp_num);
+		path = tbv_select_native_data_path_for_qp_locked(
+			tqp, wr_striping ? psn : tqp->base.qp_num);
 		if (!path) {
 			ret = -ENOTCONN;
 			goto out_unlock_paths;
@@ -3985,9 +4128,10 @@ static void tbv_send_read_status_on_path(struct tbv_state *state,
 	tbv_send_control_frame_on_path(state, rx_path, frame, len);
 }
 
-static int tbv_send_recv_credit(struct tbv_state *state, u32 dest_qp,
+static int tbv_send_recv_credit(struct tbv_qp *tqp, u32 dest_qp,
 				u32 src_qp, u32 credits)
 {
+	struct tbv_state *state = tqp->owner;
 	struct tbv_native_data_header hdr = {};
 	u8 frame[TBV_NATIVE_DATA_HDR_SIZE];
 	int len;
@@ -4003,6 +4147,27 @@ static int tbv_send_recv_credit(struct tbv_state *state, u32 dest_qp,
 	len = tbv_native_data_build_header(frame, sizeof(frame), &hdr);
 	if (len < 0)
 		return len;
+
+	/*
+	 * In per-lane mode the QP's pinned rail is the only valid carrier for
+	 * its credit advertisement; the peer keys recv-credit accounting on
+	 * which ib_device received it. The aggregate fallback below preserves
+	 * legacy behavior when the QP is not pinned.
+	 */
+	if (tqp->rail) {
+		struct tbv_path *path;
+		int ret = -ENOTCONN;
+
+		mutex_lock(&state->lock);
+		path = tbv_select_pinned_native_data_path_get_locked(tqp->rail);
+		mutex_unlock(&state->lock);
+		if (path) {
+			ret = tbv_path_send(path, frame, len,
+					    TBV_PATH_SEND_CONTROL, NULL, NULL);
+			tbv_rail_put(path->rail);
+		}
+		return ret;
+	}
 
 	return tbv_send_control_frame(state, frame, len);
 }
@@ -4028,8 +4193,7 @@ static void tbv_qp_advertise_recv_credits(struct tbv_qp *tqp)
 	dest_qp = tqp->attr.dest_qp_num;
 	spin_unlock_irqrestore(&tqp->lock, flags);
 
-	ret = tbv_send_recv_credit(tqp->owner, dest_qp, tqp->base.qp_num,
-				   credits);
+	ret = tbv_send_recv_credit(tqp, dest_qp, tqp->base.qp_num, credits);
 	if (!ret)
 		return;
 
@@ -4208,7 +4372,7 @@ static int tbv_apple_sq_get_tx_resources(struct tbv_qp *tqp, u32 frames,
 			return -ECANCELED;
 
 		mutex_lock(&tqp->owner->lock);
-		path = tbv_first_active_apple_path_locked(tqp->owner);
+		path = tbv_first_active_apple_path_for_qp_locked(tqp);
 		mutex_unlock(&tqp->owner->lock);
 		if (!path) {
 			atomic64_inc(&tqp->owner->data_wr_no_path);
@@ -5210,7 +5374,7 @@ static int tbv_send_read_response_ctx(struct tbv_read_resp_ctx *ctx)
 	bool selected_ref = false;
 	int ret = 0;
 
-	path = tbv_select_read_response_path(state, ctx->rx_path,
+	path = tbv_select_read_response_path(state, tqp, ctx->rx_path,
 					     req->src_qp ^ req->psn,
 					     &selected_ref);
 	if (!path)
@@ -5819,10 +5983,12 @@ static const struct ib_device_ops tbv_ibdev_ops = {
 
 static int tbv_ibdev_register_one(struct tbv_state *state,
 				  enum tbv_backend_type backend,
-				  const char *name)
+				  struct tbv_rail *rail,
+				  const char *name,
+				  struct tbv_ibdev **out)
 {
 	struct tbv_ibdev *dev;
-	struct device *dma_device;
+	struct device *dma_device = NULL;
 	int ret;
 
 	dev = ib_alloc_device(tbv_ibdev, base);
@@ -5831,11 +5997,25 @@ static int tbv_ibdev_register_one(struct tbv_state *state,
 
 	dev->state = state;
 	dev->backend = backend;
+	dev->rail = rail;
 	dev->base.phys_port_cnt = TBV_IBDEV_PORTS;
 	dev->base.num_comp_vectors = num_possible_cpus();
 	dev->base.local_dma_lkey = 0;
 	dev->base.node_type = RDMA_NODE_IB_CA;
-	dev->base.node_guid = cpu_to_be64(0x0200544256524253ULL + backend);
+	/*
+	 * Per-lane mode encodes the rail in the low bits of the node GUID so
+	 * each ib_device has a distinct GID; this matches the historical
+	 * module/ca70710 behavior where each lane was a separate HCA.
+	 */
+	if (rail)
+		dev->base.node_guid =
+			cpu_to_be64(0x0200544256524253ULL +
+				    ((u64)backend << 56) +
+				    ((u64)rail->peer->peer_id << 24) +
+				    rail->rail_id);
+	else
+		dev->base.node_guid =
+			cpu_to_be64(0x0200544256524253ULL + backend);
 	dev->base.uverbs_cmd_mask |=
 		BIT_ULL(IB_USER_VERBS_CMD_POST_SEND) |
 		BIT_ULL(IB_USER_VERBS_CMD_POST_RECV) |
@@ -5844,7 +6024,10 @@ static int tbv_ibdev_register_one(struct tbv_state *state,
 
 	ib_set_device_ops(&dev->base, &tbv_ibdev_ops);
 
-	dma_device = tbv_state_get_verbs_parent(state, backend);
+	if (rail && rail->path.tx_ring)
+		dma_device = get_device(tb_ring_dma_device(rail->path.tx_ring));
+	if (!dma_device)
+		dma_device = tbv_state_get_verbs_parent(state, backend);
 	dev->base.dev.parent = dma_device;
 	ret = ib_register_device(&dev->base, name, dma_device);
 	if (ret) {
@@ -5854,13 +6037,124 @@ static int tbv_ibdev_register_one(struct tbv_state *state,
 		return ret;
 	}
 
-	state->ibdevs[backend] = dev;
-	pr_info("registered %s ib_device %s dma_device=%s\n",
-		tbv_backend_name(backend), dev_name(&dev->base.dev),
-		dma_device ? dev_name(dma_device) : "<none>");
+	if (out)
+		*out = dev;
+	if (rail)
+		pr_info("registered %s ib_device %s rail=peer%u/%u domain=%d guid=%016llx\n",
+			tbv_backend_name(backend), dev_name(&dev->base.dev),
+			rail->peer->peer_id, rail->rail_id,
+			rail->peer->xd && rail->peer->xd->tb ?
+			rail->peer->xd->tb->index : -1,
+			be64_to_cpu(dev->base.node_guid));
+	else
+		pr_info("registered %s ib_device %s dma_device=%s\n",
+			tbv_backend_name(backend), dev_name(&dev->base.dev),
+			dma_device ? dev_name(dma_device) : "<none>");
 	if (dma_device)
 		put_device(dma_device);
 	return 0;
+}
+
+/*
+ * Compute the deterministic ib_device name suffix for a per-lane rail.
+ *
+ * The historical commit (module/ ca70710) called out that probe-order
+ * naming gives different ib_device numbers on different nodes for the
+ * same physical lane, which breaks any tooling that pins to "usb4_rdma2".
+ * Use (tb_domain_index * TBV_NATIVE_MAX_LANES + lane) so the same lane on
+ * the same domain always gets the same name. Apple peers don't carry a
+ * lane subdivision, so they take the per-domain "Apple slot" which lives
+ * just above the native lane range.
+ */
+static int tbv_ibdev_rail_name_index(const struct tbv_rail *rail)
+{
+	int domain_idx;
+	unsigned int slot;
+
+	if (!rail || !rail->peer || !rail->peer->xd || !rail->peer->xd->tb)
+		return -ENODEV;
+
+	domain_idx = rail->peer->xd->tb->index;
+	if (domain_idx < 0)
+		return -ENODEV;
+
+	if (rail->peer->backend == TBV_BACKEND_NATIVE) {
+		u32 lane = rail->key.path_id & 0xff;
+
+		if (lane >= TBV_NATIVE_MAX_LANES)
+			return -ERANGE;
+		slot = lane;
+	} else {
+		/* One slot per (domain, backend) for Apple. */
+		slot = TBV_NATIVE_MAX_LANES;
+	}
+
+	return domain_idx * (TBV_NATIVE_MAX_LANES + 1) + slot;
+}
+
+void tbv_ibdev_rail_event(struct tbv_state *state, struct tbv_rail *rail,
+			  bool joined)
+{
+	struct tbv_ibdev *dev;
+	char name[16];
+	int idx;
+	int ret;
+
+	if (!state || !rail)
+		return;
+	if (!state->register_verbs || !state->register_per_rail)
+		return;
+
+	if (joined) {
+		bool ready;
+
+		mutex_lock(&state->lock);
+		if (rail->peer->backend == TBV_BACKEND_NATIVE)
+			ready = tbv_rail_data_ready(rail);
+		else
+			ready = tbv_rail_apple_data_ready(rail);
+		ready = ready && !rail->removing;
+		mutex_unlock(&state->lock);
+		if (!ready)
+			return;
+
+		mutex_lock(&state->rail_register_lock);
+		if (rail->ibdev) {
+			mutex_unlock(&state->rail_register_lock);
+			return;
+		}
+		idx = tbv_ibdev_rail_name_index(rail);
+		if (idx < 0) {
+			mutex_unlock(&state->rail_register_lock);
+			pr_warn("rail event ignored: cannot derive deterministic name (peer=%u rail=%u err=%d)\n",
+				rail->peer->peer_id, rail->rail_id, idx);
+			return;
+		}
+		snprintf(name, sizeof(name), "usb4_rdma%d", idx);
+		dev = NULL;
+		ret = tbv_ibdev_register_one(state, rail->peer->backend, rail,
+					     name, &dev);
+		if (ret) {
+			mutex_unlock(&state->rail_register_lock);
+			pr_warn("failed to register per-rail ib_device %s: %d\n",
+				name, ret);
+			return;
+		}
+		rail->ibdev = dev;
+		mutex_unlock(&state->rail_register_lock);
+		return;
+	}
+
+	mutex_lock(&state->rail_register_lock);
+	dev = rail->ibdev;
+	rail->ibdev = NULL;
+	mutex_unlock(&state->rail_register_lock);
+	if (!dev)
+		return;
+	ib_unregister_device(&dev->base);
+	ib_dealloc_device(&dev->base);
+	pr_info("unregistered per-rail ib_device peer=%u rail=%u\n",
+		rail->peer->peer_id, rail->rail_id);
 }
 
 int tbv_ibdev_start(struct tbv_state *state, bool register_verbs)
@@ -5871,17 +6165,76 @@ int tbv_ibdev_start(struct tbv_state *state, bool register_verbs)
 	if (!register_verbs)
 		return 0;
 
+	/*
+	 * In per-lane mode the legacy aggregate ib_devices stay un-registered;
+	 * rail-up events (tbv_ibdev_rail_event) publish one ib_device per
+	 * active rail instead. The flag is checked here too, not just in the
+	 * event hook, so that ibdev_stop's teardown loop sees a consistent
+	 * empty ibdevs[] (and the rest of the kernel can still call
+	 * tbv_ibdev_rail_event after start returns).
+	 */
+	if (state->register_per_rail) {
+		struct tbv_peer *peer;
+		struct tbv_rail *catchup = NULL;
+
+		pr_info("register_per_rail=1: deferring ib_device registration to rail-up events\n");
+		state->verbs_registered = true;
+
+		/*
+		 * Catch up any rails that finished bringing data paths up
+		 * before tbv_ibdev_start ran. The hooks in native_control and
+		 * service.c are gated on register_verbs which we just set, so
+		 * future rail-up events go through the normal path.
+		 */
+		for (;;) {
+			catchup = NULL;
+			mutex_lock(&state->lock);
+			list_for_each_entry(peer, &state->peers, node) {
+				struct tbv_rail *rail;
+				bool ready;
+
+				list_for_each_entry(rail, &peer->rails, node) {
+					mutex_lock(&state->rail_register_lock);
+					if (rail->ibdev) {
+						mutex_unlock(&state->rail_register_lock);
+						continue;
+					}
+					mutex_unlock(&state->rail_register_lock);
+					if (peer->backend == TBV_BACKEND_NATIVE)
+						ready = tbv_rail_data_ready(rail);
+					else
+						ready = tbv_rail_apple_data_ready(rail);
+					if (!ready || rail->removing)
+						continue;
+					refcount_inc(&rail->refcnt);
+					catchup = rail;
+					break;
+				}
+				if (catchup)
+					break;
+			}
+			mutex_unlock(&state->lock);
+			if (!catchup)
+				break;
+			tbv_ibdev_rail_event(state, catchup, true);
+			tbv_rail_put(catchup);
+		}
+		return 0;
+	}
+
 	if (state->cfg.native_enabled) {
-		ret = tbv_ibdev_register_one(state, TBV_BACKEND_NATIVE,
-					     "usb4_rdma%d");
+		ret = tbv_ibdev_register_one(state, TBV_BACKEND_NATIVE, NULL,
+					     "usb4_rdma%d",
+					     &state->ibdevs[TBV_BACKEND_NATIVE]);
 		if (ret)
 			goto err_stop;
 	}
 
 	if (state->cfg.apple_enabled) {
-		ret = tbv_ibdev_register_one(state, TBV_BACKEND_APPLE,
+		ret = tbv_ibdev_register_one(state, TBV_BACKEND_APPLE, NULL,
 					     state->cfg.native_enabled ?
-					     "usb4_apple%d" : "usb4_rdma%d");
+					     "usb4_apple%d" : "usb4_rdma%d",
+					     &state->ibdevs[TBV_BACKEND_APPLE]);
 		if (ret)
 			goto err_stop;
 	}
@@ -5897,10 +6250,49 @@ err_stop:
 void tbv_ibdev_stop(struct tbv_state *state)
 {
 	enum tbv_backend_type backend;
+	struct tbv_peer *peer;
 
 	state->verbs_registered = false;
 	if (state->workqueue)
 		flush_workqueue(state->workqueue);
+
+	/*
+	 * Per-lane mode: walk every peer/rail and unregister anything still
+	 * published. Done under no state->lock because ib_unregister_device
+	 * can block waiting for ops to drain.
+	 */
+	if (state->register_per_rail) {
+		bool any;
+
+		do {
+			struct tbv_rail *target = NULL;
+
+			any = false;
+			mutex_lock(&state->lock);
+			list_for_each_entry(peer, &state->peers, node) {
+				struct tbv_rail *rail;
+
+				list_for_each_entry(rail, &peer->rails, node) {
+					mutex_lock(&state->rail_register_lock);
+					if (rail->ibdev) {
+						target = rail;
+						refcount_inc(&rail->refcnt);
+					}
+					mutex_unlock(&state->rail_register_lock);
+					if (target)
+						break;
+				}
+				if (target)
+					break;
+			}
+			mutex_unlock(&state->lock);
+			if (target) {
+				tbv_ibdev_rail_event(state, target, false);
+				tbv_rail_put(target);
+				any = true;
+			}
+		} while (any);
+	}
 
 	for (backend = TBV_BACKEND_NATIVE; backend <= TBV_BACKEND_APPLE;
 	     backend++) {

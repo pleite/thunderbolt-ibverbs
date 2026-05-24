@@ -272,6 +272,16 @@ void tbv_peer_remove_rail(struct tbv_rail *rail)
 	}
 	mutex_unlock(&peer->state->lock);
 
+	/*
+	 * Tear down the per-rail ib_device (if any) before the path. Any QPs
+	 * pinned to this rail hold a rail refcount, so ib_unregister_device's
+	 * destroy_qp callbacks must complete before wait_for_completion
+	 * (refs_zero) can return. This serializes data-path cleanup with
+	 * verbs lifecycle and removes any chance of post_send racing
+	 * tbv_path_destroy.
+	 */
+	tbv_ibdev_rail_event(peer->state, rail, false);
+
 	tbv_native_control_cancel_rail(rail);
 	tbv_rail_put(rail);
 	wait_for_completion(&rail->refs_zero);

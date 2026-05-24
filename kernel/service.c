@@ -188,6 +188,12 @@ static int tbv_service_enable_apple_tunnel(struct tbv_rail *rail)
 		peer->xd->route, rail->path.local_transmit_path,
 		rail->path.remote_transmit_path, rail->path.local_tx_hop,
 		rail->path.local_rx_hop);
+	/*
+	 * Apple rails have no separate native HELLO/READY; the tunnel coming
+	 * up IS the data-ready edge. Publish here while we still hold a
+	 * stable reference to rail.
+	 */
+	tbv_ibdev_rail_event(peer->state, rail, true);
 	return 0;
 }
 
