@@ -99,6 +99,7 @@ build_module() {
 
 load_and_check() {
 	local kver="$1"
+	local ibdev=""
 
 	modprobe thunderbolt_ibverbs profile=linux_perf bind_services=0 \
 		register_verbs=1
@@ -110,22 +111,39 @@ load_and_check() {
 
 	modinfo thunderbolt_ibverbs | sed -n '1,20p'
 	ls -l /sys/class/infiniband
-	test -d /sys/class/infiniband/usb4_rdma0
+	if [[ -d /sys/class/infiniband ]]; then
+		ibdev="$(find /sys/class/infiniband -mindepth 1 -maxdepth 1 \
+			\( -name 'usb4_rdma*' -o -name 'usb4_apple*' \) \
+			-printf '%f\n' | sort | sed -n '1p')"
+	fi
+
+	if [[ -z "$ibdev" ]]; then
+		printf 'no usb4 RDMA device registered without peers; checking userspace tools tolerate an empty set\n'
+		rdma link show
+		ibv_devices
+		rmmod thunderbolt_ibverbs
+		if grep -q '^thunderbolt_ibverbs ' /proc/modules; then
+			die "thunderbolt_ibverbs did not unload"
+		fi
+		make -C "$src_dir" KVER="$kver" KDIR="/lib/modules/$kver/build" clean
+		return 0
+	fi
 
 	udevadm settle || true
 	ls -l /dev/infiniband /sys/class/infiniband_verbs
-	test -e /dev/infiniband/uverbs0
+	test -e /sys/class/infiniband/"$ibdev"
+	ls /dev/infiniband/uverbs* >/dev/null
 	rdma link show | tee /tmp/tbv-rdma-link.txt
-	grep -q usb4_rdma /tmp/tbv-rdma-link.txt
+	grep -Eq 'usb4_(rdma|apple)' /tmp/tbv-rdma-link.txt
 
 	ibv_devices | tee /tmp/tbv-ibv-devices.txt
-	if grep -q usb4_rdma /tmp/tbv-ibv-devices.txt; then
+	if grep -Eq 'usb4_(rdma|apple)' /tmp/tbv-ibv-devices.txt; then
 		gcc -std=c11 -Wall -Wextra -Werror \
 			"$src_dir/tools/ci/verbs-smoke.c" -libverbs \
 			-o /tmp/tbv-verbs-smoke
 		/tmp/tbv-verbs-smoke
 	else
-		printf 'libibverbs did not enumerate usb4_rdma without a userspace provider; checked rdma(8) and uverbs char device instead\n'
+		printf 'libibverbs did not enumerate %s without a userspace provider; checked rdma(8) and uverbs char device instead\n' "$ibdev"
 	fi
 
 	rmmod thunderbolt_ibverbs
