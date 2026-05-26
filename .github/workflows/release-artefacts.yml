@@ -1,0 +1,118 @@
+name: release-artefacts
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'When triggered manually against a v* tag, also create / update a GitHub Release.'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: release-artefacts-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: build (${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: debian
+            image: debian:sid
+            dkms_glob: 'dist/thunderbolt-ibverbs-dkms_*.deb'
+            rdma_glob: 'dist/usb4-rdma-provider_*.deb'
+            all_glob:  'dist/*.deb'
+          - distro: fedora
+            image: fedora:rawhide
+            dkms_glob: 'dist/thunderbolt-ibverbs-dkms-*.rpm'
+            rdma_glob: 'dist/usb4-rdma-provider-*.rpm'
+            all_glob:  'dist/*.rpm'
+          - distro: arch
+            image: archlinux:latest
+            dkms_glob: 'dist/thunderbolt-ibverbs-dkms-*.pkg.tar.zst'
+            rdma_glob: 'dist/usb4-rdma-provider-*.pkg.tar.zst'
+            all_glob:  'dist/*.pkg.tar.zst'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build DKMS package in ${{ matrix.image }}
+        run: |
+          mkdir -p dist
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            -e TBV_LINT=1 \
+            ${{ matrix.image }} \
+            bash tools/ci/distro-package.sh ${{ matrix.distro }}
+
+      - name: Build rdma-provider package in ${{ matrix.image }}
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            ${{ matrix.image }} \
+            bash tools/ci/distro-package-rdma.sh ${{ matrix.distro }}
+          ls -la dist/
+
+      - name: Verify DKMS install in ${{ matrix.image }}
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            ${{ matrix.image }} \
+            bash tools/ci/distro-install.sh '${{ matrix.dkms_glob }}'
+
+      - name: Verify rdma-provider install in ${{ matrix.image }}
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            ${{ matrix.image }} \
+            bash tools/ci/distro-install.sh '${{ matrix.rdma_glob }}'
+
+      - name: Upload artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunderbolt-ibverbs-${{ matrix.distro }}
+          path: ${{ matrix.all_glob }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || inputs.publish) }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artefacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List collected artefacts
+        run: ls -la dist/
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* \
+              --title "$tag" \
+              --generate-notes
+          fi
