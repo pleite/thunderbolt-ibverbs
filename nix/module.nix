@@ -2,10 +2,11 @@
   lib,
   stdenv,
   kernel,
+  source ? ../.,
 }:
 
 let
-  root = ../.;
+  root = source;
   rootPrefix = "${toString root}/";
 in
 stdenv.mkDerivation {

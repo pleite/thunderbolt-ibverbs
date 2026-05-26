@@ -257,20 +257,6 @@
         kernelPatches = thunderboltKernelPatches;
       });
 
-      nixosModules.default = { config, lib, ... }:
-        let
-          cfg = config.hardware.thunderbolt-ibverbs;
-          module =
-            config.boot.kernelPackages.callPackage ./nix/module.nix { };
-        in
-        {
-          options.hardware.thunderbolt-ibverbs.enable =
-            lib.mkEnableOption "the thunderbolt_ibverbs kernel module";
-
-          config = lib.mkIf cfg.enable {
-            boot.extraModulePackages = [ module ];
-            boot.kernelModules = [ "thunderbolt_ibverbs" ];
-          };
-        };
+      nixosModules.default = import ./module.nix { inherit self; };
     };
 }
