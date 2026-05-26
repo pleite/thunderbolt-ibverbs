@@ -60,6 +60,16 @@
         };
       mkThunderboltLinuxPackages = pkgs:
         pkgs.linuxPackagesFor (mkThunderboltKernel pkgs);
+      rdmaCoreUsb4Patches = [
+        ./packaging/rdma-core-patches/0001-providers-usb4_rdma-add-USB4-soft-RDMA-provider.patch
+        ./packaging/rdma-core-patches/0002-CMakeLists.txt-build-the-usb4_rdma-provider.patch
+        ./packaging/rdma-core-patches/0003-libibverbs-verbs.h-declare-verbs_provider_usb4_rdma.patch
+      ];
+      mkRdmaCoreUsb4 = pkgs:
+        pkgs.rdma-core.overrideAttrs (old: {
+          pname = "rdma-core-usb4";
+          patches = (old.patches or [ ]) ++ rdmaCoreUsb4Patches;
+        });
       mkScriptSyntaxCheck = pkgs:
         pkgs.stdenv.mkDerivation {
           pname = "thunderbolt-ibverbs-script-syntax";
@@ -73,6 +83,8 @@
           buildPhase = ''
             runHook preBuild
             bash -n \
+              packaging/regen-rdma-core-patches.sh \
+              packaging/test-rdma-patches.sh \
               tools/ci/distro-build.sh \
               tools/ci/vm-guest-smoke.sh \
               tools/ci/vm-smoke.sh
@@ -141,6 +153,7 @@
       mkNixosVmSmoke = pkgs:
         let
           module = pkgs.linuxPackages.callPackage ./nix/module.nix { };
+          rdmaCoreUsb4 = mkRdmaCoreUsb4 pkgs;
         in
         pkgs.testers.runNixOSTest {
           name = "thunderbolt-ibverbs-vm-smoke";
@@ -149,7 +162,7 @@
             boot.extraModulePackages = [ module ];
             environment.systemPackages = [
               pkgs.kmod
-              pkgs.rdma-core
+              rdmaCoreUsb4
             ];
           };
 
@@ -171,7 +184,7 @@
           src = ./.;
 
           nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = [ pkgs.rdma-core ];
+          buildInputs = [ (mkRdmaCoreUsb4 pkgs) ];
 
           dontConfigure = true;
 
@@ -205,6 +218,7 @@
           linux-thunderbolt = thunderboltKernel;
           linux-thunderbolt-dev = thunderboltKernel.dev;
           linux-thunderbolt-modules = thunderboltKernel.modules;
+          rdma-core-usb4 = mkRdmaCoreUsb4 pkgs;
           thunderbolt-ibverbs = module;
           thunderbolt-ibverbs-linux-thunderbolt = moduleForThunderboltKernel;
         });
@@ -214,6 +228,8 @@
           self.packages.${pkgs.stdenv.hostPlatform.system}.thunderbolt-ibverbs;
         script-syntax = mkScriptSyntaxCheck pkgs;
         proto-smoke = mkProtoSmoke pkgs;
+        rdma-core-usb4 =
+          self.packages.${pkgs.stdenv.hostPlatform.system}.rdma-core-usb4;
         verbs-smoke-build = mkVerbsSmokeBuild pkgs;
       });
 
@@ -226,6 +242,8 @@
           self.packages.${pkgs.stdenv.hostPlatform.system}.linux-thunderbolt-dev;
         linux-thunderbolt-modules =
           self.packages.${pkgs.stdenv.hostPlatform.system}.linux-thunderbolt-modules;
+        rdma-core-usb4 =
+          self.packages.${pkgs.stdenv.hostPlatform.system}.rdma-core-usb4;
         thunderbolt-ibverbs-linux-thunderbolt =
           self.packages.${pkgs.stdenv.hostPlatform.system}.thunderbolt-ibverbs-linux-thunderbolt;
         checks = self.checks.${pkgs.stdenv.hostPlatform.system};
@@ -247,6 +265,7 @@
       });
 
       overlays.default = final: prev: {
+        rdma-core-usb4 = mkRdmaCoreUsb4 final;
         thunderbolt-ibverbs =
           final.linuxPackages.callPackage ./nix/module.nix { };
       };

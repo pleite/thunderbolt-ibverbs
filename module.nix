@@ -504,9 +504,12 @@ in {
 
       package = lib.mkOption {
         type = types.package;
-        default = pkgs.rdma-core;
-        defaultText = lib.literalExpression "pkgs.rdma-core";
-        description = "rdma-core package used for userspace verbs tools.";
+        default =
+          if projectPackages ? rdma-core-usb4
+          then projectPackages.rdma-core-usb4
+          else pkgs.rdma-core;
+        defaultText = lib.literalExpression "thunderbolt-ibverbs.packages.${system}.rdma-core-usb4 or pkgs.rdma-core";
+        description = "rdma-core package used for userspace verbs tools. The flake default includes the usb4_rdma libibverbs provider.";
       };
     };
 
