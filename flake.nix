@@ -1,23 +1,65 @@
 {
   description = "Thunderbolt/USB4 host-to-host RDMA verbs kernel module";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    linux-src = {
+      # Thunderbolt maintainer tree carrying the USB4STREAM/XDomain base series.
+      url = "git+https://git.kernel.org/pub/scm/linux/kernel/git/westeri/thunderbolt.git?ref=refs/heads/next&shallow=1";
+      flake = false;
+    };
+  };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, linux-src }:
     let
       lib = nixpkgs.lib;
-      optionalKernelPatches = [
-        {
-          name = "thunderbolt-nhi-ring-throttling-helper";
-          patch = ./patches/linux/0001-thunderbolt-nhi-add-per-ring-interrupt-throttling-helper.patch;
-        }
-      ];
+      usb4KernelPatches = import ./kernel-workflow/patches;
       systems = [
         "x86_64-linux"
       ];
       forAllSystems = f:
         lib.genAttrs systems (system:
           f (import nixpkgs { inherit system; }));
+      linuxSrcMakefile = builtins.readFile "${linux-src}/Makefile";
+      linuxSrcMakeVars =
+        let
+          lines = lib.splitString "\n" linuxSrcMakefile;
+          readVar = name:
+            let
+              matches = lib.filter (match: match != null)
+                (map (line: builtins.match "${name}[[:space:]]*=[[:space:]]*(.*)" line) lines);
+            in
+            if matches == [ ] then
+              throw "could not read ${name} from Linux Makefile"
+            else
+              lib.head (lib.head matches);
+        in
+        {
+          version = readVar "VERSION";
+          patchlevel = readVar "PATCHLEVEL";
+          sublevel = readVar "SUBLEVEL";
+          extraversion = readVar "EXTRAVERSION";
+        };
+      linuxSrcVersion =
+        "${linuxSrcMakeVars.version}.${linuxSrcMakeVars.patchlevel}.${linuxSrcMakeVars.sublevel}${linuxSrcMakeVars.extraversion}";
+      mkUsb4Kernel = pkgs:
+        let
+          testingKernel = pkgs.linuxPackages_testing.kernel;
+          kernelPatches =
+            (testingKernel.passthru.kernelPatches or [ ])
+            ++ usb4KernelPatches;
+        in
+        testingKernel.override {
+          argsOverride = {
+            pname = "linux-usb4";
+            version = linuxSrcVersion;
+            modDirVersion = linuxSrcVersion;
+            src = linux-src;
+            inherit kernelPatches;
+          };
+        };
+      mkUsb4LinuxPackages = pkgs:
+        pkgs.linuxPackagesFor (mkUsb4Kernel pkgs);
       mkScriptSyntaxCheck = pkgs:
         pkgs.stdenv.mkDerivation {
           pname = "thunderbolt-ibverbs-script-syntax";
@@ -153,10 +195,16 @@
       packages = forAllSystems (pkgs:
         let
           module = pkgs.linuxPackages.callPackage ./nix/module.nix { };
+          usb4Kernel = mkUsb4Kernel pkgs;
+          usb4LinuxPackages = mkUsb4LinuxPackages pkgs;
+          moduleForUsb4Kernel =
+            usb4LinuxPackages.callPackage ./nix/module.nix { };
         in
         {
           default = module;
+          linux-usb4 = usb4Kernel;
           thunderbolt-ibverbs = module;
+          thunderbolt-ibverbs-linux-usb4 = moduleForUsb4Kernel;
         });
 
       checks = forAllSystems (pkgs: {
@@ -170,6 +218,10 @@
       hydraJobs = forAllSystems (pkgs: {
         thunderbolt-ibverbs =
           self.packages.${pkgs.stdenv.hostPlatform.system}.thunderbolt-ibverbs;
+        linux-usb4 =
+          self.packages.${pkgs.stdenv.hostPlatform.system}.linux-usb4;
+        thunderbolt-ibverbs-linux-usb4 =
+          self.packages.${pkgs.stdenv.hostPlatform.system}.thunderbolt-ibverbs-linux-usb4;
         checks = self.checks.${pkgs.stdenv.hostPlatform.system};
         vm-smoke.nixos = mkNixosVmSmoke pkgs;
         distro = {
@@ -193,10 +245,10 @@
           final.linuxPackages.callPackage ./nix/module.nix { };
       };
 
-      lib.kernelPatches = optionalKernelPatches;
+      lib.kernelPatches = usb4KernelPatches;
 
       legacyPackages = forAllSystems (_pkgs: {
-        kernelPatches = optionalKernelPatches;
+        kernelPatches = usb4KernelPatches;
       });
 
       nixosModules.default = { config, lib, ... }:
