@@ -19,7 +19,7 @@ https://blog.hellas.ai/blog/thunderbolt-ibverbs/
 - The module builds against stock kernels.
 - `nhi_interrupt_throttle_ns` is active only on kernels that export
   `tb_ring_throttling()`.
-- The Nix flake builds a USB4 testing kernel from the Thunderbolt maintainer
+- The Nix flake builds a Thunderbolt testing kernel from the maintainer
   `next` branch with the local kernel patches applied.
 - Debian, Fedora, Arch, and Nix builds are exercised in CI.
 
@@ -179,16 +179,16 @@ nhi_interrupt_throttle_ns=<ns>
 
 Run `make -C kernel help` for the full parameter list.
 
-## Nix USB4 Kernel
+## Nix Thunderbolt Kernel
 
 The module loads on stock kernels. For the maintainer-tree USB4 work, the flake
-also exposes `linux-usb4`: nixpkgs' `linuxPackages_testing.kernel` with only
-the source, version, and kernel patch list overridden. It uses the nixpkgs
+also exposes `linux-thunderbolt`: nixpkgs' `linuxPackages_testing.kernel` with
+only the source, version, and kernel patch list overridden. It uses the nixpkgs
 testing kernel configuration, not a machine-local config.
 
 ```sh
-nix build .#linux-usb4
-nix build .#thunderbolt-ibverbs-linux-usb4
+nix build .#linux-thunderbolt
+nix build .#thunderbolt-ibverbs-linux-thunderbolt
 ```
 
 On NixOS, use that kernel package set and enable the module:
@@ -199,11 +199,11 @@ let
   system = pkgs.stdenv.hostPlatform.system;
   tbv = inputs.thunderbolt-ibverbs.packages.${system};
 in {
-  boot.kernelPackages = pkgs.linuxPackagesFor tbv.linux-usb4;
+  boot.kernelPackages = pkgs.linuxPackagesFor tbv.linux-thunderbolt;
   hardware.thunderbolt-ibverbs.enable = true;
 }
 ```
 
 Hydra evaluates the same path through
-`hydraJobs.x86_64-linux.linux-usb4` and
-`hydraJobs.x86_64-linux.thunderbolt-ibverbs-linux-usb4`.
+`hydraJobs.x86_64-linux.linux-thunderbolt` and
+`hydraJobs.x86_64-linux.thunderbolt-ibverbs-linux-thunderbolt`.

@@ -13,7 +13,7 @@
   outputs = { self, nixpkgs, linux-src }:
     let
       lib = nixpkgs.lib;
-      usb4KernelPatches = import ./kernel-workflow/patches;
+      thunderboltKernelPatches = import ./kernel-workflow/patches;
       systems = [
         "x86_64-linux"
       ];
@@ -42,24 +42,24 @@
         };
       linuxSrcVersion =
         "${linuxSrcMakeVars.version}.${linuxSrcMakeVars.patchlevel}.${linuxSrcMakeVars.sublevel}${linuxSrcMakeVars.extraversion}";
-      mkUsb4Kernel = pkgs:
+      mkThunderboltKernel = pkgs:
         let
           testingKernel = pkgs.linuxPackages_testing.kernel;
           kernelPatches =
             (testingKernel.passthru.kernelPatches or [ ])
-            ++ usb4KernelPatches;
+            ++ thunderboltKernelPatches;
         in
         testingKernel.override {
           argsOverride = {
-            pname = "linux-usb4";
+            pname = "linux-thunderbolt";
             version = linuxSrcVersion;
             modDirVersion = linuxSrcVersion;
             src = linux-src;
             inherit kernelPatches;
           };
         };
-      mkUsb4LinuxPackages = pkgs:
-        pkgs.linuxPackagesFor (mkUsb4Kernel pkgs);
+      mkThunderboltLinuxPackages = pkgs:
+        pkgs.linuxPackagesFor (mkThunderboltKernel pkgs);
       mkScriptSyntaxCheck = pkgs:
         pkgs.stdenv.mkDerivation {
           pname = "thunderbolt-ibverbs-script-syntax";
@@ -195,16 +195,18 @@
       packages = forAllSystems (pkgs:
         let
           module = pkgs.linuxPackages.callPackage ./nix/module.nix { };
-          usb4Kernel = mkUsb4Kernel pkgs;
-          usb4LinuxPackages = mkUsb4LinuxPackages pkgs;
-          moduleForUsb4Kernel =
-            usb4LinuxPackages.callPackage ./nix/module.nix { };
+          thunderboltKernel = mkThunderboltKernel pkgs;
+          thunderboltLinuxPackages = mkThunderboltLinuxPackages pkgs;
+          moduleForThunderboltKernel =
+            thunderboltLinuxPackages.callPackage ./nix/module.nix { };
         in
         {
           default = module;
-          linux-usb4 = usb4Kernel;
+          linux-thunderbolt = thunderboltKernel;
+          linux-thunderbolt-dev = thunderboltKernel.dev;
+          linux-thunderbolt-modules = thunderboltKernel.modules;
           thunderbolt-ibverbs = module;
-          thunderbolt-ibverbs-linux-usb4 = moduleForUsb4Kernel;
+          thunderbolt-ibverbs-linux-thunderbolt = moduleForThunderboltKernel;
         });
 
       checks = forAllSystems (pkgs: {
@@ -218,10 +220,14 @@
       hydraJobs = forAllSystems (pkgs: {
         thunderbolt-ibverbs =
           self.packages.${pkgs.stdenv.hostPlatform.system}.thunderbolt-ibverbs;
-        linux-usb4 =
-          self.packages.${pkgs.stdenv.hostPlatform.system}.linux-usb4;
-        thunderbolt-ibverbs-linux-usb4 =
-          self.packages.${pkgs.stdenv.hostPlatform.system}.thunderbolt-ibverbs-linux-usb4;
+        linux-thunderbolt =
+          self.packages.${pkgs.stdenv.hostPlatform.system}.linux-thunderbolt;
+        linux-thunderbolt-dev =
+          self.packages.${pkgs.stdenv.hostPlatform.system}.linux-thunderbolt-dev;
+        linux-thunderbolt-modules =
+          self.packages.${pkgs.stdenv.hostPlatform.system}.linux-thunderbolt-modules;
+        thunderbolt-ibverbs-linux-thunderbolt =
+          self.packages.${pkgs.stdenv.hostPlatform.system}.thunderbolt-ibverbs-linux-thunderbolt;
         checks = self.checks.${pkgs.stdenv.hostPlatform.system};
         vm-smoke.nixos = mkNixosVmSmoke pkgs;
         distro = {
@@ -245,10 +251,10 @@
           final.linuxPackages.callPackage ./nix/module.nix { };
       };
 
-      lib.kernelPatches = usb4KernelPatches;
+      lib.kernelPatches = thunderboltKernelPatches;
 
       legacyPackages = forAllSystems (_pkgs: {
-        kernelPatches = usb4KernelPatches;
+        kernelPatches = thunderboltKernelPatches;
       });
 
       nixosModules.default = { config, lib, ... }:
