@@ -23,13 +23,6 @@ from pathlib import Path
 from typing import Any
 
 
-HOST_ALIASES = {
-    "strix-1": "192.168.23.136",
-    "strix-2": "192.168.23.192",
-    "router": "192.168.23.1",
-}
-
-
 IMPORTANT_COUNTERS = [
     "verbs_qps",
     "verbs_mrs",
@@ -188,23 +181,31 @@ def require_env(name: str) -> str:
 
 RDMA_CORE = require_env("TBV_RDMA_CORE")
 PERFTEST = require_env("TBV_PERFTEST")
+PERFTEST_DARWIN = os.environ.get("TBV_PERFTEST_DARWIN", "")
 
 
-def resolve_host(host: str) -> str:
-    return HOST_ALIASES.get(host, host)
+# Set once per run by detect_systems(); maps hostname -> "Linux" / "Darwin".
+HOST_SYSTEM: dict[str, str] = {}
 
 
-def ssh_args(host: str, command: str) -> list[str]:
+def perftest_for(host: str) -> str:
+    return PERFTEST_DARWIN if HOST_SYSTEM.get(host) == "Darwin" else PERFTEST
+
+
+def rdma_core_for(host: str) -> str:
+    # Darwin uses dyld dynamic-lookup; no rdma-core build, no LD_LIBRARY_PATH.
+    return "" if HOST_SYSTEM.get(host) == "Darwin" else RDMA_CORE
+
+
+def ssh_args(target: str, command: str) -> list[str]:
     return [
         "ssh",
         "-o",
         "ConnectTimeout=8",
         "-o",
         "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-        f"root@{host}",
-        "bash -lc " + shlex.quote(command),
+        target,
+        "sudo -n bash -lc " + shlex.quote(command),
     ]
 
 
@@ -221,23 +222,23 @@ def run_local(args: list[str], *, check: bool = True, timeout: int | None = None
     return proc
 
 
-def run_ssh(host: str, command: str, *, check: bool = True, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
-    return run_local(ssh_args(host, command), check=check, timeout=timeout)
+def run_ssh(target: str, command: str, *, check: bool = True, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
+    return run_local(ssh_args(target, command), check=check, timeout=timeout)
+
+
+def detect_system(host: str) -> str:
+    """Return 'Linux' or 'Darwin' for the host via `uname -s`."""
+    out = run_ssh(host, "uname -s", check=False, timeout=10).stdout.strip()
+    return out or "Linux"
 
 
 def copy_tools(host: str) -> None:
-    run_local(
-        [
-            "nix",
-            "copy",
-            "--no-check-sigs",
-            "--to",
-            f"ssh-ng://root@{host}",
-            RDMA_CORE,
-            PERFTEST,
-        ],
-        check=True,
-    )
+    if HOST_SYSTEM.get(host) == "Darwin":
+        # Darwin closures are built natively (via remote builder); the
+        # linux closure isn't substitutable here. The mac already has its
+        # perftest path in its own nix store.
+        return
+    run_local(["nix-copy-closure", "--to", host, RDMA_CORE, PERFTEST], check=True)
 
 
 def now_utc() -> str:
@@ -331,7 +332,7 @@ def format_identity(label: str, identity: dict[str, str]) -> str:
     )
 
 
-def collect_telemetry(host: str, dev: str, backend: str | None, netdev: str | None) -> dict[str, Any]:
+def collect_telemetry(host: str, dev: str, backend: str | None, netdev: str | None, rdma_lib: str) -> dict[str, Any]:
     summary = run_ssh(
         host,
         "cat /sys/kernel/debug/thunderbolt_ibverbs/summary 2>/dev/null || true",
@@ -345,13 +346,18 @@ def collect_telemetry(host: str, dev: str, backend: str | None, netdev: str | No
         timeout=10,
     ).stdout
     rdma_link = run_ssh(host, "rdma link show 2>&1 || true", check=False, timeout=10).stdout
-    devinfo = run_ssh(
-        host,
-        f"LD_LIBRARY_PATH={shlex.quote(RDMA_CORE + '/lib')} "
-        f"{shlex.quote(RDMA_CORE + '/bin/ibv_devinfo')} -d {shlex.quote(dev)} -v 2>&1 || true",
-        check=False,
-        timeout=15,
-    ).stdout
+    if rdma_lib:
+        devinfo = run_ssh(
+            host,
+            f"LD_LIBRARY_PATH={shlex.quote(rdma_lib + '/lib')} "
+            f"{shlex.quote(rdma_lib + '/bin/ibv_devinfo')} -d {shlex.quote(dev)} -v 2>&1 || true",
+            check=False,
+            timeout=15,
+        ).stdout
+    else:
+        # No rdma-core path configured for this host (e.g. Darwin); ibv_devinfo
+        # isn't available to invoke.
+        devinfo = "(skipped: no rdma-core path)"
     params = collect_params(host)
     ip_stats = ""
     if netdev:
@@ -443,6 +449,9 @@ def strip_option(argv: list[str], flags: set[str]) -> list[str]:
 def build_perftest_command(
     case: dict[str, Any],
     *,
+    perftest_path: str,
+    rdma_lib: str,
+    pair_has_darwin: bool,
     dev: str,
     gid_index: int,
     port: int,
@@ -455,6 +464,10 @@ def build_perftest_command(
         {"--ib-dev", "-d", "--gid-index", "-x", "--port", "-p", "--out_json_file"},
     )
     argv.extend(["--ib-dev", dev, "--gid-index", str(gid_index), "--port", str(port), "-F"])
+    if pair_has_darwin and "--use_old_post_send" not in argv:
+        # Apple perftest is built with --disable-ibv_wr_api; force both sides
+        # to use the legacy post-send flow so the negotiated ABI matches.
+        argv.append("--use_old_post_send")
     if perftest_kind(case) == "bw":
         argv.append("--report_gbits")
     if perftest_kind(case) == "bw" and "--bidirectional" in argv and "--report-both" not in argv:
@@ -463,13 +476,14 @@ def build_perftest_command(
     if peer:
         argv.append(peer)
 
-    bin_path = f"{PERFTEST}/bin/{case['bin']}"
+    bin_path = f"{perftest_path}/bin/{case['bin']}"
     quoted = " ".join(shlex.quote(str(arg)) for arg in argv)
+    lib_prefix = f"LD_LIBRARY_PATH={shlex.quote(rdma_lib + '/lib')} " if rdma_lib else ""
     return (
         "set -euo pipefail; "
         f"mkdir -p {shlex.quote(str(Path(remote_json).parent))}; "
         f"cd {shlex.quote(str(Path(remote_json).parent))}; "
-        f"LD_LIBRARY_PATH={shlex.quote(RDMA_CORE + '/lib')} "
+        f"{lib_prefix}"
         f"timeout {shlex.quote(str(timeout))} {shlex.quote(bin_path)} {quoted}"
     )
 
@@ -559,9 +573,12 @@ def run_pair(
     run_id: str,
     server: str,
     client: str,
-    server_host: str,
-    client_host: str,
-    dev: str,
+    server_perftest: str,
+    client_perftest: str,
+    server_rdma_lib: str,
+    client_rdma_lib: str,
+    server_dev: str,
+    client_dev: str,
     gid_index: int,
     port: int,
     timeout: int,
@@ -570,9 +587,13 @@ def run_pair(
     remote_dir = f"/tmp/tbv-perftest/{run_id}"
     server_json = f"{remote_dir}/server.json"
     client_json = f"{remote_dir}/client.json"
+    pair_has_darwin = "Darwin" in (HOST_SYSTEM.get(server), HOST_SYSTEM.get(client))
     server_cmd = build_perftest_command(
         case,
-        dev=dev,
+        perftest_path=server_perftest,
+        rdma_lib=server_rdma_lib,
+        pair_has_darwin=pair_has_darwin,
+        dev=server_dev,
         gid_index=gid_index,
         port=port,
         timeout=timeout,
@@ -581,22 +602,25 @@ def run_pair(
     )
     client_cmd = build_perftest_command(
         case,
-        dev=dev,
+        perftest_path=client_perftest,
+        rdma_lib=client_rdma_lib,
+        pair_has_darwin=pair_has_darwin,
+        dev=client_dev,
         gid_index=gid_index,
         port=port,
         timeout=timeout,
         remote_json=client_json,
-        peer=server_host,
+        peer=server,
     )
 
     server_proc = subprocess.Popen(
-        ssh_args(server_host, server_cmd),
+        ssh_args(server, server_cmd),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
     time.sleep(server_start_delay)
-    client_proc = run_ssh(client_host, client_cmd, check=False, timeout=timeout + 20)
+    client_proc = run_ssh(client, client_cmd, check=False, timeout=timeout + 20)
     server_reap_error = ""
     try:
         server_stdout, _ = server_proc.communicate(timeout=15)
@@ -607,7 +631,7 @@ def run_pair(
         except subprocess.TimeoutExpired:
             server_proc.kill()
             server_stdout, _ = server_proc.communicate()
-            cleanup_remote_run(server_host, remote_dir)
+            cleanup_remote_run(server, remote_dir)
             server_reap_error = "server ssh cleanup timeout"
 
     raw = {
@@ -615,8 +639,8 @@ def run_pair(
         "client_stdout": client_proc.stdout,
         "server_returncode": server_proc.returncode,
         "client_returncode": client_proc.returncode,
-        "server_json": load_remote_json(server_host, server_json),
-        "client_json": load_remote_json(client_host, client_json),
+        "server_json": load_remote_json(server, server_json),
+        "client_json": load_remote_json(client, client_json),
     }
     if server_reap_error:
         return "fail", {}, f"{server_reap_error}: {server_stdout.strip()[-800:]}", raw
@@ -709,6 +733,8 @@ def main() -> int:
     parser.add_argument("--client")
     parser.add_argument("--hosts", help="Shortcut for --server A --client B")
     parser.add_argument("--dev")
+    parser.add_argument("--server-dev", help="override --dev on the server side (asymmetric pairs)")
+    parser.add_argument("--client-dev", help="override --dev on the client side (asymmetric pairs)")
     parser.add_argument("--gid-index", type=int)
     parser.add_argument("--backend")
     parser.add_argument("--netdev")
@@ -743,9 +769,13 @@ def main() -> int:
 
     server = args.server or defaults["server"]
     client = args.client or defaults["client"]
-    server_host = resolve_host(server)
-    client_host = resolve_host(client)
     dev = args.dev or defaults["dev"]
+    # Pin device per host (not per role); directions swap server/client but
+    # the host -> dev mapping stays fixed.
+    host_dev = {
+        server: args.server_dev or dev,
+        client: args.client_dev or dev,
+    }
     gid_index = args.gid_index if args.gid_index is not None else int(defaults["gidIndex"])
     backend = args.backend if args.backend is not None else defaults.get("backend")
     netdev = args.netdev or defaults.get("netdev")
@@ -773,8 +803,15 @@ def main() -> int:
             print(f"{idx:03d} {case['name']} {case['bin']} {' '.join(case.get('argv', []))}")
         return 0
 
+    if not args.dry_run:
+        for host in sorted({server, client}):
+            HOST_SYSTEM[host] = detect_system(host)
+            print(f"tbv-perftest: {host} system={HOST_SYSTEM[host]}", flush=True)
+        if "Darwin" in HOST_SYSTEM.values() and not PERFTEST_DARWIN:
+            die("a host reports Darwin but TBV_PERFTEST_DARWIN is unset; the wrapper was built without a darwin perftest reference")
+
     if copy and not args.dry_run:
-        for host in sorted({server_host, client_host}):
+        for host in sorted({server, client}):
             copy_tools(host)
 
     if args.dry_run:
@@ -796,8 +833,8 @@ def main() -> int:
     failures = 0
     run_index = 0
     try:
-        identity_server = collect_host_identity(server_host)
-        identity_client = collect_host_identity(client_host)
+        identity_server = collect_host_identity(server)
+        identity_client = collect_host_identity(client)
         print(format_identity(server, identity_server), flush=True)
         print(format_identity(client, identity_client), flush=True)
         for field in ("kernel", "module_sha256", "iommu"):
@@ -808,8 +845,8 @@ def main() -> int:
                     flush=True,
                 )
 
-        initial_server = collect_telemetry(server_host, dev, backend, netdev)
-        initial_client = collect_telemetry(client_host, dev, backend, netdev)
+        initial_server = collect_telemetry(server, host_dev[server], backend, netdev, rdma_core_for(server))
+        initial_client = collect_telemetry(client, host_dev[client], backend, netdev, rdma_core_for(client))
         assert_topology(server, initial_server, expect_rails, expect_speed)
         assert_topology(client, initial_client, expect_rails, expect_speed)
         print(
@@ -836,10 +873,8 @@ def main() -> int:
                             f"{tag}-r{repeat_index:02d}-"
                             f"{run_index:04d}-{case['name'].replace('.', '-')}-{direction_name}"
                         )
-                        run_server_host = resolve_host(run_server)
-                        run_client_host = resolve_host(run_client)
-                        before_server = collect_telemetry(run_server_host, dev, backend, netdev)
-                        before_client = collect_telemetry(run_client_host, dev, backend, netdev)
+                        before_server = collect_telemetry(run_server, host_dev[run_server], backend, netdev, rdma_core_for(run_server))
+                        before_client = collect_telemetry(run_client, host_dev[run_client], backend, netdev, rdma_core_for(run_client))
                         assert_topology(run_server, before_server, expect_rails, expect_speed)
                         assert_topology(run_client, before_client, expect_rails, expect_speed)
 
@@ -875,17 +910,20 @@ def main() -> int:
                             run_id=run_id,
                             server=run_server,
                             client=run_client,
-                            server_host=run_server_host,
-                            client_host=run_client_host,
-                            dev=dev,
+                            server_perftest=perftest_for(run_server),
+                            client_perftest=perftest_for(run_client),
+                            server_rdma_lib=rdma_core_for(run_server),
+                            client_rdma_lib=rdma_core_for(run_client),
+                            server_dev=host_dev[run_server],
+                            client_dev=host_dev[run_client],
                             gid_index=gid_index,
                             port=port,
                             timeout=timeout,
                             server_start_delay=float(defaults["serverStartDelay"]),
                         )
                         elapsed = time.monotonic() - start
-                        after_server = collect_telemetry(run_server_host, dev, backend, netdev)
-                        after_client = collect_telemetry(run_client_host, dev, backend, netdev)
+                        after_server = collect_telemetry(run_server, host_dev[run_server], backend, netdev, rdma_core_for(run_server))
+                        after_client = collect_telemetry(run_client, host_dev[run_client], backend, netdev, rdma_core_for(run_client))
                         server_delta = delta_ints(after_server["summary_counters"], before_server["summary_counters"])
                         client_delta = delta_ints(after_client["summary_counters"], before_client["summary_counters"])
                         server_rail_delta = delta_ints(after_server["rail_totals"], before_server["rail_totals"])

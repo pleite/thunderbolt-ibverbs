@@ -1,11 +1,11 @@
 { lib
 , stdenv
 , pkg-config
+, apple-sdk_26 ? null
 , rdma-core-usb4 ? null
 , python3
 , source ? ../userspace/bench
 , appleCompat ? ./apple-compat
-, appleRdmaSdk ? null
 }:
 
 let
@@ -19,6 +19,7 @@ let
     "rc_write_verify"
     "u4_pingpong"
     "uc_oneway"
+    "uc_write_verify"
   ];
 
   # Full Linux set. ibv_trace (LD_PRELOAD tracer, built as .so) and
@@ -34,8 +35,8 @@ let
 
   cPrograms = if isDarwin then darwinPrograms else linuxPrograms;
 in
-assert lib.assertMsg (!isDarwin || appleRdmaSdk != null)
-  "bench-tools Darwin build requires appleRdmaSdk";
+assert lib.assertMsg (!isDarwin || apple-sdk_26 != null)
+  "bench-tools Darwin build requires apple-sdk_26";
 stdenv.mkDerivation {
   pname =
     if isDarwin
@@ -55,7 +56,9 @@ stdenv.mkDerivation {
   };
 
   nativeBuildInputs = lib.optionals (!isDarwin) [ pkg-config ];
-  buildInputs = lib.optionals (!isDarwin) [ rdma-core-usb4 ] ++ [ python3 ];
+  buildInputs = lib.optionals (!isDarwin) [ rdma-core-usb4 ]
+    ++ lib.optionals isDarwin [ apple-sdk_26 ]
+    ++ [ python3 ];
 
   dontConfigure = true;
 
@@ -65,9 +68,8 @@ stdenv.mkDerivation {
       for name in ${lib.concatStringsSep " " cPrograms}; do
         $CC -O2 -Wall -Wextra -std=gnu11 \
           -I${appleCompat} \
-          -I${appleRdmaSdk}/include \
           "$name.c" \
-          -Wl,-undefined,dynamic_lookup \
+          -lrdma \
           -o "$name"
       done
       runHook postBuild
