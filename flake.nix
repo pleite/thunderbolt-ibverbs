@@ -196,11 +196,22 @@
           isLinux = pkgs.stdenv.hostPlatform.isLinux;
           isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
           appleRdmaSdk = mkAppleRdmaSdk pkgs;
+          rdmaCoreUsb4 = mkRdmaCoreUsb4 pkgs;
           packageArgs =
-            lib.optionalAttrs isLinux { rdma-core-usb4 = mkRdmaCoreUsb4 pkgs; }
+            lib.optionalAttrs isLinux { rdma-core-usb4 = rdmaCoreUsb4; }
             // lib.optionalAttrs isDarwin { inherit appleRdmaSdk; };
           perftest = pkgs.callPackage ./nix/perftest.nix packageArgs;
           benchTools = pkgs.callPackage ./nix/bench-tools.nix packageArgs;
+          perftestBench =
+            if isLinux then
+              import ./bench/perftest.nix {
+                inherit lib pkgs perftest;
+                rdma-core-usb4 = rdmaCoreUsb4;
+                runnerSrc = ./userspace/bench/tbv_perftest_runner.py;
+                benchConfig = import ./bench/common.nix { inherit lib; };
+              }
+            else
+              null;
         in
         {
           perftest = perftest;
@@ -221,11 +232,25 @@
             linux-thunderbolt = thunderboltKernel;
             linux-thunderbolt-dev = thunderboltKernel.dev;
             linux-thunderbolt-modules = thunderboltKernel.modules;
-            rdma-core-usb4 = mkRdmaCoreUsb4 pkgs;
+            rdma-core-usb4 = rdmaCoreUsb4;
             thunderbolt-ibverbs = module;
             thunderbolt-ibverbs-linux-thunderbolt = moduleForThunderboltKernel;
+            tbv-perftest = perftestBench.runner;
           }
         )
+      );
+
+      apps = forLinuxSystems (
+        pkgs:
+        let
+          pkgsAt = self.packages.${pkgs.stdenv.hostPlatform.system};
+        in
+        {
+          tbv-perftest = {
+            type = "app";
+            program = lib.getExe pkgsAt.tbv-perftest;
+          };
+        }
       );
 
       checks = forAllSystems (

@@ -126,6 +126,9 @@ CSV_FIELDS = [
     "kind",
     "server",
     "client",
+    "kernel",
+    "module_sha256",
+    "iommu",
     "direction",
     "dev",
     "gid_index",
@@ -285,6 +288,47 @@ def collect_params(host: str) -> str:
         "done 2>/dev/null || true"
     )
     return run_ssh(host, cmd, check=False, timeout=10).stdout
+
+
+def parse_iommu_setting(cmdline: str) -> str:
+    matches = re.findall(r"\b(?:intel_iommu|amd_iommu|iommu)=(\S+)", cmdline)
+    if not matches:
+        return "default"
+    for preferred in ("off", "pt", "on"):
+        if preferred in matches:
+            return preferred
+    return ",".join(matches)
+
+
+def collect_host_identity(host: str) -> dict[str, str]:
+    cmd = (
+        "ko=$(modinfo -F filename thunderbolt_ibverbs 2>/dev/null); "
+        "echo kernel=$(uname -r); "
+        "echo srcversion=$(cat /sys/module/thunderbolt_ibverbs/srcversion 2>/dev/null); "
+        "echo taint=$(cat /sys/module/thunderbolt_ibverbs/taint 2>/dev/null); "
+        "echo ko_path=$ko; "
+        "echo module_sha256=$(sha256sum \"$ko\" 2>/dev/null | cut -c1-16); "
+        "echo cmdline=$(tr -d '\\n' < /proc/cmdline 2>/dev/null)"
+    )
+    out = run_ssh(host, cmd, check=False, timeout=15).stdout
+    fields: dict[str, str] = {}
+    for line in out.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            fields[key.strip()] = value.strip()
+    fields["iommu"] = parse_iommu_setting(fields.get("cmdline", ""))
+    return fields
+
+
+def format_identity(label: str, identity: dict[str, str]) -> str:
+    return (
+        f"tbv-perftest: {label} "
+        f"kernel={identity.get('kernel', '?')} "
+        f"module_sha256={identity.get('module_sha256') or 'unknown'} "
+        f"srcversion={identity.get('srcversion') or '-'} "
+        f"taint={identity.get('taint') or '-'} "
+        f"iommu={identity['iommu']}"
+    )
 
 
 def collect_telemetry(host: str, dev: str, backend: str | None, netdev: str | None) -> dict[str, Any]:
@@ -669,6 +713,7 @@ def main() -> int:
     parser.add_argument("--backend")
     parser.add_argument("--netdev")
     parser.add_argument("--expect-rails", type=int)
+    parser.add_argument("--no-rail-check", action="store_true", help="skip the ready-rails / rail-speed topology check (e.g. RXE runs)")
     parser.add_argument("--expect-speed")
     parser.add_argument("--timeout", type=int)
     parser.add_argument("--base-port", type=int)
@@ -704,8 +749,12 @@ def main() -> int:
     gid_index = args.gid_index if args.gid_index is not None else int(defaults["gidIndex"])
     backend = args.backend if args.backend is not None else defaults.get("backend")
     netdev = args.netdev or defaults.get("netdev")
-    expect_rails = args.expect_rails if args.expect_rails is not None else defaults.get("expectRails")
-    expect_speed = args.expect_speed if args.expect_speed is not None else defaults.get("expectSpeed")
+    if args.no_rail_check:
+        expect_rails = None
+        expect_speed = None
+    else:
+        expect_rails = args.expect_rails if args.expect_rails is not None else defaults.get("expectRails")
+        expect_speed = args.expect_speed if args.expect_speed is not None else defaults.get("expectSpeed")
     timeout = args.timeout or int(defaults["timeout"])
     base_port = args.base_port or int(defaults["basePort"])
     directions = args.directions or defaults.get("directions", "from-plan")
@@ -747,6 +796,18 @@ def main() -> int:
     failures = 0
     run_index = 0
     try:
+        identity_server = collect_host_identity(server_host)
+        identity_client = collect_host_identity(client_host)
+        print(format_identity(server, identity_server), flush=True)
+        print(format_identity(client, identity_client), flush=True)
+        for field in ("kernel", "module_sha256", "iommu"):
+            if identity_server.get(field) != identity_client.get(field):
+                print(
+                    f"tbv-perftest: WARNING: server/client {field} mismatch",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
         initial_server = collect_telemetry(server_host, dev, backend, netdev)
         initial_client = collect_telemetry(client_host, dev, backend, netdev)
         assert_topology(server, initial_server, expect_rails, expect_speed)
@@ -794,6 +855,9 @@ def main() -> int:
                             "kind": perftest_kind(case),
                             "server": run_server,
                             "client": run_client,
+                            "kernel": identity_server.get("kernel", ""),
+                            "module_sha256": identity_server.get("module_sha256", ""),
+                            "iommu": identity_server.get("iommu", ""),
                             "direction": direction_name,
                             "dev": dev,
                             "gid_index": str(gid_index),
@@ -882,6 +946,10 @@ def main() -> int:
                             "row": row,
                             "case": case,
                             "raw": raw,
+                            "host_identity": {
+                                "server": identity_server,
+                                "client": identity_client,
+                            },
                             "telemetry": {
                                 "before_server": before_server,
                                 "before_client": before_client,
