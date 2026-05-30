@@ -225,6 +225,7 @@
             thunderboltKernel = mkThunderboltKernel pkgs;
             thunderboltLinuxPackages = mkThunderboltLinuxPackages pkgs;
             moduleForThunderboltKernel = thunderboltLinuxPackages.callPackage ./nix/module.nix { };
+            dvProbes = pkgs.callPackage ./nix/dv-probes.nix packageArgs;
           in
           {
             default = module;
@@ -235,6 +236,7 @@
             thunderbolt-ibverbs = module;
             thunderbolt-ibverbs-linux-thunderbolt = moduleForThunderboltKernel;
             tbv-perftest = perftestBench.runner;
+            tbv-dv-caps-probe = dvProbes;
           }
         )
       );
@@ -248,6 +250,10 @@
           tbv-perftest = {
             type = "app";
             program = lib.getExe pkgsAt.tbv-perftest;
+          };
+          tbv-dv-caps-probe = {
+            type = "app";
+            program = lib.getExe pkgsAt.tbv-dv-caps-probe;
           };
         }
       );
@@ -268,6 +274,7 @@
           proto-smoke = mkProtoSmoke pkgs;
           rdma-core-usb4 = pkgsAt.rdma-core-usb4;
           verbs-smoke-build = mkVerbsSmokeBuild pkgs;
+          tbv-dv-caps-probe = pkgsAt.tbv-dv-caps-probe;
         }
       );
 
@@ -289,6 +296,7 @@
           linux-thunderbolt-modules = pkgsAt.linux-thunderbolt-modules;
           rdma-core-usb4 = pkgsAt.rdma-core-usb4;
           thunderbolt-ibverbs-linux-thunderbolt = pkgsAt.thunderbolt-ibverbs-linux-thunderbolt;
+          tbv-dv-caps-probe = pkgsAt.tbv-dv-caps-probe;
           vm-smoke.nixos = mkNixosVmSmoke pkgs;
         }
       );
