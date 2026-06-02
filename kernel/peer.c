@@ -281,23 +281,24 @@ void tbv_peer_remove_rail(struct tbv_rail *rail)
 	mutex_unlock(&peer->state->lock);
 
 	/*
-	 * Tear down the per-rail ib_device (if any) before the path. Any QPs
-	 * pinned to this rail hold a rail refcount, so ib_unregister_device's
-	 * destroy_qp callbacks must complete before wait_for_completion
-	 * (refs_zero) can return. This serializes data-path cleanup with
-	 * verbs lifecycle and removes any chance of post_send racing
-	 * tbv_path_destroy.
+	 * Break the teardown dependency cycle before unregistering verbs:
+	 * QP destroy waits for WR ownership callbacks, while WR ownership may
+	 * be held by TX frames that will never complete once the rail is gone.
+	 * With removing=true above, no new QP/path selection can target this
+	 * rail, so it is safe to abort the path first and deliver flush
+	 * completions to the QPs that ib_unregister_device() will then drain.
 	 */
+	tbv_native_control_cancel_rail(rail);
+	tbv_path_destroy(&rail->path, peer->xd);
 	tbv_ibdev_rail_event(peer->state, rail, false);
 
-	tbv_native_control_cancel_rail(rail);
 	tbv_rail_put(rail);
 	wait_for_completion(&rail->refs_zero);
 
 	/*
 	 * All QPs that held a ref on this rail have now been destroyed
-	 * (their refs were dropped in tbv_destroy_qp); it is safe to
-	 * unlink the rail from peer->rails and free its path.
+	 * (their refs were dropped in tbv_destroy_qp); it is safe to unlink
+	 * the rail from peer->rails and free the rail object.
 	 */
 	mutex_lock(&peer->state->lock);
 	if (!list_empty(&rail->node)) {
@@ -307,7 +308,6 @@ void tbv_peer_remove_rail(struct tbv_rail *rail)
 	}
 	mutex_unlock(&peer->state->lock);
 
-	tbv_path_destroy(&rail->path, peer->xd);
 	ida_free(&peer->rail_ids, rail->rail_id);
 	kfree(rail);
 }

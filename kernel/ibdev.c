@@ -65,6 +65,9 @@
 #define TBV_APPLE_RAW_DESCS_PER_CHUNK 17
 #define TBV_QP_TIMEOUT_DEFAULT_MS 5000
 #define TBV_QP_TIMEOUT_WORK_INTERVAL_MS 1000
+#define TBV_SEND_RETRY_MS 100
+#define TBV_SEND_MAX_RETRIES 7
+#define TBV_SEND_ACK_CACHE_SIZE 16
 #define TBV_READ_RESP_RETRY_MS 100
 #define TBV_READ_RESP_MAX_RETRIES 3
 static char *roce_netdev;
@@ -227,6 +230,12 @@ struct tbv_rx_reorder_msg {
 	bool solicited;
 };
 
+struct tbv_send_ack_cache_entry {
+	u32 psn;
+	u8 status;
+	bool valid;
+};
+
 struct tbv_apple_pending_rx {
 	void *buf;
 	u32 capacity;
@@ -280,12 +289,15 @@ struct tbv_qp {
 	u32 recv_count;
 	u32 recv_credits_advertised;
 	u32 remote_recv_credits;
+	u32 early_remote_recv_credit_src_qp;
 	atomic_t apple_tx_inflight;
 	atomic_t apple_tx_inflight_frames;
 	u32 send_psn;
 	u32 rx_expected_psn;
 	struct tbv_rx_message rx_msg;
 	struct list_head rx_reorder;
+	struct tbv_send_ack_cache_entry send_ack_cache[TBV_SEND_ACK_CACHE_SIZE];
+	u8 send_ack_cache_next;
 	u32 rx_reorder_count;
 	u32 rx_reorder_bytes;
 	struct tbv_apple_pending_rx *apple_pending;
@@ -298,6 +310,7 @@ struct tbv_qp {
 	u32 apple_sq_outstanding;
 	bool qpn_allocated;
 	bool dest_qp_known;
+	bool early_remote_recv_credit_src_known;
 	bool closing;
 	bool timeout_work_armed;
 };
@@ -329,6 +342,7 @@ struct tbv_ibdev {
 
 struct tbv_send_ctx {
 	struct list_head node;
+	struct list_head retry_node;
 	struct tbv_qp *tqp;
 	refcount_t refs;
 	spinlock_t lock;
@@ -337,6 +351,12 @@ struct tbv_send_ctx {
 	u32 psn;
 	enum ib_wc_opcode wc_opcode;
 	atomic_t apple_pending;
+	void *retry_frame;
+	u32 retry_frame_len;
+	u8 retry_sof;
+	u8 retry_eof;
+	u8 retries;
+	bool retrying;
 	bool signaled;
 	bool completed;
 	bool apple_window_acquired;
@@ -641,6 +661,20 @@ static unsigned long tbv_read_resp_retry_jiffies(unsigned long qp_timeout)
 	return min(retry, qp_timeout);
 }
 
+static unsigned long tbv_send_retry_jiffies(unsigned long qp_timeout)
+{
+	unsigned long retry;
+
+	if (!qp_timeout)
+		return 0;
+
+	retry = msecs_to_jiffies(TBV_SEND_RETRY_MS);
+	if (!retry)
+		retry = 1;
+
+	return min(retry, qp_timeout);
+}
+
 static bool tbv_qp_entry_expired(unsigned long queued, unsigned long now,
 				 unsigned long timeout)
 {
@@ -721,6 +755,64 @@ enum tbv_rx_endpoint_status {
 	TBV_RX_ENDPOINT_QP_ERROR,
 };
 
+static const char *tbv_native_data_opcode_name(u8 opcode)
+{
+	switch (opcode) {
+	case TBV_NATIVE_DATA_OP_SEND_ACK:
+		return "send_ack";
+	case TBV_NATIVE_DATA_OP_RDMA_READ_ACK:
+		return "read_ack";
+	case TBV_NATIVE_DATA_OP_RECV_CREDIT:
+		return "recv_credit";
+	case TBV_NATIVE_DATA_OP_RDMA_READ_REQ:
+		return "read_req";
+	case TBV_NATIVE_DATA_OP_RDMA_READ_RESP:
+		return "read_resp";
+	case TBV_NATIVE_DATA_OP_SEND:
+		return "send";
+	case TBV_NATIVE_DATA_OP_SEND_IMM:
+		return "send_imm";
+	case TBV_NATIVE_DATA_OP_RDMA_WRITE:
+		return "write";
+	case TBV_NATIVE_DATA_OP_RDMA_WRITE_IMM:
+		return "write_imm";
+	default:
+		return "unknown";
+	}
+}
+
+static void tbv_count_native_rx_opcode(struct tbv_state *state, u8 opcode)
+{
+	if (!state)
+		return;
+
+	switch (opcode) {
+	case TBV_NATIVE_DATA_OP_SEND:
+	case TBV_NATIVE_DATA_OP_SEND_IMM:
+	case TBV_NATIVE_DATA_OP_RDMA_WRITE:
+	case TBV_NATIVE_DATA_OP_RDMA_WRITE_IMM:
+		atomic64_inc(&state->native_rx_data);
+		break;
+	case TBV_NATIVE_DATA_OP_SEND_ACK:
+		atomic64_inc(&state->native_rx_send_ack);
+		break;
+	case TBV_NATIVE_DATA_OP_RECV_CREDIT:
+		atomic64_inc(&state->native_rx_recv_credit);
+		break;
+	case TBV_NATIVE_DATA_OP_RDMA_READ_ACK:
+		atomic64_inc(&state->native_rx_read_ack);
+		break;
+	case TBV_NATIVE_DATA_OP_RDMA_READ_REQ:
+		atomic64_inc(&state->native_rx_read_req);
+		break;
+	case TBV_NATIVE_DATA_OP_RDMA_READ_RESP:
+		atomic64_inc(&state->native_rx_read_resp);
+		break;
+	default:
+		break;
+	}
+}
+
 static enum tbv_rx_endpoint_status
 tbv_qp_validate_native_endpoint(struct tbv_qp *tqp,
 				const struct tbv_native_data_header *hdr)
@@ -741,6 +833,84 @@ tbv_qp_validate_native_endpoint(struct tbv_qp *tqp,
 	spin_unlock_irqrestore(&tqp->lock, flags);
 
 	return status;
+}
+
+static enum tbv_rx_endpoint_status
+tbv_qp_accept_recv_credit(struct tbv_qp *tqp,
+			  const struct tbv_native_data_header *hdr)
+{
+	enum tbv_rx_endpoint_status status = TBV_RX_ENDPOINT_OK;
+	unsigned long flags;
+	u32 new_credits;
+
+	spin_lock_irqsave(&tqp->lock, flags);
+	if (tqp->closing || tqp->state == IB_QPS_ERR) {
+		status = TBV_RX_ENDPOINT_QP_ERROR;
+	} else if (hdr->dest_qp != tqp->base.qp_num) {
+		status = TBV_RX_ENDPOINT_BAD_PEER;
+	} else if (tqp->dest_qp_known) {
+		if (hdr->src_qp != tqp->attr.dest_qp_num) {
+			status = TBV_RX_ENDPOINT_BAD_PEER;
+		} else if (!check_add_overflow(tqp->remote_recv_credits,
+					       hdr->imm_data, &new_credits)) {
+			tqp->remote_recv_credits = new_credits;
+		}
+	} else if (tqp->early_remote_recv_credit_src_known &&
+		   tqp->early_remote_recv_credit_src_qp != hdr->src_qp) {
+		status = TBV_RX_ENDPOINT_BAD_PEER;
+	} else {
+		tqp->early_remote_recv_credit_src_known = true;
+		tqp->early_remote_recv_credit_src_qp = hdr->src_qp;
+		if (!check_add_overflow(tqp->remote_recv_credits,
+					hdr->imm_data, &new_credits))
+			tqp->remote_recv_credits = new_credits;
+	}
+	spin_unlock_irqrestore(&tqp->lock, flags);
+
+	return status;
+}
+
+static u8 tbv_qp_send_max_retries(const struct tbv_qp *tqp)
+{
+	return min_t(u8, tqp->attr.retry_cnt, TBV_SEND_MAX_RETRIES);
+}
+
+static void tbv_qp_note_send_ack(struct tbv_qp *tqp, u32 psn, int status)
+{
+	struct tbv_send_ack_cache_entry *entry;
+	unsigned long flags;
+
+	spin_lock_irqsave(&tqp->lock, flags);
+	entry = &tqp->send_ack_cache[tqp->send_ack_cache_next];
+	entry->psn = psn & TBV_PSN_MASK;
+	entry->status = status ? 1 : 0;
+	entry->valid = true;
+	tqp->send_ack_cache_next =
+		(tqp->send_ack_cache_next + 1) % TBV_SEND_ACK_CACHE_SIZE;
+	spin_unlock_irqrestore(&tqp->lock, flags);
+}
+
+static bool tbv_qp_lookup_send_ack(struct tbv_qp *tqp, u32 psn,
+				   int *status)
+{
+	unsigned long flags;
+	u32 masked = psn & TBV_PSN_MASK;
+	u32 i;
+	bool found = false;
+
+	spin_lock_irqsave(&tqp->lock, flags);
+	for (i = 0; i < ARRAY_SIZE(tqp->send_ack_cache); i++) {
+		struct tbv_send_ack_cache_entry *entry =
+			&tqp->send_ack_cache[i];
+
+		if (!entry->valid || entry->psn != masked)
+			continue;
+		*status = entry->status ? 1 : 0;
+		found = true;
+		break;
+	}
+	spin_unlock_irqrestore(&tqp->lock, flags);
+	return found;
 }
 
 static void tbv_qp_queue_send(struct tbv_qp *tqp, struct tbv_send_ctx *send)
@@ -1593,7 +1763,18 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 		atomic_sub(pending, &tqp->owner->verbs_recv_wqes);
 	kfree(tqp->recvq);
 	if (tqp->qpn_allocated) {
-		ida_free(&tbv_qpn_ida, qp->qp_num);
+		bool free_qpn = tbv_backend_is_apple(tqp->backend);
+
+		/*
+		 * Native USB4 rings may still deliver late control/data frames
+		 * after a QP is destroyed. Reusing a native QPN immediately lets
+		 * those stale frames target a new QP and perturb its endpoint or
+		 * credit state. The native QPN range is 24 bits, so keep native
+		 * QPNs unique until module unload. The Apple backend has one
+		 * fixed QPN and must still release it for the next UC QP.
+		 */
+		if (free_qpn)
+			ida_free(&tbv_qpn_ida, qp->qp_num);
 		tqp->qpn_allocated = false;
 	}
 	if (tqp->owner)
@@ -1650,6 +1831,11 @@ static int tbv_modify_qp(struct ib_qp *qp, struct ib_qp_attr *attr,
 	if (attr_mask & IB_QP_PATH_MTU)
 		tqp->attr.path_mtu = attr->path_mtu;
 	if (attr_mask & IB_QP_DEST_QPN) {
+		if (tqp->early_remote_recv_credit_src_known &&
+		    tqp->early_remote_recv_credit_src_qp != attr->dest_qp_num) {
+			ret = -EINVAL;
+			goto out_unlock;
+		}
 		tqp->attr.dest_qp_num = attr->dest_qp_num;
 		tqp->dest_qp_known = true;
 	}
@@ -1704,6 +1890,7 @@ static void tbv_send_ctx_get(struct tbv_send_ctx *send)
 static void tbv_send_ctx_put(struct tbv_send_ctx *send)
 {
 	if (refcount_dec_and_test(&send->refs)) {
+		kfree(send->retry_frame);
 		atomic64_dec(&send->tqp->owner->data_wr_live);
 		tbv_qp_put(send->tqp);
 		kfree(send);
@@ -1819,6 +2006,9 @@ static bool tbv_send_complete(struct tbv_send_ctx *send, int status)
 	spin_unlock_irqrestore(&send->lock, flags);
 	if (!complete)
 		return false;
+
+	if (tqp->backend == TBV_BACKEND_NATIVE)
+		tbv_cancel_send_ctx_packets(send);
 
 	tbv_apple_sq_release_slot(send);
 
@@ -1981,6 +2171,63 @@ static void tbv_send_tx_done(void *ctx, int status)
 	tbv_send_ctx_put(send);
 }
 
+static void tbv_send_retry_tx_done(void *ctx, int status)
+{
+	struct tbv_send_ctx *send = ctx;
+	struct tbv_qp *tqp = send->tqp;
+	unsigned long flags;
+
+	spin_lock_irqsave(&tqp->lock, flags);
+	send->retrying = false;
+	spin_unlock_irqrestore(&tqp->lock, flags);
+
+	if (status && tbv_qp_unqueue_send(tqp, send)) {
+		tbv_send_complete(send, status);
+		tbv_send_ctx_put(send);
+	}
+	tbv_send_ctx_put(send);
+}
+
+static int tbv_send_retry_one(struct tbv_send_ctx *send)
+{
+	struct tbv_qp *tqp = send->tqp;
+	struct tbv_state *state = tqp->owner;
+	struct tbv_path *path;
+	void *frame;
+	int ret;
+
+	if (!send->retry_frame || !send->retry_frame_len ||
+	    tbv_send_is_completed(send))
+		return -EINVAL;
+
+	frame = kmemdup(send->retry_frame, send->retry_frame_len, GFP_KERNEL);
+	if (!frame)
+		return -ENOMEM;
+
+	mutex_lock(&state->lock);
+	path = tbv_select_native_data_path_for_qp_locked(tqp);
+	mutex_unlock(&state->lock);
+	if (!path) {
+		kfree(frame);
+		return -ENOTCONN;
+	}
+
+	tbv_send_ctx_get(send);
+	ret = tbv_path_send_marked_owned(path, frame, send->retry_frame_len,
+					 send->retry_sof, send->retry_eof, 0,
+					 tbv_send_retry_tx_done, send);
+	tbv_rail_put(path->rail);
+	if (ret) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&tqp->lock, flags);
+		send->retrying = false;
+		spin_unlock_irqrestore(&tqp->lock, flags);
+		tbv_send_ctx_put(send);
+	}
+	return ret;
+}
+
 static void tbv_apple_send_complete_work(struct work_struct *work)
 {
 	struct tbv_send_ctx *send =
@@ -1992,22 +2239,41 @@ static void tbv_apple_send_complete_work(struct work_struct *work)
 }
 
 static bool tbv_qp_timeout_reap_tx(struct tbv_qp *tqp,
+				   struct list_head *retry_sends,
 				   struct list_head *timed_out_sends,
 				   struct list_head *timed_out_reads,
 				   unsigned long now,
-				   unsigned long timeout)
+				   unsigned long timeout,
+				   unsigned long send_retry_timeout)
 {
 	struct tbv_send_ctx *send, *send_tmp;
 	struct tbv_read_ctx *read, *read_tmp;
 	unsigned long flags;
+	u8 max_retries = tbv_qp_send_max_retries(tqp);
 	bool need_resched;
 	bool timed_out = false;
 	bool wake_error = false;
 
 	spin_lock_irqsave(&tqp->lock, flags);
 	list_for_each_entry_safe(send, send_tmp, &tqp->pending_sends, node) {
-		if (!tbv_qp_entry_expired(send->queued_jiffies, now, timeout))
+		unsigned long send_timeout =
+			(send->retry_frame && max_retries) ? send_retry_timeout :
+							     timeout;
+
+		if (!tbv_qp_entry_expired(send->queued_jiffies, now,
+					  send_timeout))
 			continue;
+		if (send->retrying)
+			continue;
+		if (!tqp->closing && tqp->state != IB_QPS_ERR &&
+		    send->retry_frame && send->retries < max_retries) {
+			send->retries++;
+			send->retrying = true;
+			send->queued_jiffies = now;
+			tbv_send_ctx_get(send);
+			list_add_tail(&send->retry_node, retry_sends);
+			continue;
+		}
 		list_move_tail(&send->node, timed_out_sends);
 		timed_out = true;
 	}
@@ -2023,7 +2289,8 @@ static bool tbv_qp_timeout_reap_tx(struct tbv_qp *tqp,
 		wake_error = true;
 	}
 	need_resched = !tqp->closing &&
-		       (!list_empty(&tqp->pending_sends) ||
+		       (!list_empty(retry_sends) ||
+			!list_empty(&tqp->pending_sends) ||
 			!list_empty(&tqp->pending_reads));
 	spin_unlock_irqrestore(&tqp->lock, flags);
 
@@ -2146,6 +2413,7 @@ static void tbv_qp_timeout_work(struct work_struct *work)
 	struct tbv_qp *tqp =
 		container_of(to_delayed_work(work), struct tbv_qp,
 			     timeout_work);
+	LIST_HEAD(retry_sends);
 	LIST_HEAD(timed_out_sends);
 	LIST_HEAD(timed_out_reads);
 	LIST_HEAD(retry_read_resps);
@@ -2164,12 +2432,32 @@ static void tbv_qp_timeout_work(struct work_struct *work)
 	if (!timeout)
 		return;
 
-	need_resched |= tbv_qp_timeout_reap_tx(tqp, &timed_out_sends,
+	need_resched |= tbv_qp_timeout_reap_tx(tqp, &retry_sends,
+					       &timed_out_sends,
 					       &timed_out_reads, now,
-					       timeout);
+					       timeout,
+					       tbv_send_retry_jiffies(timeout));
 	need_resched |= tbv_qp_timeout_reap_read_resps(tqp, &retry_read_resps,
 						       &drop_read_resps, now,
 						       read_resp_timeout);
+
+	while (!list_empty(&retry_sends)) {
+		struct tbv_send_ctx *send =
+			list_first_entry(&retry_sends, struct tbv_send_ctx,
+					 retry_node);
+		int ret;
+
+		list_del_init(&send->retry_node);
+		ret = tbv_send_retry_one(send);
+		if (ret) {
+			atomic64_inc(&tqp->owner->data_wr_path_send_error);
+			if (tbv_qp_unqueue_send(tqp, send)) {
+				tbv_send_complete(send, ret);
+				tbv_send_ctx_put(send);
+			}
+		}
+		tbv_send_ctx_put(send);
+	}
 
 	while (!list_empty(&timed_out_sends)) {
 		struct tbv_send_ctx *send =
@@ -2179,6 +2467,9 @@ static void tbv_qp_timeout_work(struct work_struct *work)
 		list_del_init(&send->node);
 		tbv_cancel_send_ctx_packets(send);
 		atomic64_inc(&tqp->owner->data_wr_timeout);
+		pr_info_ratelimited("tbv: send_timeout qpn=%u dest_qp=%u psn=%u state=%u closing=%d\n",
+				    tqp->base.qp_num, tqp->attr.dest_qp_num,
+				    send->psn, tqp->state, tqp->closing);
 		tbv_send_complete(send, -ETIMEDOUT);
 		tbv_send_ctx_put(send);
 	}
@@ -2191,6 +2482,9 @@ static void tbv_qp_timeout_work(struct work_struct *work)
 		list_del_init(&read->node);
 		tbv_cancel_read_ctx_packets(read);
 		atomic64_inc(&tqp->owner->data_wr_timeout);
+		pr_info_ratelimited("tbv: read_timeout qpn=%u dest_qp=%u psn=%u state=%u closing=%d\n",
+				    tqp->base.qp_num, tqp->attr.dest_qp_num,
+				    read->psn, tqp->state, tqp->closing);
 		tbv_read_complete(read, -ETIMEDOUT);
 		tbv_read_ctx_put(read);
 	}
@@ -2568,6 +2862,7 @@ static int tbv_post_apple_send(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	INIT_DELAYED_WORK(&ctx->apple_complete_work,
 			  tbv_apple_send_complete_work);
 	INIT_LIST_HEAD(&ctx->node);
+	INIT_LIST_HEAD(&ctx->retry_node);
 
 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
 	if (!entry) {
@@ -2988,6 +3283,7 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	ctx->signaled = !!(wr->send_flags & IB_SEND_SIGNALED);
 	ctx->wc_opcode = is_write ? IB_WC_RDMA_WRITE : IB_WC_SEND;
 	INIT_LIST_HEAD(&ctx->node);
+	INIT_LIST_HEAD(&ctx->retry_node);
 
 	spin_lock_irqsave(&tqp->lock, flags);
 	psn = tqp->send_psn & TBV_PSN_MASK;
@@ -3194,6 +3490,17 @@ out_unlock_paths:
 		if (ret < 0) {
 			kfree(frame);
 			goto err_release_paths_unqueue_ctx;
+		}
+		if (nfrags == 1 && !ctx->retry_frame) {
+			ctx->retry_frame = kmemdup(frame, packet_len, GFP_KERNEL);
+			if (!ctx->retry_frame) {
+				kfree(frame);
+				ret = -ENOMEM;
+				goto err_release_paths_unqueue_ctx;
+			}
+			ctx->retry_frame_len = packet_len;
+			ctx->retry_sof = TBV_DATA_PDF_FRAME_START;
+			ctx->retry_eof = TBV_DATA_PDF_FRAME_END;
 		}
 
 		owned = kzalloc(sizeof(*owned), GFP_KERNEL);
@@ -3917,7 +4224,8 @@ static int tbv_send_control_frame_on_path(struct tbv_qp *tqp,
 					  struct tbv_path *rx_path,
 					  const void *frame, u32 len)
 {
-	if (rx_path && rx_path->rail && tbv_rail_data_ready(rx_path->rail))
+	if (rx_path && rx_path->rail && tbv_rail_data_ready(rx_path->rail) &&
+	    !rx_path->rail->removing)
 		return tbv_path_send(rx_path, frame, len,
 				     TBV_PATH_SEND_CONTROL, NULL, NULL);
 
@@ -4903,6 +5211,7 @@ static void tbv_rx_finish_send(struct tbv_state *state, struct tbv_qp *tqp,
 
 	memset(msg, 0, sizeof(*msg));
 	tqp->rx_expected_psn = tbv_psn_next(psn);
+	tbv_qp_note_send_ack(tqp, psn, ack_status);
 	tbv_send_ack_on_path(tqp, rx_path, src_qp, tqp->base.qp_num, psn,
 			     ack_status);
 }
@@ -4993,6 +5302,7 @@ static bool tbv_rx_deliver_reorder_msg_locked(struct tbv_state *state,
 		ack_status = 1;
 
 	tqp->rx_expected_psn = tbv_psn_next(msg->psn);
+	tbv_qp_note_send_ack(tqp, msg->psn, ack_status);
 	tbv_send_ack_on_path(tqp, rx_path, msg->src_qp, tqp->base.qp_num,
 			     msg->psn, ack_status);
 	atomic64_inc(&state->data_rx_reorder_delivered);
@@ -5041,8 +5351,11 @@ static void tbv_rx_buffer_fragment_locked(struct tbv_state *state,
 	int ret;
 
 	if (delta < 0) {
+		int cached_status = 1;
+
+		tbv_qp_lookup_send_ack(tqp, psn, &cached_status);
 		tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
-				     hdr->dest_qp, psn, 1);
+				     hdr->dest_qp, psn, cached_status);
 		return;
 	}
 	if (delta >= TBV_RX_REORDER_MAX_MESSAGES) {
@@ -5164,7 +5477,21 @@ static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 		    msg->with_imm != with_imm ||
 		    msg->imm_data != imm_data ||
 		    msg->received != offset) {
-			if (tbv_psn_delta(psn, tqp->rx_expected_psn) > 0) {
+			s32 delta = tbv_psn_delta(psn, tqp->rx_expected_psn);
+
+			if (delta < 0) {
+				int cached_status = 1;
+
+				tbv_qp_lookup_send_ack(tqp, psn,
+						       &cached_status);
+				mutex_unlock(&tqp->rx_lock);
+				tbv_send_ack_on_path(tqp, rx_path,
+						     hdr->src_qp,
+						     hdr->dest_qp, psn,
+						     cached_status);
+				return;
+			}
+			if (delta > 0) {
 				tbv_rx_buffer_fragment_locked(state, tqp,
 							      rx_path, hdr,
 							      psn, total_len,
@@ -5724,6 +6051,8 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 		return;
 	}
 
+	tbv_count_native_rx_opcode(state, hdr->opcode);
+
 	tqp = tbv_qp_get_by_num(state, hdr->dest_qp);
 	if (!tqp) {
 		atomic64_inc(&state->data_rx_no_qp);
@@ -5741,14 +6070,50 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 		return;
 	}
 
+	if (hdr->opcode == TBV_NATIVE_DATA_OP_RECV_CREDIT) {
+		if (!hdr->imm_data) {
+			atomic64_inc(&state->data_rx_bad_header);
+			tbv_qp_put(tqp);
+			return;
+		}
+
+		endpoint_status = tbv_qp_accept_recv_credit(tqp, hdr);
+		if (endpoint_status != TBV_RX_ENDPOINT_OK) {
+			if (endpoint_status == TBV_RX_ENDPOINT_QP_ERROR)
+				atomic64_inc(&state->data_rx_qp_error);
+			else
+				atomic64_inc(&state->data_rx_bad_peer);
+			tbv_qp_put(tqp);
+			return;
+		}
+
+		atomic64_inc(&state->data_rx_ack);
+		wake_up_all(&tqp->credit_wait);
+		tbv_qp_put(tqp);
+		return;
+	}
+
 	endpoint_status = tbv_qp_validate_native_endpoint(tqp, hdr);
 	if (endpoint_status != TBV_RX_ENDPOINT_OK) {
-		if (endpoint_status == TBV_RX_ENDPOINT_UNCONNECTED)
+		if (endpoint_status == TBV_RX_ENDPOINT_UNCONNECTED) {
 			atomic64_inc(&state->data_rx_unconnected_qp);
-		else if (endpoint_status == TBV_RX_ENDPOINT_QP_ERROR)
+			pr_info_ratelimited("tbv: rx_unconnected op=%s dest_qp=%u src_qp=%u psn=%u local_qpn=%u expected_src=%u state=%u closing=%d\n",
+					    tbv_native_data_opcode_name(hdr->opcode),
+					    hdr->dest_qp, hdr->src_qp, hdr->psn,
+					    tqp->base.qp_num,
+					    tqp->attr.dest_qp_num,
+					    tqp->state, tqp->closing);
+		} else if (endpoint_status == TBV_RX_ENDPOINT_QP_ERROR) {
 			atomic64_inc(&state->data_rx_qp_error);
-		else
+			pr_info_ratelimited("tbv: rx_qp_error op=%s dest_qp=%u src_qp=%u psn=%u local_qpn=%u expected_src=%u state=%u closing=%d\n",
+					    tbv_native_data_opcode_name(hdr->opcode),
+					    hdr->dest_qp, hdr->src_qp, hdr->psn,
+					    tqp->base.qp_num,
+					    tqp->attr.dest_qp_num,
+					    tqp->state, tqp->closing);
+		} else {
 			atomic64_inc(&state->data_rx_bad_peer);
+		}
 		tbv_qp_put(tqp);
 		return;
 	}
@@ -5778,27 +6143,6 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 			if (ctx)
 				tbv_read_resp_ctx_put(ctx);
 		}
-		tbv_qp_put(tqp);
-		return;
-	}
-
-	if (hdr->opcode == TBV_NATIVE_DATA_OP_RECV_CREDIT) {
-		unsigned long flags;
-		u32 new_credits;
-
-		atomic64_inc(&state->data_rx_ack);
-		if (!hdr->imm_data) {
-			atomic64_inc(&state->data_rx_bad_header);
-			tbv_qp_put(tqp);
-			return;
-		}
-
-		spin_lock_irqsave(&tqp->lock, flags);
-		if (!check_add_overflow(tqp->remote_recv_credits,
-					hdr->imm_data, &new_credits))
-			tqp->remote_recv_credits = new_credits;
-		spin_unlock_irqrestore(&tqp->lock, flags);
-		wake_up_all(&tqp->credit_wait);
 		tbv_qp_put(tqp);
 		return;
 	}

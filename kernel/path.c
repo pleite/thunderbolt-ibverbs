@@ -100,6 +100,7 @@ struct tbv_tx_packet {
 	void *owner_ctx;
 	u8 sof;
 	u8 eof;
+	u8 native_opcode;
 	bool control;
 	bool pooled;
 	bool queued;
@@ -119,6 +120,48 @@ static u32 tbv_frame_len(const struct ring_frame *frame)
 static struct tbv_state *tbv_path_state(struct tbv_path *path)
 {
 	return path->rail && path->rail->peer ? path->rail->peer->state : NULL;
+}
+
+static u8 tbv_native_opcode_from_packet(const void *data, u32 len)
+{
+	struct tbv_native_data_header hdr;
+
+	if (tbv_native_data_parse_header(data, len, &hdr))
+		return 0;
+
+	return hdr.opcode;
+}
+
+static void tbv_count_native_tx_opcode(struct tbv_state *state, u8 opcode)
+{
+	if (!state)
+		return;
+
+	switch (opcode) {
+	case TBV_NATIVE_DATA_OP_SEND:
+	case TBV_NATIVE_DATA_OP_SEND_IMM:
+	case TBV_NATIVE_DATA_OP_RDMA_WRITE:
+	case TBV_NATIVE_DATA_OP_RDMA_WRITE_IMM:
+		atomic64_inc(&state->native_tx_data);
+		break;
+	case TBV_NATIVE_DATA_OP_SEND_ACK:
+		atomic64_inc(&state->native_tx_send_ack);
+		break;
+	case TBV_NATIVE_DATA_OP_RECV_CREDIT:
+		atomic64_inc(&state->native_tx_recv_credit);
+		break;
+	case TBV_NATIVE_DATA_OP_RDMA_READ_ACK:
+		atomic64_inc(&state->native_tx_read_ack);
+		break;
+	case TBV_NATIVE_DATA_OP_RDMA_READ_REQ:
+		atomic64_inc(&state->native_tx_read_req);
+		break;
+	case TBV_NATIVE_DATA_OP_RDMA_READ_RESP:
+		atomic64_inc(&state->native_tx_read_resp);
+		break;
+	default:
+		break;
+	}
 }
 
 static u32 tbv_path_control_packet_count(const struct tbv_path *path)
@@ -186,6 +229,7 @@ static void tbv_path_tx_packet_release(struct tbv_tx_packet *packet, int status)
 	packet->done_ctx = NULL;
 	packet->owner_ctx = NULL;
 	packet->len = 0;
+	packet->native_opcode = 0;
 	packet->queued = false;
 	packet->inflight = false;
 
@@ -1123,6 +1167,7 @@ tbv_path_alloc_data_packet_owned(struct tbv_path *path, u8 *buf, u32 len,
 	packet->owner_ctx = done_ctx;
 	packet->sof = TBV_DATA_PDF_FRAME_START;
 	packet->eof = TBV_DATA_PDF_FRAME_END;
+	packet->native_opcode = tbv_native_opcode_from_packet(buf, len);
 	return packet;
 }
 
@@ -1167,6 +1212,7 @@ static struct tbv_tx_packet *tbv_path_alloc_pooled_data_packet(
 	packet->owner_ctx = done_ctx;
 	packet->sof = TBV_DATA_PDF_FRAME_START;
 	packet->eof = TBV_DATA_PDF_FRAME_END;
+	packet->native_opcode = 0;
 	packet->control = false;
 	packet->queued = false;
 	packet->zcopy = false;
@@ -1197,6 +1243,7 @@ tbv_path_alloc_zcopy_packet(struct tbv_path *path, dma_addr_t dma, u32 len,
 	packet->owner_ctx = done_ctx;
 	packet->sof = TBV_DATA_PDF_FRAME_START;
 	packet->eof = TBV_DATA_PDF_FRAME_END;
+	packet->native_opcode = 0;
 	packet->zcopy = true;
 	packet->unmap_dma = unmap_dma;
 	return packet;
@@ -1245,6 +1292,7 @@ static int tbv_path_enqueue_control(struct tbv_path *path, const void *data,
 	packet->owner_ctx = NULL;
 	packet->sof = TBV_DATA_PDF_FRAME_START;
 	packet->eof = TBV_DATA_PDF_FRAME_END;
+	packet->native_opcode = tbv_native_opcode_from_packet(data, len);
 	packet->pooled = pooled;
 	packet->queued = true;
 	memcpy(packet->buf, data, len);
@@ -1521,6 +1569,8 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 
 			ret = tb_ring_tx(path->tx_ring, &packet->frame);
 			if (!ret) {
+				tbv_count_native_tx_opcode(state,
+							   packet->native_opcode);
 				if (state)
 					atomic64_inc(&state->data_tx_posted);
 				atomic64_inc(&path->data_tx_posted);
@@ -1578,6 +1628,7 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 
 		ret = tb_ring_tx(path->tx_ring, &f->frame);
 		if (!ret) {
+			tbv_count_native_tx_opcode(state, packet->native_opcode);
 			if (state)
 				atomic64_inc(&state->data_tx_posted);
 			if (!packet->control)
@@ -1735,6 +1786,8 @@ int tbv_path_send_marked_fill(struct tbv_path *path, u32 len,
 			tbv_path_tx_packet_release(packet, ret);
 			return ret;
 		}
+		packet->native_opcode = tbv_native_opcode_from_packet(packet->buf,
+								      len);
 	} else {
 		buf = kmalloc(len, GFP_KERNEL);
 		if (!buf)
@@ -1957,6 +2010,7 @@ int tbv_path_send_page_stream(struct tbv_path *path,
 		goto err_release;
 	}
 	packet->raw_stream_start = true;
+	packet->native_opcode = 0;
 	list_add_tail(&packet->node, &packets);
 	packet_count++;
 
@@ -2003,6 +2057,7 @@ int tbv_path_send_page_stream(struct tbv_path *path,
 		}
 		packet->owner_ctx = meta_done_ctx ? meta_done_ctx : done_ctx;
 		packet->raw_stream_end = last;
+		packet->native_opcode = stream_hdr.opcode;
 		list_add_tail(&packet->node, &packets);
 		packet_count++;
 		prepared += len;
@@ -2158,6 +2213,61 @@ static void tbv_path_flush_tx_queue(struct tbv_path *path, int status)
 	}
 }
 
+static void tbv_path_flush_tx_inflight(struct tbv_path *path, int status)
+{
+	struct tbv_tx_packet *packet;
+	struct tbv_tx_packet *tmp;
+	struct tbv_state *state = tbv_path_state(path);
+	LIST_HEAD(release);
+	unsigned long flags;
+	u32 i;
+
+	spin_lock_irqsave(&path->tx_lock, flags);
+	for (i = 0; i < path->tx_frame_count; i++) {
+		struct tbv_data_frame *f = &path->tx_frames[i];
+
+		packet = f->packet;
+		if (!packet)
+			continue;
+
+		f->packet = NULL;
+		f->done = NULL;
+		f->done_ctx = NULL;
+		f->frame.callback = NULL;
+		f->frame.size = 0;
+		f->frame.flags = 0;
+		f->frame.sof = 0;
+		f->frame.eof = 0;
+		list_add_tail(&f->free_node, &path->tx_free);
+		list_add_tail(&packet->node, &release);
+		if (atomic_read(&path->tx_inflight) > 0)
+			atomic_dec(&path->tx_inflight);
+		if (state)
+			atomic64_inc(&state->data_tx_canceled);
+	}
+
+	list_for_each_entry_safe(packet, tmp, &path->tx_zcopy_inflight, node) {
+		list_del_init(&packet->node);
+		packet->inflight = false;
+		list_add_tail(&packet->node, &release);
+		if (atomic_read(&path->tx_inflight) > 0)
+			atomic_dec(&path->tx_inflight);
+		if (state)
+			atomic64_inc(&state->data_tx_canceled);
+	}
+
+	path->tx_raw_stream_active = false;
+	path->tx_raw_stream_owner = NULL;
+	spin_unlock_irqrestore(&path->tx_lock, flags);
+
+	while (!list_empty(&release)) {
+		packet = list_first_entry(&release, struct tbv_tx_packet, node);
+		list_del_init(&packet->node);
+		tbv_path_finish_raw_stream_if_needed(path, packet);
+		tbv_path_tx_packet_release(packet, status);
+	}
+}
+
 void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd)
 {
 	bool tunnel_enabled = path->state == TBV_PATH_TUNNEL_ENABLED;
@@ -2187,6 +2297,7 @@ void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd)
 	}
 
 	tbv_path_flush_tx_queue(path, -ECANCELED);
+	tbv_path_flush_tx_inflight(path, -ECANCELED);
 
 	if (path->rx_ring) {
 		tbv_path_free_frames(path, false);

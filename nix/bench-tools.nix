@@ -15,6 +15,7 @@ let
   # plain libibverbs verbs surface, no Linux-specific kernel uapi or
   # LD_PRELOAD-style entrypoints.
   darwinPrograms = [
+    "rc_send_churn"
     "rc_write_poll"
     "rc_write_verify"
     "u4_pingpong"

@@ -391,8 +391,22 @@
               pkgsAt.bench-tools
             ]
             ++ lib.optionals isLinux [
+              pkgs.bpftrace
+              pkgs.bpftools
+              pkgs.bcc
+              pkgs.ethtool
+              pkgs.gdb
+              pkgs.iproute2
               pkgs.kmod
+              pkgs.lsof
+              pkgs.ltrace
+              pkgs.pciutils
+              pkgs.perf
               pkgsAt.rdma-core-usb4
+              pkgs.strace
+              pkgs.tcpdump
+              pkgs.trace-cmd
+              pkgs.usbutils
             ];
             meta = {
               maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
