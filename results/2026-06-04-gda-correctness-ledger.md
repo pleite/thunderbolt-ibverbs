@@ -1849,3 +1849,31 @@ Interpretation:
    high-loss unfenced pressure. Current evidence points to the no-QP ACK-history
    gap as the reproducible correctness bug fixed here; the older hard reset is
    now lower-frequency or a separate trigger, not reproduced by this row.
+
+### Post-Stress Normal Sanity
+
+Reloaded both modules, restored no-injection defaults, and ran the ordinary
+fenced row:
+
+```text
+count=256 timeout_ms=60000 native_tx_max_inflight=6 qp_timeout_ms=30000
+receiver native_ack_drop_every=0
+final_fence=1
+port=18541
+sender:   status=OK elapsed_sec=0.055204
+receiver: status=OK elapsed_sec=0.055296
+```
+
+Counters after the row:
+
+```text
+sender data_wr_send=512 data_wr_retransmit=0 data_wr_retry_exhausted=0 data_wr_timeout=0
+sender data_rx_ack_match_retried=0 data_rx_ack_miss=0 data_rx_canceled=0
+
+receiver data_tx_ack_drop_injected=0 data_rx_duplicate_ack=0
+receiver data_rx_no_qp=0 data_rx_no_qp_reack=0 data_rx_no_qp_error_ack=0
+receiver data_rx_canceled=0
+```
+
+Interpretation: after the hostile unfenced rows, the clean fast path still
+behaves normally and the live hosts were left with ACK injection disabled.
