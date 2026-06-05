@@ -2106,3 +2106,36 @@ Interpretation:
 4. After the A/B, both modules were reloaded and restored to safe defaults:
    `native_qp_tombstone_reack=1`, `native_ack_drop_every=0`,
    `qp_timeout_ms=30000`, `native_tx_max_inflight=6`.
+
+Post-A/B clean sanity:
+
+```text
+count=256 timeout_ms=60000 native_tx_max_inflight=6 qp_timeout_ms=30000
+native_ack_drop_every=0
+native_qp_tombstone_reack=1
+final_fence=1
+port=18562
+sender:   status=OK elapsed_sec=0.056416
+receiver: status=OK elapsed_sec=0.056488
+
+sender:
+data_wr_send=512
+data_wr_retransmit=0
+data_wr_retransmit_closing_qp=0
+data_wr_retransmit_no_live_path=0
+data_wr_retransmit_teardown_path=0
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_rx_ack_match_retried=0
+data_rx_ack_miss=0
+data_rx_canceled=0
+data_rx_no_qp=0
+
+receiver:
+data_tx_ack_drop_injected=0
+data_rx_duplicate_ack=0
+data_rx_no_qp=0
+data_rx_no_qp_reack=0
+data_rx_no_qp_error_ack=0
+data_rx_canceled=0
+```
