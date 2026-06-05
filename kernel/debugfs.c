@@ -69,6 +69,8 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->native_legacy_ambiguous_limited));
 	seq_printf(s, "native_qp_tombstone_reack: %u\n",
 		   tbv_ibdev_native_qp_tombstone_reack_enabled());
+	seq_printf(s, "native_qp_tombstone_max: %u\n",
+		   tbv_ibdev_native_qp_tombstone_max());
 	seq_printf(s, "native_retransmit_teardown_guard: %u\n",
 		   tbv_ibdev_native_retransmit_teardown_guard_enabled());
 	seq_printf(s, "configured_links: %u\n", tbv_link_count(state));

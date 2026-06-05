@@ -69,7 +69,7 @@
 #define TBV_RX_REORDER_MAX_BYTES (64u * 1024u * 1024u)
 #define TBV_RX_REORDER_MAX_FRAGS TBV_NATIVE_DATA_MAX_FRAGS
 #define TBV_ACK_HISTORY_SIZE TBV_IBDEV_MAX_QP_WR
-#define TBV_QP_TOMBSTONE_MAX 128
+#define TBV_QP_TOMBSTONE_DEFAULT_MAX 4096
 #define TBV_QP_TOMBSTONE_LIFETIME_MS 30000
 #define TBV_IBDEV_GID_TBL_LEN 8
 #define TBV_APPLE_PENDING_RX_DEFAULT_SLOTS 4096
@@ -92,6 +92,7 @@
 #define TBV_GSI_MAD_META_PKEY_OFF 32
 static char *roce_netdev;
 static bool native_qp_tombstone_reack = true;
+static uint native_qp_tombstone_max = TBV_QP_TOMBSTONE_DEFAULT_MAX;
 static bool native_unsafe_retransmit_teardown_guard_disable;
 module_param(roce_netdev, charp, 0444);
 MODULE_PARM_DESC(roce_netdev,
@@ -105,6 +106,13 @@ const char *tbv_ibdev_roce_netdev_name(void)
 bool tbv_ibdev_native_qp_tombstone_reack_enabled(void)
 {
 	return READ_ONCE(native_qp_tombstone_reack);
+}
+
+u32 tbv_ibdev_native_qp_tombstone_max(void)
+{
+	uint max = READ_ONCE(native_qp_tombstone_max);
+
+	return max ? max : 1;
 }
 
 bool tbv_ibdev_native_retransmit_teardown_guard_enabled(void)
@@ -141,6 +149,10 @@ MODULE_PARM_DESC(native_ack_drop_every,
 module_param(native_qp_tombstone_reack, bool, 0644);
 MODULE_PARM_DESC(native_qp_tombstone_reack,
 		 "Re-ACK duplicate native SEND/WRITE frames that arrive after QP teardown using destroyed-QP tombstone history; disabling recreates old no-QP drop behavior for A/B testing");
+
+module_param(native_qp_tombstone_max, uint, 0644);
+MODULE_PARM_DESC(native_qp_tombstone_max,
+		 "Maximum destroyed-QP tombstones retained for native late-retransmit re-ACK; minimum effective value is 1");
 
 module_param(native_unsafe_retransmit_teardown_guard_disable, bool, 0644);
 MODULE_PARM_DESC(native_unsafe_retransmit_teardown_guard_disable,
@@ -1519,6 +1531,7 @@ static void tbv_qp_publish_tombstone(struct tbv_qp *tqp)
 	u32 evicted_qpn = 0;
 	u32 evicted_remote_qpn = 0;
 	u32 tombstone_count;
+	u32 tombstone_max;
 	u32 remote_qpn;
 
 	if (!READ_ONCE(native_qp_tombstone_reack))
@@ -1549,6 +1562,7 @@ static void tbv_qp_publish_tombstone(struct tbv_qp *tqp)
 	mutex_unlock(&tqp->rx_lock);
 
 	spin_lock_irqsave(&state->qp_tombstone_lock, flags);
+	tombstone_max = tbv_ibdev_native_qp_tombstone_max();
 	tbv_qp_prune_tombstones_locked(state, jiffies);
 	list_for_each_entry_safe(pos, tmp, &state->qp_tombstones, node) {
 		if (pos->qpn != ts->qpn || pos->remote_qpn != ts->remote_qpn)
@@ -1561,7 +1575,7 @@ static void tbv_qp_publish_tombstone(struct tbv_qp *tqp)
 	}
 	list_add(&ts->node, &state->qp_tombstones);
 	state->qp_tombstone_count++;
-	while (state->qp_tombstone_count > TBV_QP_TOMBSTONE_MAX) {
+	while (state->qp_tombstone_count > tombstone_max) {
 		pos = list_last_entry(&state->qp_tombstones,
 				      struct tbv_qp_tombstone, node);
 		list_del(&pos->node);
@@ -1578,7 +1592,7 @@ static void tbv_qp_publish_tombstone(struct tbv_qp *tqp)
 	if (evicted)
 		pr_warn_ratelimited("native QP tombstone cap evicted qpn=0x%x remote_qpn=0x%x count=%u cap=%u\n",
 				    evicted_qpn, evicted_remote_qpn,
-				    tombstone_count, TBV_QP_TOMBSTONE_MAX);
+				    tombstone_count, tombstone_max);
 }
 
 static bool tbv_native_data_op_has_send_ack(u8 opcode)
