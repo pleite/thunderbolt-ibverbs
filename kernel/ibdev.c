@@ -92,6 +92,7 @@
 #define TBV_GSI_MAD_META_PKEY_OFF 32
 static char *roce_netdev;
 static bool native_qp_tombstone_reack = true;
+static bool native_unsafe_retransmit_teardown_guard_disable;
 module_param(roce_netdev, charp, 0444);
 MODULE_PARM_DESC(roce_netdev,
 		 "Netdev used for RoCE GID metadata, for example br0.lan");
@@ -104,6 +105,11 @@ const char *tbv_ibdev_roce_netdev_name(void)
 bool tbv_ibdev_native_qp_tombstone_reack_enabled(void)
 {
 	return READ_ONCE(native_qp_tombstone_reack);
+}
+
+bool tbv_ibdev_native_retransmit_teardown_guard_enabled(void)
+{
+	return !READ_ONCE(native_unsafe_retransmit_teardown_guard_disable);
 }
 
 static uint zcopy_min_bytes;
@@ -135,6 +141,10 @@ MODULE_PARM_DESC(native_ack_drop_every,
 module_param(native_qp_tombstone_reack, bool, 0644);
 MODULE_PARM_DESC(native_qp_tombstone_reack,
 		 "Re-ACK duplicate native SEND/WRITE frames that arrive after QP teardown using destroyed-QP tombstone history; disabling recreates old no-QP drop behavior for A/B testing");
+
+module_param(native_unsafe_retransmit_teardown_guard_disable, bool, 0644);
+MODULE_PARM_DESC(native_unsafe_retransmit_teardown_guard_disable,
+		 "Unsafe fault injection: allow retry retransmits to continue after selecting a tearing-down native path; 0 keeps the guard enabled");
 
 static uint apple_tx_max_inflight_wr = 16;
 module_param(apple_tx_max_inflight_wr, uint, 0644);
@@ -1385,7 +1395,7 @@ tbv_retransmit_path_teardown_observed(struct tbv_send_ctx *ctx,
 			    ctx->psn, reason, rail ? rail->rail_id : U32_MAX,
 			    rail_active, rail_removing, path_state,
 			    missing_tx, missing_rx);
-	return true;
+	return !READ_ONCE(native_unsafe_retransmit_teardown_guard_disable);
 }
 
 static bool
