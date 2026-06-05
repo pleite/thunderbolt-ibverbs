@@ -2289,13 +2289,63 @@ data_rx_no_qp_error_ack=0
 data_rx_canceled=0
 ```
 
+Direct same-build guard-on contrast:
+
+```text
+count=256 timeout_ms=60000 native_tx_max_inflight=6 qp_timeout_ms=200
+receiver native_ack_drop_every=2
+native_qp_tombstone_reack=0 on both hosts
+native_retransmit_teardown_guard=1 on both hosts
+final_fence=0
+port=18566
+sender:   failed, wc error wr_id=513 status=12
+receiver: status=OK elapsed_sec=18.357129
+pstore: empty on both hosts
+netconsole: explicit <0> markers from both hosts reached collector
+```
+
+Sender (`strix-2`) counters:
+
+```text
+data_wr_send=512
+data_wr_retransmit=262
+data_wr_retransmit_closing_qp=0
+data_wr_retransmit_no_live_path=0
+data_wr_retransmit_teardown_path=0
+data_wr_retry_exhausted=1
+data_wr_timeout=1
+data_rx_ack=2802
+data_rx_ack_matched=650
+data_rx_ack_match_retried=255
+data_rx_ack_match_over_64ms=255
+data_rx_late_ack=2152
+data_rx_canceled=0
+data_rx_no_qp=0
+```
+
+Receiver (`strix-1`) counters:
+
+```text
+data_tx_posted=3017 data_tx_completed=3017
+data_rx_completed=6905
+data_rx_canceled=0
+data_tx_ack_ok=2802
+native_tx_send_ack=2801
+data_tx_ack_drop_checked=2802 data_tx_ack_drop_injected=1401
+data_rx_duplicate_ack=2290
+data_rx_no_qp=7
+data_rx_no_qp_reack=0
+data_rx_no_qp_error_ack=0
+data_qp_tombstone_evicted=0
+```
+
 Interpretation:
 
 1. Disabling both tombstone re-ack and the sender retransmit teardown guard
-   reproduced the destructive `strix-2` hard reset. The earlier
-   tombstone-off/guard-on row failed gracefully with retry exhaustion and the
-   host stayed up. That is strong evidence the guard is not cosmetic: removing
-   it reopens the crash-era behavior.
+   reproduced the destructive `strix-2` hard reset. On the same deployed build,
+   the tombstone-off/guard-on contrast failed gracefully with retry exhaustion
+   and the host stayed up. That is strong evidence the guard is not cosmetic:
+   removing it reopens the crash-era behavior.
 2. This still did not produce a stack. The sender rebooted without pstore
    contents and without a netconsole panic/oops. Persistent journald has no
    final kernel line after the unsafe parameters were written; normal logging
@@ -2303,9 +2353,9 @@ Interpretation:
 3. The old receiver-side near-miss signature returned at the same time:
    `data_rx_canceled=4096` and `data_rx_no_qp=119`, followed by peer/ring
    teardown on `strix-1`. The tombstone/guard-safe rows keep this at zero.
-4. The previous guard-on tombstone-off A/B had sender guard counters at zero,
-   so there is still no non-destructive counter trace from the exact sender
-   line that reset. The honest statement is: guard-off makes the crash
+4. The same-build guard-on/tombstone-off row still had sender guard counters at
+   zero, so there is no positive non-destructive counter trace from the exact
+   sender line that reset. The honest statement is: guard-off makes the crash
    reproducible again; guard-on has so far converted this test family to either
    graceful timeout (tombstone off) or success (tombstone on).
 5. Netconsole requires explicit high-priority markers (`<0>...`) for reliable
