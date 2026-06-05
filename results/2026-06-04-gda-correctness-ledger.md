@@ -930,3 +930,96 @@ with the rebuilt module from
 5. Repeat the ACK=1 matrix only after path/NHI-level counters exist. The goal is
    not to find a lower "safe" TX limit; it is to find the exact layer where the
    ACK disappears.
+
+## 2026-06-05 Correctness Stack Retest After Rebase
+
+The missing HIP/GDA probes are now packaged in the flake so this test artifact
+is reproducible instead of being a local binary:
+
+```text
+36d1fc3 nix: package HIP GDA probes
+d83fc33 native: auto-disable E2E on AMD NHI
+```
+
+The new package is exposed as `.#tbv-hip-gda-probes`, included in the Linux
+dev shell, and exported by the overlay as `tbv-hip-gda-probes`. The built output
+used for this retest was:
+
+```text
+/nix/store/z9nf2cxbzh3d9c9bi4i8r8hjyampwndb-tbv-hip-gda-probes-0.1.0
+```
+
+Verification before running:
+
+```text
+nix build --no-link .#tbv-hip-gda-probes .#thunderbolt-ibverbs \
+  .#checks.x86_64-linux.proto-smoke \
+  .#checks.x86_64-linux.portable-kernel-patches
+nix build --no-link .#bench-tools
+nix flake check --no-build
+git diff --check
+```
+
+Both Strix hosts were clean-reloaded with `thunderbolt-ibverbs-reload-system`,
+then run with:
+
+```text
+native_e2e=-1
+native_tx_max_inflight=6
+```
+
+On AMD/Strix, `native_e2e=-1` auto-disables hardware E2E for native rings. Live
+paths showed `path_cfg ... e2e=0 wire_flags=0x1`.
+
+Important caveat: this is not a literal replay of the old
+`send_ack_redundancy=1` row. That parameter is gone in the rebased correctness
+stack. OK SEND_ACKs are now sent on every live native path for the QP, so one
+logical ACK produces two ACK frames in this two-rail run.
+
+Five repeated runs of the old pressure row all passed:
+
+```text
+hip_rdma_write_visibility_probe \
+  --kind host-uncached --mode normal --size 65536 --count 256 \
+  --dev usb4_rdma0 --gid-index 1 --timeout-ms 15000
+```
+
+Each run returned `send_result ... status=OK` and
+`recv_result ... status=OK`; observed elapsed times were about 0.052-0.061 s.
+
+Cumulative post-run counters:
+
+```text
+strix-1 receiver:
+data_tx_posted=5840 data_tx_completed=5840
+data_tx_canceled=0 data_tx_errors=0
+data_rx_completed=23040 data_rx_canceled=0 data_rx_repost_failed=0
+data_rx_bad_frame=0 data_rx_bad_header=0
+data_tx_ack_ok=2560 native_tx_send_ack=5120
+data_tx_ack_send_error=0
+data_rx_no_qp=0 data_rx_bad_peer=0 data_rx_unconnected_qp=0 data_rx_qp_error=0
+path_tx inflight=0 on all paths
+
+strix-2 sender:
+data_wr_send=2560 data_wr_live=0 data_wr_timeout=0 data_wr_retransmit=0
+data_tx_posted=23040 data_tx_completed=23040
+data_tx_canceled=0 data_tx_errors=0
+data_rx_completed=5840 data_rx_canceled=0 data_rx_repost_failed=0
+data_rx_ack=5120 data_rx_ack_matched=2560
+data_rx_late_ack=2560 data_rx_ack_miss=0
+native_rx_send_ack=5120
+data_rx_no_qp=0 data_rx_bad_peer=0 data_rx_unconnected_qp=0 data_rx_qp_error=0
+path_tx inflight=0 on all paths
+```
+
+Interpretation:
+
+1. The correctness stack no longer reproduces the old copied-WR ACK timeout in
+   this pressure row across five runs.
+2. The ACK path now has the expected duplicate shape: every logical ACK is
+   matched once and observed once more as a late duplicate.
+3. The old late-duplicate teardown wart did not appear here: `data_rx_no_qp=0`
+   after userspace exit on both hosts.
+4. This does not prove the transport is reliable. It proves that the current
+   software ACK replication plus AMD E2E auto-disable survives this formerly
+   failing GDA visibility row.
