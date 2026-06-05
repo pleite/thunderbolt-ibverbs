@@ -2526,10 +2526,16 @@ old RCCL test wrapper:
 
 old vLLM/PyTorch wrapper:
 /nix/store/3mr3fgrn6znah88jrc42r2wh692x24km-vllm-env-therock-usb4-hostheap-gfx1151
+```
 
 strix-1 has both closures.
-strix-2 currently lacks both closures and the TheRock/rocSHMEM/RCCL dependencies
-needed by those wrappers.
+strix-2 initially lacked both closures and the TheRock/rocSHMEM/RCCL
+dependencies needed by those wrappers. The RCCL test closure and dependencies
+were staged to strix-2 with:
+
+```text
+nix copy --to ssh-ng://strix-2 --no-check-sigs \
+  /nix/store/4bhvq0qphnq9ardka495pmji5f5130a0-rccl-tests-usb4-hostheap-gfx1151-2.14.1-local
 ```
 
 The pre-existing app-level benchmark scripts in
@@ -2558,3 +2564,149 @@ primarily stresses all-reduce/all-gather, while the USB4 RCCL/rocSHMEM route
 that has been validated is all-to-all/all-to-allv. vLLM can be run as a
 separate end-to-end application sanity check after the RCCL/rocSHMEM counter
 smoke passes on this rebased kernel.
+
+RCCL/rocSHMEM app smoke after staging:
+
+```text
+log root: /tmp/usb4-rccl-gda-20260606
+hosts: strix-1,strix-2
+MPI TCP iface: eno1
+RCCL tests:
+  /nix/store/4bhvq0qphnq9ardka495pmji5f5130a0-rccl-tests-usb4-hostheap-gfx1151-2.14.1-local/bin
+RCCL:
+  /nix/store/gkickq51z5rlysmdlp74sxswhcyib740-rccl-usb4-hostheap-gfx1151-2.28.9-local
+rocSHMEM:
+  /nix/store/6k7p8rayvrpq95r89q9hakc5967m5xmh-rocshmem-usb4-hostheap-gfx1151-3.4.0-local
+```
+
+Raw rocSHMEM `Alltoallmem_On_Stream`, `-a 76 -s 524288 -z 64 -n 20
+-noverif`:
+
+```text
+262144 B: 682.25 us, 1.43 GB/s
+524288 B: 653.44 us, 2.99 GB/s
+dv_poll_wqes sum       +1440
+dv_hard_error sum         +0
+data_wr_copy_error sum    +0
+data_wr_timeout sum       +0
+data_tx_errors sum        +0
+```
+
+`rccl-tests alltoall_perf`, ordinary RCCL fallback,
+`RCCL_ROCSHMEM_ENABLE=0`, `-b 262144 -e 524288 -n 3 -w 1 -c 1`:
+
+```text
+262144 B out-of-place: 252.25 us, 1.04 GB/s, wrong=0
+524288 B out-of-place: 442.95 us, 1.18 GB/s, wrong=0
+dv_poll_wqes sum          +0
+dv_hard_error sum         +0
+data_wr_copy_error sum    +0
+data_wr_timeout sum       +0
+data_tx_errors sum        +0
+```
+
+`rccl-tests alltoall_perf`, RCCL host-stream GDA,
+`RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL=1`, same sizes:
+
+```text
+262144 B out-of-place: 1819.16 us, 0.14 GB/s, wrong=0
+524288 B out-of-place: 29699.6 us, 0.02 GB/s, wrong=0
+dv_poll_wqes sum         +88
+dv_hard_error sum         +0
+data_wr_copy_error sum    +0
+data_wr_timeout sum       +0
+data_tx_errors sum        +0
+```
+
+`rccl-tests alltoall_perf`, default RCCL device-side GDA,
+`RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL=0`, same sizes:
+
+```text
+262144 B out-of-place: 2539.87 us, 0.10 GB/s, wrong=0
+524288 B out-of-place: 59259.1 us, 0.01 GB/s, wrong=0
+dv_poll_wqes sum         +88
+dv_hard_error sum         +0
+data_wr_copy_error sum    +0
+data_wr_timeout sum       +0
+data_tx_errors sum        +0
+```
+
+Full RCCL smoke suite with default RCCL device-side GDA:
+
+```text
+broadcast/all_gather/all_reduce:
+  completed, dv_poll_wqes sum +0 as expected
+
+alltoall_perf -b 65536 -e 1048576 -n 3 -w 1 -c 1:
+  65536 B out-of-place: 740.74 us, wrong=0
+  262144 B out-of-place: 1772.59 us, wrong=0
+  1048576 B out-of-place: 48256.4 us, wrong=0
+  dv_poll_wqes sum +140
+
+alltoallv_perf -b 65536 -e 1048576 -n 3 -w 1 -c 1:
+  65536 B out-of-place: 694.86 us, wrong=0
+  262144 B out-of-place: 1722.33 us, wrong=0
+  1048576 B out-of-place: 5579.94 us, wrong=0
+  dv_poll_wqes sum +140
+
+all smoke labels:
+  dv_hard_error sum         +0
+  data_wr_copy_error sum    +0
+  data_wr_timeout sum       +0
+  data_tx_errors sum        +0
+```
+
+Post-run driver health:
+
+```text
+strix-1:
+dv_poll_wqes=948
+dv_hard_error=0
+data_wr_copy_error=0
+data_wr_retransmit=15
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_tx_posted=1524809
+data_tx_completed=1524809
+data_tx_errors=0
+data_rx_canceled=0
+data_rx_no_qp=0
+data_qp_tombstone_evicted=350
+
+strix-2:
+dv_poll_wqes=948
+dv_hard_error=0
+data_wr_copy_error=0
+data_wr_retransmit=39
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_tx_posted=5927276
+data_tx_completed=5927276
+data_tx_errors=0
+data_rx_canceled=0
+data_rx_no_qp=2
+data_qp_tombstone_evicted=350
+```
+
+No matching `BUG`, `Oops`, `panic`, watchdog, lockup, hard-error, timeout, or
+GPU-fault lines appeared in the last 300 dmesg lines on either host.
+
+Interpretation:
+
+1. This is the first post-rebase application-level RCCL/rocSHMEM smoke on the
+   corrected GDA stack. It proves PyTorch-adjacent RCCL test binaries can drive
+   all-to-all and all-to-allv through USB4 GDA on this kernel: DV counters move
+   exactly on the routed collectives, and the fallback/control collectives stay
+   off DV.
+2. Correctness is good in these small runs: all checked RCCL tests report
+   `wrong=0`, no DV hard errors, no copy errors, no WR timeouts, no TX errors,
+   and posted/completed stay matched after the run.
+3. Performance is still the application-level problem. Raw rocSHMEM at 524 KiB
+   is about 653 us, ordinary RCCL fallback is about 443 us, while RCCL GDA is
+   much slower and size-sensitive. That keeps the optimization target in the
+   RCCL/rocSHMEM integration path, not the kernel data path.
+4. App-level QP churn hit the tombstone LRU cap (`data_qp_tombstone_evicted=350`
+   on both hosts). No late no-QP re-ack or timeout followed in this run, but the
+   cap is no longer hypothetical under application workloads. Before longer
+   benchmark sweeps, raise the cap or make it tunable so heavy QP churn cannot
+   evict a tombstone that a late retransmit still needs.
