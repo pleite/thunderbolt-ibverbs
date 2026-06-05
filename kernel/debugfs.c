@@ -29,6 +29,21 @@ static u32 tbv_debugfs_list_count(const struct list_head *head)
 	return count;
 }
 
+static int tbv_debugfs_ring_hop(const struct tb_ring *ring)
+{
+	return ring ? ring->hop : -1;
+}
+
+static unsigned int tbv_debugfs_ring_flags(const struct tb_ring *ring)
+{
+	return ring ? ring->flags : 0;
+}
+
+static int tbv_debugfs_ring_e2e_tx_hop(const struct tb_ring *ring)
+{
+	return ring ? ring->e2e_tx_hop : -1;
+}
+
 static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 {
 	struct tbv_state *state = s->private;
@@ -549,6 +564,86 @@ static int tbv_debugfs_peers_show(struct seq_file *s, void *unused)
 
 DEFINE_SHOW_ATTRIBUTE(tbv_debugfs_peers);
 
+static int tbv_debugfs_peer_identity_show(struct seq_file *s, void *unused)
+{
+	struct tbv_state *state = s->private;
+	struct tbv_peer *peer;
+
+	seq_puts(s,
+		 "# one rail per line; key_link/key_depth are xd->link/xd->depth as stored in tbv_rail_key\n");
+	seq_printf(s,
+		   "# native_single_peer=%u native_source_aware=%u native_legacy_ambiguous_limited=%lld\n",
+		   state->native_single_peer,
+		   state->native_control_source_aware,
+		   atomic64_read(&state->native_legacy_ambiguous_limited));
+
+	mutex_lock(&state->lock);
+	list_for_each_entry(peer, &state->peers, node) {
+		const struct tb_xdomain *xd = peer->xd;
+		struct tbv_rail *rail;
+
+		seq_printf(s,
+			   "peer peer=%u backend=%s refs=%u rails=%u native_qp_rr_rail_id=%u xd_dev=%s xd_route=0x%llx xd_link=%u xd_depth=%u xd_link_speed=%uGb/s xd_link_width=0x%x xd_usb4=%u",
+			   peer->peer_id, tbv_backend_name(peer->backend),
+			   refcount_read(&peer->refcnt), peer->nr_rails,
+			   peer->native_qp_rr_rail_id,
+			   xd ? dev_name(&xd->dev) : "<none>",
+			   xd ? xd->route : 0, xd ? xd->link : 0,
+			   xd ? xd->depth : 0, xd ? xd->link_speed : 0,
+			   xd ? xd->link_width : 0, xd ? xd->link_usb4 : 0);
+		if (xd && xd->remote_uuid)
+			seq_printf(s, " remote_uuid=%pUb\n", xd->remote_uuid);
+		else
+			seq_puts(s, " remote_uuid=<none>\n");
+
+		list_for_each_entry(rail, &peer->rails, node) {
+			struct tbv_path *path = &rail->path;
+			struct tb_ring *tx_ring = READ_ONCE(path->tx_ring);
+			struct tb_ring *rx_ring = READ_ONCE(path->rx_ring);
+			bool data_ready = peer->backend == TBV_BACKEND_APPLE ?
+				tbv_rail_apple_data_ready(rail) :
+				tbv_rail_data_ready(rail);
+
+			seq_printf(s,
+				   "rail peer=%u rail=0x%x key_hash=0x%08x native_lane=%u active=%u removing=%u data_ready=%u state=%s qp_binds=%d key_route=0x%llx key_link=%u key_depth=%u key_path_id=%u link_speed=%uGb/s link_width=0x%x cfg_tx_hop=%d cfg_rx_hop=%d cfg_tx_path=%d cfg_rx_path=%d cfg_tx_flags=0x%x cfg_rx_flags=0x%x cfg_e2e=%u wire_flags=0x%x tx_ring_hop=%d rx_ring_hop=%d tx_ring_flags=0x%x rx_ring_flags=0x%x rx_ring_e2e_tx_hop=%d local_out=%d local_tx=%d local_rx=%d path_remote_out=%d remote_rail=0x%x remote_out=%d remote_tx=%d remote_rx=%d attempts_native=%u attempts_ready=%u attempts_tunnel=%u last_error=%d\n",
+				   peer->peer_id, rail->rail_id,
+				   tbv_rail_key_hash(&rail->key),
+				   rail->native_lane, rail->active,
+				   rail->removing, data_ready,
+				   tbv_path_state_name(path->state),
+				   atomic_read(&rail->native_qp_bind_count),
+				   rail->key.route, rail->key.local_adapter,
+				   rail->key.remote_adapter, rail->key.path_id,
+				   rail->link_speed, rail->link_width,
+				   path->cfg.tx_hop, path->cfg.rx_hop,
+				   path->cfg.transmit_path,
+				   path->cfg.receive_path, path->cfg.tx_flags,
+				   path->cfg.rx_flags, path->cfg.e2e,
+				   tbv_debugfs_wire_path_flags(path),
+				   tbv_debugfs_ring_hop(tx_ring),
+				   tbv_debugfs_ring_hop(rx_ring),
+				   tbv_debugfs_ring_flags(tx_ring),
+				   tbv_debugfs_ring_flags(rx_ring),
+				   tbv_debugfs_ring_e2e_tx_hop(rx_ring),
+				   path->local_transmit_path,
+				   path->local_tx_hop, path->local_rx_hop,
+				   path->remote_transmit_path,
+				   rail->remote_rail_id,
+				   rail->remote_transmit_path,
+				   rail->remote_tx_hop, rail->remote_rx_hop,
+				   rail->native_attempts,
+				   rail->native_ready_attempts,
+				   rail->native_tunnel_attempts,
+				   rail->native_last_error);
+		}
+	}
+	mutex_unlock(&state->lock);
+
+	return 0;
+}
+
+DEFINE_SHOW_ATTRIBUTE(tbv_debugfs_peer_identity);
+
 static int tbv_debugfs_configured_links_show(struct seq_file *s, void *unused)
 {
 	struct tbv_state *state = s->private;
@@ -571,6 +666,8 @@ int tbv_debugfs_init(struct tbv_state *state)
 			    &tbv_debugfs_summary_fops);
 	debugfs_create_file("peers", 0444, state->debugfs_dir, state,
 			    &tbv_debugfs_peers_fops);
+	debugfs_create_file("peer_identity", 0444, state->debugfs_dir, state,
+			    &tbv_debugfs_peer_identity_fops);
 	debugfs_create_file("configured_links", 0444, state->debugfs_dir,
 			    state, &tbv_debugfs_configured_links_fops);
 	return 0;
