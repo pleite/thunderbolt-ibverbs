@@ -71,6 +71,7 @@ struct opts {
 	int timeout_ms;
 	uint32_t count;
 	size_t size;
+	bool unsafe_no_final_fence;
 	enum load_mode mode;
 	enum source_fill source_fill;
 	enum source_reg source_reg;
@@ -447,7 +448,8 @@ static void usage(const char *argv0)
 		"                         ext-finegrained|ext-uncached|hsa-gpu-extended]\n"
 		"          [--source-fill cpu|gpu|gpu-hdp|gpu-sync|gpu-hdp-sync|gpu-host-hdp]\n"
 		"          [--source-reg reg_mr|dmabuf]\n"
-		"          [--size BYTES] [--count N] [--timeout-ms N]\n",
+		"          [--size BYTES] [--count N] [--timeout-ms N]\n"
+		"          [--unsafe-no-final-fence]\n",
 		argv0);
 }
 
@@ -510,6 +512,8 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 			o->count = (uint32_t)strtoul(argv[++i], NULL, 0);
 		} else if (!strcmp(argv[i], "--size") && i + 1 < argc) {
 			o->size = strtoull(argv[++i], NULL, 0);
+		} else if (!strcmp(argv[i], "--unsafe-no-final-fence")) {
+			o->unsafe_no_final_fence = true;
 		} else {
 			return -1;
 		}
@@ -1441,17 +1445,21 @@ static int run_receiver(struct opts *o, int sock, HipRegion *region,
 			hipGetErrorString(hret));
 		goto out_sync;
 	}
-	if (recv_all_with_timeout(sock, &done, 1, o->timeout_ms) ||
-	    done != 'D') {
-		fprintf(stderr,
-			"receiver did not get sender completion fence\n");
-		goto out_sync;
+	if (!o->unsafe_no_final_fence) {
+		if (recv_all_with_timeout(sock, &done, 1, o->timeout_ms) ||
+		    done != 'D') {
+			fprintf(stderr,
+				"receiver did not get sender completion fence\n");
+			goto out_sync;
+		}
 	}
 
 	{
 		double secs = (double)(now_ns() - start_ns) / 1000000000.0;
-		printf("recv_result kind=%s mode=%s size=%zu count=%u status=OK elapsed_sec=%.6f avg_us=%.3f gpu_spins=%" PRIu64 " prefetch_sink=0x%x\n",
-		       o->kind, o->mode_name, o->size, o->count, secs,
+		printf("recv_result kind=%s mode=%s size=%zu count=%u final_fence=%u status=OK elapsed_sec=%.6f avg_us=%.3f gpu_spins=%" PRIu64 " prefetch_sink=0x%x\n",
+		       o->kind, o->mode_name, o->size, o->count,
+		       o->unsafe_no_final_fence ? 0u : 1u,
+		       secs,
 		       secs * 1000000.0 / (double)o->count,
 		       region->state->gpu_spins, region->state->prefetch_sink);
 	}
@@ -1501,16 +1509,19 @@ static int run_sender(struct opts *o, int sock, struct ibv_pd *pd,
 			goto out_src;
 		}
 	}
-	if (send_all(sock, &done, 1)) {
-		perror("done send");
-		goto out_src;
+	if (!o->unsafe_no_final_fence) {
+		if (send_all(sock, &done, 1)) {
+			perror("done send");
+			goto out_src;
+		}
 	}
 
 	{
 		double secs = (double)(now_ns() - start_ns) / 1000000000.0;
-		printf("send_result source_kind=%s source_fill=%s source_reg=%s size=%zu count=%u status=OK elapsed_sec=%.6f avg_us=%.3f remote_addr=0x%016" PRIx64 " remote_rkey=0x%x\n",
+		printf("send_result source_kind=%s source_fill=%s source_reg=%s size=%zu count=%u final_fence=%u status=OK elapsed_sec=%.6f avg_us=%.3f remote_addr=0x%016" PRIx64 " remote_rkey=0x%x\n",
 		       o->source_kind, o->source_fill_name, o->source_reg_name,
-		       o->size, o->count, secs,
+		       o->size, o->count, o->unsafe_no_final_fence ? 0u : 1u,
+		       secs,
 		       secs * 1000000.0 / (double)o->count,
 		       remote->addr, remote->rkey);
 	}
