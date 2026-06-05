@@ -4,7 +4,7 @@
 , apple-sdk_26 ? null
 , rdma-core-usb4 ? null
 , python3
-, source ? ../userspace/bench
+, source ? ../userspace
 , appleCompat ? ./apple-compat
 }:
 
@@ -28,6 +28,8 @@ let
   linuxPrograms = darwinPrograms ++ [
     "rc_qpn_churn"
     "rdma_gid_probe"
+    "tbv_dv_caps_probe"
+    "tbv_dv_send_probe"
   ];
 
   scripts = [
@@ -49,11 +51,13 @@ stdenv.mkDerivation {
 
   src = lib.cleanSourceWith {
     src = source;
-    filter = path: _type:
+    filter = path: type:
       let
         rel = baseNameOf (toString path);
       in
-        lib.hasSuffix ".c" rel
+        type == "directory"
+        || lib.hasSuffix ".c" rel
+        || lib.hasSuffix ".h" rel
         || lib.hasSuffix ".py" rel
         || lib.hasSuffix ".sh" rel;
   };
@@ -68,12 +72,12 @@ stdenv.mkDerivation {
   buildPhase =
     if isDarwin then ''
       runHook preBuild
-      for name in ${lib.concatStringsSep " " cPrograms}; do
-        $CC -O2 -Wall -Wextra -std=gnu11 \
-          -I${appleCompat} \
-          "$name.c" \
-          -lrdma \
-          -o "$name"
+	      for name in ${lib.concatStringsSep " " cPrograms}; do
+	        $CC -O2 -Wall -Wextra -std=gnu11 \
+	          -I${appleCompat} \
+	          "bench/$name.c" \
+	          -lrdma \
+	          -o "$name"
       done
       runHook postBuild
     '' else ''
@@ -83,18 +87,19 @@ stdenv.mkDerivation {
         case "$name" in
           uc_oneway) extra="-ldl" ;;
         esac
-        $CC -O2 -Wall -Wextra -std=gnu11 \
-          -I${rdma-core-usb4.dev}/include \
-          "$name.c" \
-          -L${rdma-core-usb4}/lib -libverbs \
-          $extra \
+	        $CC -O2 -Wall -Wextra -std=gnu11 \
+	          -I${rdma-core-usb4.dev}/include \
+	          -Iusb4_rdma \
+	          "bench/$name.c" \
+	          -L${rdma-core-usb4}/lib -libverbs \
+	          $extra \
           -Wl,-rpath,${rdma-core-usb4}/lib \
           -o "$name"
       done
-      $CC -O2 -Wall -Wextra -fPIC -shared \
-        -I${rdma-core-usb4.dev}/include \
-        ibv_trace.c \
-        -ldl -lpthread \
+	      $CC -O2 -Wall -Wextra -fPIC -shared \
+	        -I${rdma-core-usb4.dev}/include \
+	        bench/ibv_trace.c \
+	        -ldl -lpthread \
         -L${rdma-core-usb4}/lib -libverbs \
         -Wl,-rpath,${rdma-core-usb4}/lib \
         -o libibv_trace.so
@@ -105,7 +110,7 @@ stdenv.mkDerivation {
     runHook preInstall
     mkdir -p $out/bin
     install -m 0755 ${lib.concatStringsSep " " cPrograms} $out/bin/
-    install -m 0755 ${lib.concatStringsSep " " scripts} $out/bin/
+    install -m 0755 ${lib.concatMapStringsSep " " (script: "bench/${script}") scripts} $out/bin/
     ${lib.optionalString (!isDarwin) ''
       mkdir -p $out/lib
       install -m 0644 libibv_trace.so $out/lib/

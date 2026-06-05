@@ -3,17 +3,16 @@
 #define pr_fmt(fmt) "thunderbolt_ibverbs: " fmt
 
 #include <linux/errno.h>
+#include <linux/moduleparam.h>
 #include <linux/slab.h>
 #include <linux/thunderbolt.h>
 
 #include "tbv.h"
 
-static bool tbv_peer_matches(const struct tbv_peer *peer,
-			     enum tbv_backend_type backend,
-			     const struct tb_xdomain *xd)
-{
-	return peer->backend == backend && peer->xd == xd;
-}
+static bool native_e2e = true;
+module_param(native_e2e, bool, 0444);
+MODULE_PARM_DESC(native_e2e,
+		 "Enable E2E flow control on native Linux data rings");
 
 static bool tbv_xdomain_same_remote_host(const struct tb_xdomain *a,
 					 const struct tb_xdomain *b)
@@ -28,6 +27,31 @@ static bool tbv_xdomain_same_remote_host(const struct tb_xdomain *a,
 
 	return a->route == b->route && a->link == b->link &&
 	       a->depth == b->depth;
+}
+
+static bool tbv_xdomain_same_route_key(const struct tb_xdomain *a,
+				       const struct tb_xdomain *b)
+{
+	if (a == b)
+		return true;
+	if (!a || !b)
+		return false;
+
+	return a->route == b->route && a->link == b->link &&
+	       a->depth == b->depth;
+}
+
+static bool tbv_peer_matches(const struct tbv_peer *peer,
+			     enum tbv_backend_type backend,
+			     const struct tb_xdomain *xd)
+{
+	if (peer->backend != backend)
+		return false;
+	if (backend == TBV_BACKEND_NATIVE && peer->state &&
+	    peer->state->native_single_peer)
+		return tbv_xdomain_same_route_key(peer->xd, xd);
+
+	return peer->xd == xd;
 }
 
 static bool tbv_native_legacy_xdomain_allowed_locked(struct tbv_state *state,
@@ -205,12 +229,12 @@ struct tbv_rail *tbv_peer_add_rail(struct tbv_peer *peer,
 	rail->native_remote_ready = false;
 	tbv_native_control_init_rail(rail, peer);
 	tbv_path_default_config(peer->backend, &path_cfg);
-	if (peer->backend == TBV_BACKEND_NATIVE) {
+	if (peer->backend == TBV_BACKEND_NATIVE && native_e2e) {
 		/*
 		 * Native rails only bind to Linux peers.  Even in mixed mode the
 		 * Mac-facing wire format is handled by the separate Apple
-		 * backend, so native can keep the hardware E2E delivery contract
-		 * needed for RC semantics.
+		 * backend, so native can keep hardware E2E enabled by default.
+		 * native_e2e=0 is a diagnostic override for loss localization.
 		 */
 		path_cfg.tx_flags |= RING_FLAG_E2E;
 		path_cfg.rx_flags |= RING_FLAG_E2E;

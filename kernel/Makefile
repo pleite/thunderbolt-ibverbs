@@ -45,6 +45,7 @@ help:
 	@echo "  start_rings=0|1"
 	@echo "  negotiate_native=0|1"
 	@echo "  enable_tunnels=0|1"
+	@echo "  allow_source_blind_native=0|1"
 	@echo "  register_verbs=0|1"
 	@echo "  native_prtcstns=<u32>"
 	@echo "  apple_prtcstns=<u32>"

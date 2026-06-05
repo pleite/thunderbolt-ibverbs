@@ -201,6 +201,7 @@ struct tbv_path {
 	atomic64_t data_tx_credit_stalls;
 	atomic64_t data_tx_credit_received;
 	atomic64_t data_rx_completed;
+	atomic64_t data_rx_canceled;
 	atomic64_t data_rx_credit_sent;
 	atomic64_t data_rx_credit_send_error;
 	atomic64_t data_rx_repost_failed;
@@ -444,6 +445,8 @@ struct tbv_state {
 	bool native_data;
 	bool apple_data;
 	bool native_fragment_striping;
+	bool native_single_peer;
+	u32 native_link_speed_filter;
 	bool register_verbs;
 	bool services_registered;
 	bool verbs_registered;
@@ -455,6 +458,11 @@ struct tbv_state {
 	struct work_struct apple_tunnel_work;
 	struct workqueue_struct *workqueue;
 	struct notifier_block ibdev_netdev_nb;
+	struct task_struct *dv_poll_task;
+	struct mutex dv_poll_lock;
+	struct list_head dv_poll_qps;
+	wait_queue_head_t dv_poll_wait;
+	u32 dv_poll_qp_count;
 	atomic_t verbs_ucontexts;
 	atomic_t verbs_pds;
 	atomic_t verbs_cqs;
@@ -484,6 +492,8 @@ struct tbv_state {
 	atomic64_t data_wr_retry_exhausted;
 	atomic64_t data_wr_rnr_retry_exhausted;
 	atomic64_t data_wr_timeout;
+	atomic64_t data_wr_send_timeout;
+	atomic64_t data_wr_timeout_last_psn;
 	atomic64_t apple_sq_queued;
 	atomic64_t apple_sq_dequeued;
 	atomic64_t apple_sq_full;
@@ -496,6 +506,7 @@ struct tbv_state {
 	atomic64_t data_tx_credit_stalls;
 	atomic64_t data_tx_credit_received;
 	atomic64_t data_rx_completed;
+	atomic64_t data_rx_canceled;
 	atomic64_t data_rx_credit_sent;
 	atomic64_t data_rx_credit_send_error;
 	atomic64_t data_rx_repost_failed;
@@ -585,6 +596,14 @@ struct tbv_state {
 	atomic64_t apple_rx_eof_without_active;
 	atomic64_t apple_rx_len_overrun;
 	atomic64_t data_cq_overflow;
+	atomic64_t dv_poll_scans;
+	atomic64_t dv_poll_wqes;
+	atomic64_t dv_poll_budget_exhausted;
+	atomic64_t dv_poll_errors;
+	atomic64_t dv_admission_attempts;
+	atomic64_t dv_backpressure_retry;
+	atomic64_t dv_fence_retry;
+	atomic64_t dv_hard_error;
 	atomic64_t native_legacy_ambiguous_limited;
 	struct xarray verbs_mrs_xa;
 	struct xarray verbs_qps_xa;
@@ -617,6 +636,8 @@ struct tbv_service_config {
 	bool start_rings;
 	bool negotiate_native;
 	bool enable_tunnels;
+	bool allow_source_blind_native;
+	u32 native_link_speed_filter;
 };
 
 struct tb_property_dir;
@@ -762,6 +783,7 @@ int tbv_path_enable_tunnel(struct tbv_path *path, struct tb_xdomain *xd,
 			   int remote_transmit_path);
 void tbv_path_set_remote_rx_capacity(struct tbv_path *path, u32 rx_ring_size);
 void tbv_path_add_remote_rx_credits(struct tbv_path *path, u32 credits);
+int tbv_path_try_reserve_data(struct tbv_path *path, u32 frames);
 int tbv_path_reserve_data(struct tbv_path *path, u32 frames);
 void tbv_path_release_data_reservation(struct tbv_path *path, u32 frames);
 int tbv_path_send(struct tbv_path *path, const void *data, u32 len,

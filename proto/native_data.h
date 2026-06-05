@@ -28,7 +28,9 @@ enum tbv_native_data_op {
 	TBV_NATIVE_DATA_OP_PATH_CREDIT = 9,
 	TBV_NATIVE_DATA_OP_RDMA_READ_ACK = 10,
 	TBV_NATIVE_DATA_OP_MAD = 11,
-	TBV_NATIVE_DATA_OP_MAX = TBV_NATIVE_DATA_OP_MAD,
+	TBV_NATIVE_DATA_OP_ATOMIC_REQ = 12,
+	TBV_NATIVE_DATA_OP_ATOMIC_RESP = 13,
+	TBV_NATIVE_DATA_OP_MAX = TBV_NATIVE_DATA_OP_ATOMIC_RESP,
 };
 
 enum tbv_native_data_flag {
@@ -49,6 +51,12 @@ enum tbv_native_send_ack_status {
 	TBV_NATIVE_SEND_ACK_ERROR = 2,
 };
 
+enum tbv_native_atomic_op {
+	TBV_NATIVE_ATOMIC_FETCH_ADD = 1,
+	TBV_NATIVE_ATOMIC_SWAP = 2,
+	TBV_NATIVE_ATOMIC_CMP_SWAP = 3,
+};
+
 struct tbv_native_data_header {
 	tbv_wire_u8 opcode;
 	tbv_wire_u8 flags;
@@ -63,6 +71,13 @@ struct tbv_native_data_header {
 	 * remote_addr is the base remote IOVA, rkey is the remote key, and
 	 * imm_data carries immediate data only for RDMA_WRITE_IMM. For
 	 * SEND_ACK, imm_data is enum tbv_native_send_ack_status.
+	 *
+	 * For ATOMIC_REQ, length is the request payload length, imm_data is
+	 * enum tbv_native_atomic_op, remote_addr/rkey identify the target, and
+	 * the payload is little-endian {add/swap} for FETCH_ADD/SWAP or
+	 * little-endian {swap, compare} for CMP_SWAP. For ATOMIC_RESP, length is
+	 * 8 on success, rkey is non-zero on error, and the payload is the
+	 * little-endian original target value.
 	 */
 	tbv_wire_u32 length;
 	tbv_wire_u32 imm_data;

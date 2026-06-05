@@ -347,6 +347,10 @@ static int tbv_service_probe(struct tb_service *svc,
 	if (backend == TBV_BACKEND_APPLE &&
 	    !tbv_service_apple_xdomain_allowed(tbv_service_state, xd))
 		return -ENODEV;
+	if (backend == TBV_BACKEND_NATIVE &&
+	    tbv_service_state->native_link_speed_filter &&
+	    xd->link_speed != tbv_service_state->native_link_speed_filter)
+		return -ENODEV;
 
 	if (backend == TBV_BACKEND_NATIVE &&
 	    native_lane >= tbv_config_native_lane_count(tbv_service_state))
@@ -628,6 +632,15 @@ int tbv_services_start(struct tbv_state *state, bool bind_services,
 	ret = tbv_native_control_start(state);
 	if (ret)
 		goto err_stop_minimal;
+
+	if (state->cfg.native_enabled &&
+	    !state->native_control_source_aware &&
+	    (state->negotiate_native || state->enable_tunnels) &&
+	    !service_cfg->allow_source_blind_native) {
+		pr_err("refusing source-blind native control with native negotiation/tunnels; rebuild against a kernel exposing tb_protocol_handler.callback_xd or set allow_source_blind_native=1\n");
+		ret = -EOPNOTSUPP;
+		goto err_stop_minimal;
+	}
 
 	ret = tbv_register_native_dirs(state, service_cfg->native_prtcstns);
 	if (ret)

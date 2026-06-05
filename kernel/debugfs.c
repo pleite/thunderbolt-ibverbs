@@ -19,6 +19,16 @@ static u32 tbv_debugfs_wire_path_flags(const struct tbv_path *path)
 	return flags;
 }
 
+static u32 tbv_debugfs_list_count(const struct list_head *head)
+{
+	const struct list_head *pos;
+	u32 count = 0;
+
+	list_for_each(pos, head)
+		count++;
+	return count;
+}
+
 static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 {
 	struct tbv_state *state = s->private;
@@ -33,8 +43,13 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 	seq_printf(s, "native_same_peer_multicable: %s\n",
 		   !state->cfg.native_enabled ||
 		   !state->native_control_registered ? "off" :
+		   state->native_single_peer ? "forced" :
 		   state->native_control_source_aware ? "enabled" :
 						       "limited");
+	seq_printf(s, "native_single_peer: %u\n",
+		   state->native_single_peer);
+	seq_printf(s, "native_link_speed_filter: %u\n",
+		   state->native_link_speed_filter);
 	seq_printf(s, "native_legacy_ambiguous_limited: %lld\n",
 		   atomic64_read(&state->native_legacy_ambiguous_limited));
 	seq_printf(s, "configured_links: %u\n", tbv_link_count(state));
@@ -123,6 +138,26 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 	seq_printf(s, "verbs_mrs: %d\n", atomic_read(&state->verbs_mrs));
 	seq_printf(s, "verbs_recv_wqes: %d\n",
 		   atomic_read(&state->verbs_recv_wqes));
+	seq_printf(s, "dv_poll_running: %u\n",
+		   !!READ_ONCE(state->dv_poll_task));
+	seq_printf(s, "dv_poll_qps: %u\n",
+		   READ_ONCE(state->dv_poll_qp_count));
+	seq_printf(s, "dv_poll_scans: %lld\n",
+		   atomic64_read(&state->dv_poll_scans));
+	seq_printf(s, "dv_poll_wqes: %lld\n",
+		   atomic64_read(&state->dv_poll_wqes));
+	seq_printf(s, "dv_poll_budget_exhausted: %lld\n",
+		   atomic64_read(&state->dv_poll_budget_exhausted));
+	seq_printf(s, "dv_poll_errors: %lld\n",
+		   atomic64_read(&state->dv_poll_errors));
+	seq_printf(s, "dv_admission_attempts: %lld\n",
+		   atomic64_read(&state->dv_admission_attempts));
+	seq_printf(s, "dv_backpressure_retry: %lld\n",
+		   atomic64_read(&state->dv_backpressure_retry));
+	seq_printf(s, "dv_fence_retry: %lld\n",
+		   atomic64_read(&state->dv_fence_retry));
+	seq_printf(s, "dv_hard_error: %lld\n",
+		   atomic64_read(&state->dv_hard_error));
 	seq_printf(s, "data_wr_send: %lld\n",
 		   atomic64_read(&state->data_wr_send));
 	seq_printf(s, "data_wr_op_send: %lld\n",
@@ -169,6 +204,10 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_wr_rnr_retry_exhausted));
 	seq_printf(s, "data_wr_timeout: %lld\n",
 		   atomic64_read(&state->data_wr_timeout));
+	seq_printf(s, "data_wr_send_timeout: %lld\n",
+		   atomic64_read(&state->data_wr_send_timeout));
+	seq_printf(s, "data_wr_timeout_last_psn: %lld\n",
+		   atomic64_read(&state->data_wr_timeout_last_psn));
 	seq_printf(s, "apple_sq_queued: %lld\n",
 		   atomic64_read(&state->apple_sq_queued));
 	seq_printf(s, "apple_sq_dequeued: %lld\n",
@@ -193,6 +232,8 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_tx_credit_received));
 	seq_printf(s, "data_rx_completed: %lld\n",
 		   atomic64_read(&state->data_rx_completed));
+	seq_printf(s, "data_rx_canceled: %lld\n",
+		   atomic64_read(&state->data_rx_canceled));
 	seq_printf(s, "data_rx_credit_sent: %lld\n",
 		   atomic64_read(&state->data_rx_credit_sent));
 	seq_printf(s, "data_rx_credit_send_error: %lld\n",
@@ -390,7 +431,36 @@ static int tbv_debugfs_peers_show(struct seq_file *s, void *unused)
 			   peer->nr_rails, peer->native_qp_rr_rail_id);
 
 		list_for_each_entry(rail, &peer->rails, node) {
+			struct tbv_path *path = &rail->path;
+			unsigned long flags;
+			u32 tx_control_queued;
+			u32 tx_data_queued;
+			u32 tx_data_reserved;
+			u32 tx_remote_data_credits;
+			u32 tx_remote_data_credit_max;
+			u32 tx_free;
+			u32 tx_zcopy_inflight;
+			u32 rx_data_credit_pending;
+			int tx_inflight;
+			bool tx_scheduling;
+			bool tx_raw_stream_active;
 			bool data_ready;
+
+			spin_lock_irqsave(&path->tx_lock, flags);
+			tx_control_queued = path->tx_control_queued;
+			tx_data_queued = path->tx_data_queued;
+			tx_data_reserved = path->tx_data_reserved;
+			tx_remote_data_credits = path->tx_remote_data_credits;
+			tx_remote_data_credit_max =
+				path->tx_remote_data_credit_max;
+			tx_free = tbv_debugfs_list_count(&path->tx_free);
+			tx_zcopy_inflight =
+				tbv_debugfs_list_count(&path->tx_zcopy_inflight);
+			tx_inflight = atomic_read(&path->tx_inflight);
+			rx_data_credit_pending = path->rx_data_credit_pending;
+			tx_scheduling = path->tx_scheduling;
+			tx_raw_stream_active = path->tx_raw_stream_active;
+			spin_unlock_irqrestore(&path->tx_lock, flags);
 
 			data_ready = peer->backend == TBV_BACKEND_APPLE ?
 				tbv_rail_apple_data_ready(rail) :
@@ -423,13 +493,19 @@ static int tbv_debugfs_peers_show(struct seq_file *s, void *unused)
 				   rail->remote_rx_hop);
 			seq_printf(s,
 				   "    data_tx_enqueued=%lld data_tx_posted=%lld data_tx_completed=%lld data_tx_credit_stalls=%lld data_tx_credit_received=%lld tx_credits=%u/%u\n",
-				   atomic64_read(&rail->path.data_tx_enqueued),
-				   atomic64_read(&rail->path.data_tx_posted),
-				   atomic64_read(&rail->path.data_tx_completed),
-				   atomic64_read(&rail->path.data_tx_credit_stalls),
-				   atomic64_read(&rail->path.data_tx_credit_received),
-				   rail->path.tx_remote_data_credits,
-				   rail->path.tx_remote_data_credit_max);
+				   atomic64_read(&path->data_tx_enqueued),
+				   atomic64_read(&path->data_tx_posted),
+				   atomic64_read(&path->data_tx_completed),
+				   atomic64_read(&path->data_tx_credit_stalls),
+				   atomic64_read(&path->data_tx_credit_received),
+				   tx_remote_data_credits,
+				   tx_remote_data_credit_max);
+			seq_printf(s,
+				   "    path_tx ctrl_q=%u data_q=%u reserved=%u inflight=%d free=%u zcopy_inflight=%u scheduling=%u raw_active=%u\n",
+				   tx_control_queued, tx_data_queued,
+				   tx_data_reserved, tx_inflight, tx_free,
+				   tx_zcopy_inflight, tx_scheduling,
+				   tx_raw_stream_active);
 			seq_printf(s,
 				   "    control_tx_enqueued=%lld control_tx_posted=%lld control_tx_completed=%lld control_tx_queue_max_ms=%lld\n",
 				   atomic64_read(&rail->path.control_tx_enqueued),
@@ -438,33 +514,34 @@ static int tbv_debugfs_peers_show(struct seq_file *s, void *unused)
 				   atomic64_read(&rail->path.control_tx_queue_max_ms));
 			seq_printf(s,
 				   "    path_cfg tx_flags=0x%x rx_flags=0x%x e2e=%u wire_flags=0x%x tx_ring=%u rx_ring=%u sof_mask=0x%x eof_mask=0x%x\n",
-				   rail->path.cfg.tx_flags,
-				   rail->path.cfg.rx_flags,
-				   rail->path.cfg.e2e,
-				   tbv_debugfs_wire_path_flags(&rail->path),
-				   rail->path.cfg.tx_ring_size,
-				   rail->path.cfg.rx_ring_size,
-				   rail->path.cfg.sof_mask,
-				   rail->path.cfg.eof_mask);
-				seq_printf(s,
-					   "    data_rx_completed=%lld data_rx_credit_sent=%lld data_rx_credit_send_error=%lld data_rx_repost_failed=%lld rx_credit_pending=%u\n",
-					   atomic64_read(&rail->path.data_rx_completed),
-					   atomic64_read(&rail->path.data_rx_credit_sent),
-					   atomic64_read(&rail->path.data_rx_credit_send_error),
-					   atomic64_read(&rail->path.data_rx_repost_failed),
-					   rail->path.rx_data_credit_pending);
-				seq_printf(s,
-					   "    tx_poll enabled=%u calls=%lld completed=%lld\n",
-					   rail->path.tx_poll_enabled,
-					   atomic64_read(&rail->path.tx_poll_calls),
-					   atomic64_read(&rail->path.tx_poll_completed));
-				seq_printf(s,
-					   "    rx_supp_poll enabled=%u calls=%lld completed=%lld\n",
-					   rail->path.rx_supp_poll_enabled,
-					   atomic64_read(&rail->path.rx_supp_poll_calls),
-					   atomic64_read(&rail->path.rx_supp_poll_completed));
-			}
+				   path->cfg.tx_flags,
+				   path->cfg.rx_flags,
+				   path->cfg.e2e,
+				   tbv_debugfs_wire_path_flags(path),
+				   path->cfg.tx_ring_size,
+				   path->cfg.rx_ring_size,
+				   path->cfg.sof_mask,
+				   path->cfg.eof_mask);
+			seq_printf(s,
+				   "    data_rx_completed=%lld data_rx_canceled=%lld data_rx_credit_sent=%lld data_rx_credit_send_error=%lld data_rx_repost_failed=%lld rx_credit_pending=%u\n",
+				   atomic64_read(&path->data_rx_completed),
+				   atomic64_read(&path->data_rx_canceled),
+				   atomic64_read(&path->data_rx_credit_sent),
+				   atomic64_read(&path->data_rx_credit_send_error),
+				   atomic64_read(&path->data_rx_repost_failed),
+				   rx_data_credit_pending);
+			seq_printf(s,
+				   "    tx_poll enabled=%u calls=%lld completed=%lld\n",
+				   path->tx_poll_enabled,
+				   atomic64_read(&path->tx_poll_calls),
+				   atomic64_read(&path->tx_poll_completed));
+			seq_printf(s,
+				   "    rx_supp_poll enabled=%u calls=%lld completed=%lld\n",
+				   path->rx_supp_poll_enabled,
+				   atomic64_read(&path->rx_supp_poll_calls),
+				   atomic64_read(&path->rx_supp_poll_completed));
 		}
+	}
 	mutex_unlock(&state->lock);
 
 	return 0;

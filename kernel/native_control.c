@@ -21,6 +21,18 @@
 
 static void tbv_native_control_work(struct work_struct *work);
 
+static bool tbv_native_control_same_route_key(const struct tb_xdomain *a,
+					      const struct tb_xdomain *b)
+{
+	if (a == b)
+		return true;
+	if (!a || !b)
+		return false;
+
+	return a->route == b->route && a->link == b->link &&
+	       a->depth == b->depth;
+}
+
 static u32 tbv_native_control_caps(const struct tbv_state *state,
 				   const struct tbv_peer *peer)
 {
@@ -71,7 +83,12 @@ static void tbv_native_control_fill_hello(const struct tbv_state *state,
 static bool tbv_native_control_peer_matches_source(
 	const struct tbv_peer *peer, const struct tb_xdomain *source_xd)
 {
-	return !source_xd || peer->xd == source_xd;
+	if (!source_xd || peer->xd == source_xd)
+		return true;
+	if (peer->state && peer->state->native_single_peer)
+		return tbv_native_control_same_route_key(peer->xd, source_xd);
+
+	return false;
 }
 
 static bool tbv_native_control_can_kick_rail(const struct tbv_state *state,
@@ -161,7 +178,7 @@ void tbv_native_control_cancel_rail(struct tbv_rail *rail)
 }
 
 static int tbv_native_control_snapshot(struct tbv_state *state,
-				       const struct tb_xdomain *source_xd,
+				       struct tb_xdomain *source_xd,
 				       const struct tbv_native_wire_info *info,
 				       u32 rail_id,
 				       bool require_matching_rail,
@@ -192,7 +209,7 @@ static int tbv_native_control_snapshot(struct tbv_state *state,
 
 			tbv_native_control_fill_hello(state, peer, rail,
 						      hello);
-			*xd = tb_xdomain_get(peer->xd);
+			*xd = tb_xdomain_get(source_xd ?: peer->xd);
 			ret = 0;
 			goto out;
 		}

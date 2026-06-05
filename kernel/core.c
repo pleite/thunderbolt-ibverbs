@@ -34,8 +34,11 @@ int tbv_core_init(struct tbv_state *state,
 	state->cfg = *cfg;
 	mutex_init(&state->lock);
 	mutex_init(&state->rail_register_lock);
+	mutex_init(&state->dv_poll_lock);
 	INIT_LIST_HEAD(&state->peers);
 	INIT_LIST_HEAD(&state->configured_links);
+	INIT_LIST_HEAD(&state->dv_poll_qps);
+	init_waitqueue_head(&state->dv_poll_wait);
 	xa_init(&state->verbs_mrs_xa);
 	xa_init(&state->verbs_qps_xa);
 	state->next_peer_id = 1;
@@ -44,6 +47,7 @@ int tbv_core_init(struct tbv_state *state,
 						   WQ_HIGHPRI,
 					   0);
 	if (!state->workqueue) {
+		mutex_destroy(&state->dv_poll_lock);
 		mutex_destroy(&state->rail_register_lock);
 		mutex_destroy(&state->lock);
 		return -ENOMEM;
@@ -86,6 +90,7 @@ int tbv_core_init(struct tbv_state *state,
 err_destroy_wq:
 	destroy_workqueue(state->workqueue);
 	state->workqueue = NULL;
+	mutex_destroy(&state->dv_poll_lock);
 	mutex_destroy(&state->rail_register_lock);
 	mutex_destroy(&state->lock);
 	return ret;
@@ -118,6 +123,7 @@ void tbv_core_exit(struct tbv_state *state)
 	xa_destroy(&state->verbs_mrs_xa);
 	xa_destroy(&state->verbs_qps_xa);
 	tbv_tbnet_identity_stop(&state->tbnet_identity);
+	mutex_destroy(&state->dv_poll_lock);
 	mutex_destroy(&state->rail_register_lock);
 	mutex_destroy(&state->lock);
 }

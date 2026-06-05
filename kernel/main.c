@@ -92,6 +92,11 @@ module_param(enable_tunnels, bool, 0444);
 MODULE_PARM_DESC(enable_tunnels,
 		 "Enable negotiated Thunderbolt paths after native HELLO");
 
+static bool allow_source_blind_native;
+module_param(allow_source_blind_native, bool, 0444);
+MODULE_PARM_DESC(allow_source_blind_native,
+		 "Allow legacy source-blind native control with native negotiation/tunnels");
+
 static bool native_data = true;
 module_param(native_data, bool, 0444);
 MODULE_PARM_DESC(native_data,
@@ -106,6 +111,16 @@ static bool native_fragment_striping;
 module_param(native_fragment_striping, bool, 0444);
 MODULE_PARM_DESC(native_fragment_striping,
 		 "Stripe native Linux SEND fragments across active rails");
+
+static bool native_single_peer;
+module_param(native_single_peer, bool, 0444);
+MODULE_PARM_DESC(native_single_peer,
+		 "Diagnostic: collapse native Linux services from the same remote host into one peer");
+
+static uint native_link_speed_filter;
+module_param(native_link_speed_filter, uint, 0444);
+MODULE_PARM_DESC(native_link_speed_filter,
+		 "Diagnostic: bind native Linux services only when XDomain link_speed matches this Gb/s value; 0 disables");
 
 static bool register_verbs;
 module_param(register_verbs, bool, 0444);
@@ -171,6 +186,8 @@ static int __init tbv_init(void)
 	if (ret)
 		goto err_path_symbols;
 	tbv_driver_state.native_fragment_striping = native_fragment_striping;
+	tbv_driver_state.native_single_peer = native_single_peer;
+	tbv_driver_state.native_link_speed_filter = native_link_speed_filter;
 	tbv_driver_state.native_data = native_data;
 	tbv_driver_state.apple_data = apple_data;
 
@@ -180,6 +197,8 @@ static int __init tbv_init(void)
 	service_cfg.start_rings = start_rings;
 	service_cfg.negotiate_native = negotiate_native;
 	service_cfg.enable_tunnels = enable_tunnels;
+	service_cfg.allow_source_blind_native = allow_source_blind_native;
+	service_cfg.native_link_speed_filter = native_link_speed_filter;
 
 	ret = tbv_services_start(&tbv_driver_state, bind_services,
 				 &service_cfg);
@@ -204,7 +223,7 @@ static int __init tbv_init(void)
 		snprintf(lanes_desc, sizeof(lanes_desc), "%u-%u",
 			 cfg.lanes_min, cfg.lanes_max);
 
-	pr_info("loaded compat=%s profile=%s resolved_profile=%s tbnet=%s tbnet_identity=%s tbnet_identity_minimal_e2e=%u tbnet_identity_minimal_apple_only=%u lanes=%s native_control=%s native_data=%u apple_data=%u native_fragment_striping=%u\n",
+	pr_info("loaded compat=%s profile=%s resolved_profile=%s tbnet=%s tbnet_identity=%s tbnet_identity_minimal_e2e=%u tbnet_identity_minimal_apple_only=%u lanes=%s native_control=%s native_data=%u apple_data=%u native_fragment_striping=%u native_single_peer=%u native_link_speed_filter=%u\n",
 		tbv_compat_name(cfg.compat),
 		tbv_profile_name(cfg.profile),
 		tbv_profile_name(resolved.profile),
@@ -216,7 +235,9 @@ static int __init tbv_init(void)
 		tbv_native_control_mode_name(&tbv_driver_state),
 		native_data,
 		apple_data,
-		native_fragment_striping);
+		native_fragment_striping,
+		native_single_peer,
+		native_link_speed_filter);
 
 	return 0;
 
@@ -240,4 +261,5 @@ module_exit(tbv_exit);
 MODULE_AUTHOR("thunderbolt-ibverbs contributors");
 MODULE_DESCRIPTION("Thunderbolt/USB4 host-to-host RDMA verbs");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS("DMA_BUF");
 MODULE_SOFTDEP("pre: configfs ib_core ib_uverbs");

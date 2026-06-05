@@ -23,7 +23,10 @@ stdenv.mkDerivation {
         || rel == "kernel"
         || lib.hasPrefix "kernel/" rel
         || rel == "proto"
-        || lib.hasPrefix "proto/" rel;
+        || lib.hasPrefix "proto/" rel
+        || rel == "userspace"
+        || rel == "userspace/usb4_rdma"
+        || rel == "userspace/usb4_rdma/usb4_rdma_dv.h";
   };
 
   nativeBuildInputs = kernel.moduleBuildDependencies;

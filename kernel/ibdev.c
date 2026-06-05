@@ -6,6 +6,8 @@
 #include <linux/completion.h>
 #include <linux/crc32.h>
 #include <linux/crc32c.h>
+#include <linux/dma-buf.h>
+#include <linux/dma-resv.h>
 #include <linux/delay.h>
 #include <linux/errno.h>
 #include <linux/highmem.h>
@@ -13,6 +15,7 @@
 #include <linux/in6.h>
 #include <linux/ip.h>
 #include <linux/jiffies.h>
+#include <linux/kthread.h>
 #include <linux/module.h>
 #include <linux/mmzone.h>
 #include <linux/netdevice.h>
@@ -29,11 +32,17 @@
 #include <rdma/ib_cache.h>
 #include <rdma/ib_mad.h>
 #include <rdma/ib_umem.h>
+#include <rdma/ib_user_ioctl_cmds.h>
 #include <rdma/ib_user_verbs.h>
 #include <rdma/ib_verbs.h>
+#include <rdma/uverbs_std_types.h>
+#include <rdma/uverbs_types.h>
+#define UVERBS_MODULE_NAME tbv
+#include <rdma/uverbs_named_ioctl.h>
 
 #include "../proto/native_data.h"
 #include "../proto/reliability.h"
+#include "../userspace/usb4_rdma/usb4_rdma_dv.h"
 #include "tbv.h"
 
 #define TBV_IBDEV_ABI_VERSION 1
@@ -99,6 +108,16 @@ module_param(qp_timeout_ms, uint, 0644);
 MODULE_PARM_DESC(qp_timeout_ms,
 		 "Fallback milliseconds for pending native/Apple WRs and partial native receives "
 		 "when a QP has no verbs ACK timeout; 0 disables fallback timeout work");
+
+static uint dv_poll_interval_us = 10;
+module_param(dv_poll_interval_us, uint, 0644);
+MODULE_PARM_DESC(dv_poll_interval_us,
+		 "Microseconds the device-level DV poll worker sleeps between scans; 0 uses a cond_resched spin loop for benchmarking");
+
+static uint dv_poll_budget = 64;
+module_param(dv_poll_budget, uint, 0644);
+MODULE_PARM_DESC(dv_poll_budget,
+		 "Maximum DV WQEs the device-level poll worker drains per scan; minimum effective value is 1");
 
 static uint apple_tx_max_inflight_wr = 16;
 module_param(apple_tx_max_inflight_wr, uint, 0644);
@@ -298,6 +317,32 @@ struct tbv_apple_sq_entry {
 	u32 length;
 };
 
+struct tbv_dv_cqe_slot {
+	u64 wr_id;
+	u32 status;
+	u32 opcode;
+	u32 byte_len;
+	u32 imm_data;
+	bool in_use;
+	bool done;
+	bool cqe_needed;
+};
+
+struct tbv_dv_queue_resources {
+	struct ib_umem *sq_umem;
+	struct ib_umem *cq_umem;
+	struct ib_umem *doorbell_umem;
+	struct tbv_dv_cqe_slot *cqe_slots;
+};
+
+struct tbv_dv_post {
+	u32 index;
+	u32 opcode;
+	u32 byte_len;
+	u32 imm_data;
+	bool cqe_needed;
+};
+
 struct tbv_qp {
 	struct ib_qp base;
 	struct tbv_state *owner;
@@ -310,12 +355,15 @@ struct tbv_qp {
 	 */
 	struct tbv_rail *rail;
 	spinlock_t lock;
+	struct mutex dv_mutex;
 	struct mutex rx_lock;
 	wait_queue_head_t credit_wait;
 	wait_queue_head_t apple_tx_wait;
 	wait_queue_head_t refs_wait;
 	refcount_t refs;
 	struct completion refs_zero;
+	struct work_struct dv_completion_work;
+	struct list_head dv_poll_node;
 	struct list_head pending_sends;
 	struct list_head pending_reads;
 	struct list_head pending_read_resps;
@@ -357,6 +405,22 @@ struct tbv_qp {
 	u32 apple_pending_bytes;
 	int apple_pending_active;
 	u32 apple_sq_outstanding;
+	bool dv_queue_active;
+	bool dv_cq_overflow;
+	bool dv_poll_listed;
+	u32 dv_generation;
+	u32 dv_sq_entries;
+	u32 dv_cq_entries;
+	u32 dv_sq_head;
+	u32 dv_cq_tail;
+	u32 dv_complete_head;
+	u64 dv_sq_addr;
+	u64 dv_cq_addr;
+	u64 dv_doorbell_addr;
+	struct ib_umem *dv_sq_umem;
+	struct ib_umem *dv_cq_umem;
+	struct ib_umem *dv_doorbell_umem;
+	struct tbv_dv_cqe_slot *dv_cqe_slots;
 	bool qpn_allocated;
 	bool rail_binding_counted;
 	bool dest_qp_known;
@@ -377,6 +441,7 @@ struct tbv_mr {
 	u64 length;
 	u64 virt_addr;
 	int access;
+	struct mutex atomic_lock;
 	bool closing;
 	bool dma_mr;
 };
@@ -418,6 +483,10 @@ struct tbv_send_ctx {
 	u32 psn;
 	enum tbv_native_data_op opcode;
 	enum ib_wc_opcode wc_opcode;
+	u32 dv_index;
+	u32 dv_opcode;
+	u32 dv_byte_len;
+	u32 dv_imm_data;
 	atomic_t apple_pending;
 	atomic_t tx_pending;
 	u8 retries;
@@ -427,6 +496,8 @@ struct tbv_send_ctx {
 	enum tbv_send_post_reason retry_reason;
 	int completion_status;
 	bool signaled;
+	bool dv_origin;
+	bool dv_cqe_needed;
 	bool completed;
 	bool ready;
 	bool pending;
@@ -456,9 +527,15 @@ struct tbv_read_ctx {
 	u32 total_len;
 	u32 received;
 	u32 resp_buffered_bytes;
+	u32 dv_index;
+	u32 dv_opcode;
+	u32 dv_byte_len;
+	u32 dv_imm_data;
 	int nsegs;
 	int completion_status;
 	bool signaled;
+	bool dv_origin;
+	bool dv_cqe_needed;
 	bool completed;
 	bool ready;
 	bool sq_counted;
@@ -519,7 +596,21 @@ static atomic_t tbv_mr_key = ATOMIC_INIT(1);
 
 static int tbv_cq_push(struct tbv_cq *tcq, const struct ib_wc *wc);
 static void tbv_send_ctx_put(struct tbv_send_ctx *send);
+static u32 tbv_dv_next_generation(u32 generation);
+static int tbv_dv_write_consumer_line_umem(struct ib_umem *umem, u64 addr,
+					   u32 sq_head, u32 cq_tail,
+					   u32 qp_state, u32 generation);
+static void tbv_dv_release_resources(struct tbv_dv_queue_resources *res);
+static void tbv_dv_take_resources_locked(struct tbv_qp *tqp,
+					 struct tbv_dv_queue_resources *res);
+static void tbv_dv_poll_detach_locked(struct tbv_qp *tqp);
+static void tbv_dv_send_complete(struct tbv_send_ctx *send, int status);
+static void tbv_dv_slot_complete(struct tbv_qp *tqp, u32 index, u32 status,
+				 u32 opcode, u32 byte_len, u32 imm_data,
+				 bool cqe_needed);
+static u32 tbv_dv_status_from_errno(int status);
 static bool tbv_send_complete(struct tbv_send_ctx *send, int status);
+static void tbv_dv_completion_work(struct work_struct *work);
 static void tbv_send_tx_done(void *ctx, int status);
 static void tbv_apple_send_tx_done(void *ctx, int status);
 static void tbv_apple_sq_work(struct work_struct *work);
@@ -530,9 +621,17 @@ static void tbv_read_tx_done(void *ctx, int status);
 static void tbv_read_resp_ctx_get(struct tbv_read_resp_ctx *ctx);
 static void tbv_read_resp_ctx_put(struct tbv_read_resp_ctx *ctx);
 static int tbv_send_read_response_ctx(struct tbv_read_resp_ctx *ctx);
+static int tbv_ib_umem_copy_from(void *dst, struct ib_umem *umem, u64 start,
+				 u64 length, u64 addr, size_t len);
+static int tbv_umem_iova_to_addr(struct tbv_mr *mr, u64 iova, size_t len,
+				 u64 *addr_out);
+static int tbv_mr_atomic64(struct tbv_mr *mr, u64 iova, u32 op, u64 data,
+			   u64 compare, u64 *old_out);
 static int tbv_umem_page_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
 				   struct page **page_out,
 				   u32 *page_off_out, u32 *len_out);
+static int tbv_copy_to_read_segments(struct tbv_read_ctx *read, u32 offset,
+				     const void *payload, u32 len);
 static int tbv_rx_copy_to_wqe(struct tbv_state *state,
 			      const struct tbv_recv_wqe *wqe, u32 offset,
 			      const void *payload, u32 len, u32 *delivered);
@@ -732,6 +831,26 @@ out:
 	xas_unlock_irqrestore(&xas, flags);
 	return mr;
 }
+
+static void tbv_dmabuf_invalidate(struct dma_buf_attachment *attach)
+{
+	struct ib_umem_dmabuf *umem_dmabuf = attach->importer_priv;
+
+	if (!umem_dmabuf)
+		return;
+
+	ibdev_warn_ratelimited(umem_dmabuf->umem.ibdev,
+			       "dmabuf-backed MR was invalidated; revoke handling is not implemented yet\n");
+}
+
+static const struct dma_buf_attach_ops tbv_dmabuf_attach_ops = {
+	.allow_peer2peer = false,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
+	.invalidate_mappings = tbv_dmabuf_invalidate,
+#else
+	.move_notify = tbv_dmabuf_invalidate,
+#endif
+};
 
 static void tbv_mr_free(struct tbv_mr *mr)
 {
@@ -999,6 +1118,31 @@ static bool tbv_qp_allows_post(struct tbv_qp *tqp)
 		  tqp->state != IB_QPS_ERR;
 	spin_unlock_irqrestore(&tqp->lock, flags);
 	return allowed;
+}
+
+static int tbv_qp_post_status(struct tbv_qp *tqp, bool allow_dv)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	spin_lock_irqsave(&tqp->lock, flags);
+	if (tqp->dv_queue_active && !allow_dv)
+		ret = -EBUSY;
+	else if (tqp->closing || tqp->state == IB_QPS_RESET ||
+		 tqp->state == IB_QPS_ERR)
+		ret = -EINVAL;
+	spin_unlock_irqrestore(&tqp->lock, flags);
+	return ret;
+}
+
+static int tbv_qp_recv_post_status(struct tbv_qp *tqp)
+{
+	/*
+	 * DV owns the send/completion queue pair used by GPU-originated WRs.
+	 * The receive queue stays kernel-owned so WRITE_WITH_IMM and SEND can
+	 * still use normal CPU-posted receives on the target QP.
+	 */
+	return tbv_qp_post_status(tqp, true);
 }
 
 enum tbv_rx_endpoint_status {
@@ -2462,6 +2606,7 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	tqp->init_attr = *init_attr;
 	tqp->owner = state;
 	spin_lock_init(&tqp->lock);
+	mutex_init(&tqp->dv_mutex);
 	mutex_init(&tqp->rx_lock);
 	init_waitqueue_head(&tqp->credit_wait);
 	init_waitqueue_head(&tqp->apple_tx_wait);
@@ -2470,6 +2615,8 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	atomic_set(&tqp->apple_tx_inflight, 0);
 	atomic_set(&tqp->apple_tx_inflight_frames, 0);
 	init_completion(&tqp->refs_zero);
+	INIT_WORK(&tqp->dv_completion_work, tbv_dv_completion_work);
+	INIT_LIST_HEAD(&tqp->dv_poll_node);
 	INIT_LIST_HEAD(&tqp->pending_sends);
 	INIT_LIST_HEAD(&tqp->pending_reads);
 	INIT_LIST_HEAD(&tqp->pending_read_resps);
@@ -2518,8 +2665,13 @@ err_put_rail:
 static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 {
 	struct tbv_qp *tqp = container_of(qp, struct tbv_qp, base);
+	struct tbv_dv_queue_resources dv_old = {};
 	LIST_HEAD(flush);
 	unsigned long flags;
+	u32 dv_generation = 0;
+	u32 dv_sq_head = 0;
+	u32 dv_cq_tail = 0;
+	u64 dv_doorbell_addr = 0;
 	u32 pending;
 	u32 i;
 
@@ -2537,6 +2689,28 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 	wake_up_all(&tqp->credit_wait);
 	wake_up_all(&tqp->apple_tx_wait);
 	cancel_work_sync(&tqp->apple_sq_work);
+
+	mutex_lock(&tqp->dv_mutex);
+	tbv_dv_poll_detach_locked(tqp);
+	spin_lock_irqsave(&tqp->lock, flags);
+	if (tqp->dv_queue_active) {
+		dv_sq_head = tqp->dv_sq_head;
+		dv_cq_tail = tqp->dv_cq_tail;
+		dv_doorbell_addr = tqp->dv_doorbell_addr;
+		tqp->dv_generation = tbv_dv_next_generation(tqp->dv_generation);
+		dv_generation = tqp->dv_generation;
+		tbv_dv_take_resources_locked(tqp, &dv_old);
+	}
+	spin_unlock_irqrestore(&tqp->lock, flags);
+	if (dv_old.doorbell_umem)
+		(void)tbv_dv_write_consumer_line_umem(
+			dv_old.doorbell_umem, dv_doorbell_addr,
+			usb4_rdma_dv_tail_pack(dv_sq_head, dv_generation),
+			usb4_rdma_dv_tail_pack(dv_cq_tail, dv_generation),
+			USB4_RDMA_DV_QP_DEAD, dv_generation);
+	mutex_unlock(&tqp->dv_mutex);
+	tbv_dv_release_resources(&dv_old);
+
 	cancel_delayed_work_sync(&tqp->timeout_work);
 	spin_lock_irqsave(&tqp->lock, flags);
 	tqp->timeout_work_armed = false;
@@ -2856,6 +3030,11 @@ static bool tbv_send_complete(struct tbv_send_ctx *send, int status)
 		send->apple_window_acquired = false;
 	}
 
+	if (send->dv_origin) {
+		tbv_dv_send_complete(send, status);
+		return true;
+	}
+
 	if (send->signaled) {
 		struct tbv_cq *send_cq =
 			container_of(tqp->base.send_cq, struct tbv_cq, base);
@@ -3027,6 +3206,16 @@ static bool tbv_read_complete(struct tbv_read_ctx *read, int status)
 	spin_unlock_irqrestore(&read->lock, flags);
 	if (!complete)
 		return false;
+
+	if (read->dv_origin) {
+		tbv_dv_slot_complete(tqp, read->dv_index,
+				     tbv_dv_status_from_errno(status),
+				     read->dv_opcode,
+				     status ? 0 : read->dv_byte_len,
+				     read->dv_imm_data,
+				     read->dv_cqe_needed);
+		return true;
+	}
 
 	if (read->signaled) {
 		struct tbv_cq *send_cq =
@@ -3625,8 +3814,7 @@ static int tbv_prepare_send_segments(struct tbv_qp *tqp,
 	for (i = 0; i < wr->num_sge; i++) {
 		const struct ib_sge *sge = &wr->sg_list[i];
 		struct tbv_mr *mr;
-		u64 mr_end;
-		u64 end;
+		u64 addr;
 
 		if (!sge->length)
 			continue;
@@ -3635,30 +3823,19 @@ static int tbv_prepare_send_segments(struct tbv_qp *tqp,
 			ret = -EMSGSIZE;
 			goto err_release;
 		}
-		if (check_add_overflow(sge->addr, (u64)sge->length, &end)) {
-			ret = -EINVAL;
-			goto err_release;
-		}
-
 		mr = tbv_mr_get(tqp->owner, sge->lkey);
 		if (!mr) {
 			ret = -EINVAL;
 			goto err_release;
 		}
-		if (mr->dma_mr) {
+		ret = tbv_umem_iova_to_addr(mr, sge->addr, sge->length, &addr);
+		if (ret) {
 			tbv_mr_put(mr);
-			ret = -EOPNOTSUPP;
-			goto err_release;
-		}
-		if (check_add_overflow(mr->start, mr->length, &mr_end) ||
-		    sge->addr < mr->start || end > mr_end) {
-			tbv_mr_put(mr);
-			ret = -EFAULT;
 			goto err_release;
 		}
 
 		segs[nsegs].mr = mr;
-		segs[nsegs].addr = sge->addr;
+		segs[nsegs].addr = addr;
 		segs[nsegs].length = sge->length;
 		nsegs++;
 	}
@@ -3730,15 +3907,35 @@ static int tbv_copy_send_range(const struct tbv_send_segment *segs, int nsegs,
 			skipped += seg->length;
 			continue;
 		}
-		if (offset > skipped)
-			seg_off = offset - skipped;
+			if (offset > skipped)
+				seg_off = offset - skipped;
 
-		chunk = min_t(u32, seg->length - seg_off, length - copied);
-		ret = ib_umem_copy_from((u8 *)dst + copied, seg->mr->umem,
-					seg->addr + seg_off - seg->mr->start,
-					chunk);
-		if (ret)
-			return ret;
+			chunk = min_t(u32, seg->length - seg_off, length - copied);
+			if (seg->mr->umem->is_dmabuf) {
+				struct ib_umem_dmabuf *umem_dmabuf =
+					to_ib_umem_dmabuf(seg->mr->umem);
+
+				ret = dma_buf_begin_cpu_access(
+					umem_dmabuf->attach->dmabuf, DMA_FROM_DEVICE);
+				if (ret)
+					return ret;
+			}
+			ret = tbv_ib_umem_copy_from((u8 *)dst + copied,
+						    seg->mr->umem, seg->mr->start,
+						    seg->mr->length,
+						    seg->addr + seg_off, chunk);
+			if (seg->mr->umem->is_dmabuf) {
+				struct ib_umem_dmabuf *umem_dmabuf =
+					to_ib_umem_dmabuf(seg->mr->umem);
+				int end_ret;
+
+				end_ret = dma_buf_end_cpu_access(
+					umem_dmabuf->attach->dmabuf, DMA_FROM_DEVICE);
+				if (!ret)
+					ret = end_ret;
+			}
+			if (ret)
+				return ret;
 		copied += chunk;
 		if (copied == length)
 			return 0;
@@ -4458,7 +4655,8 @@ err_release_paths:
 	return ret;
 }
 
-static int tbv_post_rdma_read(struct tbv_qp *tqp, const struct ib_send_wr *wr)
+static int tbv_post_rdma_read(struct tbv_qp *tqp, const struct ib_send_wr *wr,
+			      const struct tbv_dv_post *dv_post)
 {
 	struct tbv_read_segment segs[TBV_IBDEV_MAX_SGE];
 	const struct ib_rdma_wr *rwr = rdma_wr(wr);
@@ -4502,15 +4700,23 @@ static int tbv_post_rdma_read(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	}
 	ctx->tqp = tqp;
 	refcount_set(&ctx->refs, 1);
-		spin_lock_init(&ctx->lock);
-		mutex_init(&ctx->data_lock);
-		INIT_LIST_HEAD(&ctx->resp_frags);
-		ctx->wr_id = wr->wr_id;
-	ctx->signaled = !!(wr->send_flags & IB_SEND_SIGNALED);
+	spin_lock_init(&ctx->lock);
+	mutex_init(&ctx->data_lock);
+	INIT_LIST_HEAD(&ctx->resp_frags);
+	ctx->wr_id = wr->wr_id;
+	ctx->signaled = !dv_post && !!(wr->send_flags & IB_SEND_SIGNALED);
 	ctx->total_len = total_len;
 	ctx->nsegs = nsegs;
 	memcpy(ctx->segs, segs, sizeof(ctx->segs));
 	memset(segs, 0, sizeof(segs));
+	if (dv_post) {
+		ctx->dv_origin = true;
+		ctx->dv_index = dv_post->index;
+		ctx->dv_opcode = dv_post->opcode;
+		ctx->dv_byte_len = dv_post->byte_len;
+		ctx->dv_imm_data = dv_post->imm_data;
+		ctx->dv_cqe_needed = dv_post->cqe_needed;
+	}
 	INIT_LIST_HEAD(&ctx->node);
 
 	ret = tbv_qp_reserve_sendq(tqp);
@@ -4577,6 +4783,244 @@ err_put_ctx:
 		tbv_qp_release_sendq_counted(tqp, &ctx->sq_counted);
 	tbv_read_ctx_put(ctx);
 	return ret;
+err_release_segs:
+	tbv_release_read_segments(segs, nsegs);
+err_put_qp:
+	atomic64_dec(&tqp->owner->data_wr_live);
+	tbv_qp_put(tqp);
+	return ret;
+}
+
+static int tbv_dv_atomic_native_op(u32 opcode, u32 *native_op)
+{
+	switch (opcode) {
+	case USB4_RDMA_DV_WQE_ATOMIC_FETCH_ADD:
+		*native_op = TBV_NATIVE_ATOMIC_FETCH_ADD;
+		return 0;
+	case USB4_RDMA_DV_WQE_ATOMIC_SWAP:
+		*native_op = TBV_NATIVE_ATOMIC_SWAP;
+		return 0;
+	case USB4_RDMA_DV_WQE_ATOMIC_CMP_SWAP:
+		*native_op = TBV_NATIVE_ATOMIC_CMP_SWAP;
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static int tbv_post_dv_atomic(struct tbv_qp *tqp,
+			      const struct usb4_rdma_dv_wqe *wqe,
+			      const struct tbv_dv_post *dv_post)
+{
+	struct tbv_read_segment segs[TBV_IBDEV_MAX_SGE] = {};
+	struct tbv_native_data_header hdr = {};
+	struct ib_rdma_wr fake_rwr = {};
+	struct ib_send_wr *wr = &fake_rwr.wr;
+	struct tbv_read_ctx *ctx;
+	struct tbv_path *path = NULL;
+	struct ib_sge sge = {};
+	unsigned long flags;
+	u32 native_op;
+	u32 total_len = 0;
+	u32 payload_len;
+	u32 psn;
+	u8 *frame;
+	int nsegs = 0;
+	int len;
+	int ret;
+
+	if (!dv_post)
+		return -EINVAL;
+	ret = tbv_dv_atomic_native_op(wqe->opcode, &native_op);
+	if (ret)
+		return ret;
+	if (wqe->length != sizeof(u64))
+		return -EINVAL;
+	if (!tbv_qp_has_dest_qp(tqp))
+		return -EINVAL;
+
+	sge.addr = wqe->local_addr;
+	sge.length = sizeof(u64);
+	sge.lkey = wqe->lkey;
+	wr->sg_list = &sge;
+	wr->num_sge = 1;
+
+	atomic64_inc(&tqp->owner->data_wr_send);
+	if (!tbv_qp_get_live(tqp))
+		return -EINVAL;
+	atomic64_inc(&tqp->owner->data_wr_live);
+
+	ret = tbv_prepare_read_segments(tqp, wr, segs, &nsegs, &total_len);
+	if (ret) {
+		atomic64_inc(&tqp->owner->data_wr_copy_error);
+		goto err_put_qp;
+	}
+	if (total_len != sizeof(u64)) {
+		ret = -EINVAL;
+		goto err_release_segs;
+	}
+
+	if (wqe->flags & USB4_RDMA_DV_WQE_F_LOCAL_LOOPBACK) {
+		struct tbv_read_ctx read = {};
+		struct tbv_qp *target;
+		struct tbv_mr *mr;
+		u64 old = 0;
+
+		target = tbv_qp_get_by_num(tqp->owner, tqp->attr.dest_qp_num);
+		if (!target) {
+			ret = -ENOTCONN;
+			goto local_complete;
+		}
+		if (!(target->attr.qp_access_flags & IB_ACCESS_REMOTE_ATOMIC)) {
+			ret = -EACCES;
+			tbv_qp_put(target);
+			goto local_complete;
+		}
+
+		mr = tbv_mr_get(tqp->owner, wqe->rkey);
+		if (!mr) {
+			ret = -EACCES;
+			tbv_qp_put(target);
+			goto local_complete;
+		}
+		ret = tbv_mr_atomic64(mr, wqe->remote_addr, native_op,
+				      wqe->reserved1[0], wqe->reserved1[1], &old);
+		tbv_mr_put(mr);
+		tbv_qp_put(target);
+		if (!ret) {
+			read.nsegs = nsegs;
+			memcpy(read.segs, segs, sizeof(read.segs));
+			ret = tbv_copy_to_read_segments(&read, 0, &old,
+							sizeof(old));
+		}
+
+local_complete:
+		tbv_dv_slot_complete(tqp, dv_post->index,
+				     tbv_dv_status_from_errno(ret),
+				     dv_post->opcode,
+				     ret ? 0 : dv_post->byte_len,
+				     dv_post->imm_data,
+				     dv_post->cqe_needed || ret);
+		if (!ret)
+			atomic64_inc(&tqp->owner->data_tx_accepted);
+		tbv_release_read_segments(segs, nsegs);
+		atomic64_dec(&tqp->owner->data_wr_live);
+		tbv_qp_put(tqp);
+		return 0;
+	}
+
+	payload_len = native_op == TBV_NATIVE_ATOMIC_CMP_SWAP ?
+		      2 * sizeof(u64) : sizeof(u64);
+	frame = kzalloc(TBV_NATIVE_DATA_HDR_SIZE + payload_len, GFP_KERNEL);
+	if (!frame) {
+		ret = -ENOMEM;
+		goto err_release_segs;
+	}
+
+	mutex_lock(&tqp->owner->lock);
+	path = tbv_select_native_data_path_for_qp_locked(tqp);
+	mutex_unlock(&tqp->owner->lock);
+	if (!path) {
+		atomic64_inc(&tqp->owner->data_wr_no_path);
+		ret = -ENOTCONN;
+		goto err_free_frame;
+	}
+
+	ret = tbv_path_try_reserve_data(path, 1);
+	if (ret)
+		goto err_put_path;
+
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx) {
+		ret = -ENOMEM;
+		goto err_release_reservation;
+	}
+	ctx->tqp = tqp;
+	refcount_set(&ctx->refs, 1);
+	spin_lock_init(&ctx->lock);
+	mutex_init(&ctx->data_lock);
+	INIT_LIST_HEAD(&ctx->resp_frags);
+	ctx->wr_id = wqe->wr_id;
+	ctx->total_len = sizeof(u64);
+	ctx->nsegs = nsegs;
+	memcpy(ctx->segs, segs, sizeof(ctx->segs));
+	memset(segs, 0, sizeof(segs));
+	nsegs = 0;
+	ctx->dv_origin = true;
+	ctx->dv_index = dv_post->index;
+	ctx->dv_opcode = dv_post->opcode;
+	ctx->dv_byte_len = dv_post->byte_len;
+	ctx->dv_imm_data = dv_post->imm_data;
+	ctx->dv_cqe_needed = dv_post->cqe_needed;
+	INIT_LIST_HEAD(&ctx->node);
+
+	ret = tbv_qp_reserve_sendq(tqp);
+	if (ret)
+		goto err_put_ctx;
+	ctx->sq_counted = true;
+
+	spin_lock_irqsave(&tqp->lock, flags);
+	psn = tqp->send_psn & TBV_PSN_MASK;
+	tqp->send_psn = tbv_psn_next(psn);
+	spin_unlock_irqrestore(&tqp->lock, flags);
+	ctx->psn = psn;
+
+	hdr.opcode = TBV_NATIVE_DATA_OP_ATOMIC_REQ;
+	hdr.flags = TBV_NATIVE_DATA_F_LAST;
+	hdr.dest_qp = tqp->attr.dest_qp_num;
+	hdr.src_qp = tqp->base.qp_num;
+	hdr.psn = psn;
+	hdr.length = payload_len;
+	hdr.imm_data = native_op;
+	hdr.remote_addr = wqe->remote_addr;
+	hdr.rkey = wqe->rkey;
+
+	len = tbv_native_data_build_header(
+		frame, TBV_NATIVE_DATA_HDR_SIZE + payload_len, &hdr);
+	if (len < 0) {
+		ret = len;
+		goto err_put_ctx;
+	}
+	tbv_wire_put_le64(frame + TBV_NATIVE_DATA_HDR_SIZE, wqe->reserved1[0]);
+	if (native_op == TBV_NATIVE_ATOMIC_CMP_SWAP)
+		tbv_wire_put_le64(frame + TBV_NATIVE_DATA_HDR_SIZE + sizeof(u64),
+				  wqe->reserved1[1]);
+
+	tbv_qp_queue_read(tqp, ctx);
+	tbv_read_ctx_get(ctx);
+	atomic64_inc(&tqp->owner->data_wr_path_send);
+	ret = tbv_path_send_owned(path, frame,
+				  TBV_NATIVE_DATA_HDR_SIZE + payload_len,
+				  TBV_PATH_SEND_DEFER, tbv_read_tx_done, ctx);
+	if (ret) {
+		tbv_read_ctx_put(ctx);
+		tbv_qp_unqueue_read(tqp, ctx);
+		atomic64_inc(&tqp->owner->data_wr_path_send_error);
+		tbv_path_release_data_reservation(path, 1);
+		tbv_release_path_refs(&path, 1);
+		tbv_read_ctx_put(ctx);
+		return ret;
+	}
+
+	tbv_path_kick_tx(path);
+	tbv_release_path_refs(&path, 1);
+	atomic64_inc(&tqp->owner->data_tx_accepted);
+	return 0;
+
+err_put_ctx:
+	if (ctx->sq_counted)
+		tbv_qp_release_sendq_counted(tqp, &ctx->sq_counted);
+	tbv_read_ctx_put(ctx);
+	tbv_path_release_data_reservation(path, 1);
+	tbv_release_path_refs(&path, 1);
+	kfree(frame);
+	return ret;
+err_release_reservation:
+	tbv_path_release_data_reservation(path, 1);
+err_put_path:
+	tbv_release_path_refs(&path, 1);
+err_free_frame:
+	kfree(frame);
 err_release_segs:
 	tbv_release_read_segments(segs, nsegs);
 err_put_qp:
@@ -4771,7 +5215,8 @@ err_put_qp:
 	return ret;
 }
 
-static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
+static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr,
+			     const struct tbv_dv_post *dv_post)
 {
 	struct tbv_send_segment segs[TBV_IBDEV_MAX_SGE] = {};
 	struct tbv_send_ctx *ctx;
@@ -4789,17 +5234,24 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	bool write_with_imm = wr->opcode == IB_WR_RDMA_WRITE_WITH_IMM;
 	int ret;
 
-	if (!tbv_qp_allows_post(tqp))
-		return -EINVAL;
+	ret = tbv_qp_post_status(tqp, !!dv_post);
+	if (ret)
+		return ret;
 
-	if (tqp->type == IB_QPT_GSI)
+	if (tqp->type == IB_QPT_GSI) {
+		if (dv_post)
+			return -EOPNOTSUPP;
 		return tbv_post_gsi_send(tqp, wr);
+	}
 
-	if (tbv_qp_uses_apple_transport(tqp))
+	if (tbv_qp_uses_apple_transport(tqp)) {
+		if (dv_post)
+			return -EOPNOTSUPP;
 		return tbv_post_apple_send(tqp, wr);
+	}
 
 	if (wr->opcode == IB_WR_RDMA_READ)
-		return tbv_post_rdma_read(tqp, wr);
+		return tbv_post_rdma_read(tqp, wr, dv_post);
 
 	if (!is_send && !is_write) {
 		atomic64_inc(&tqp->owner->data_wr_op_unsupported);
@@ -4869,8 +5321,16 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	refcount_set(&ctx->refs, 1);
 	spin_lock_init(&ctx->lock);
 	ctx->wr_id = wr->wr_id;
-	ctx->signaled = !!(wr->send_flags & IB_SEND_SIGNALED);
+	ctx->signaled = !dv_post && !!(wr->send_flags & IB_SEND_SIGNALED);
 	ctx->wc_opcode = is_write ? IB_WC_RDMA_WRITE : IB_WC_SEND;
+	if (dv_post) {
+		ctx->dv_origin = true;
+		ctx->dv_index = dv_post->index;
+		ctx->dv_opcode = dv_post->opcode;
+		ctx->dv_byte_len = dv_post->byte_len;
+		ctx->dv_imm_data = dv_post->imm_data;
+		ctx->dv_cqe_needed = dv_post->cqe_needed;
+	}
 	INIT_LIST_HEAD(&ctx->node);
 	INIT_LIST_HEAD(&ctx->retry_node);
 	atomic_set(&ctx->tx_pending, 0);
@@ -4949,7 +5409,7 @@ static int tbv_post_send(struct ib_qp *qp, const struct ib_send_wr *wr,
 	int ret;
 
 	for (cur = wr; cur; cur = cur->next) {
-		ret = tbv_post_send_one(tqp, cur);
+		ret = tbv_post_send_one(tqp, cur, NULL);
 		if (ret) {
 			if (bad_wr)
 				*bad_wr = cur;
@@ -5007,10 +5467,11 @@ static int tbv_post_recv(struct ib_qp *qp, const struct ib_recv_wr *wr,
 	u32 posted = 0;
 	int ret;
 
-	if (!tbv_qp_allows_post(tqp)) {
+	ret = tbv_qp_recv_post_status(tqp);
+	if (ret) {
 		if (bad_wr)
 			*bad_wr = wr;
-		return -EINVAL;
+		return ret;
 	}
 
 	for (cur = wr; cur; cur = cur->next) {
@@ -6170,14 +6631,97 @@ static void tbv_qp_flush_apple_sq(struct tbv_qp *tqp)
 	}
 }
 
+static int tbv_ib_umem_copy_to(struct ib_umem *umem, u64 start, u64 length,
+			       u64 addr, const void *src, size_t len)
+{
+	struct sg_table *sgt = &umem->sgt_append.sgt;
+	struct scatterlist *sg;
+	size_t offset;
+	size_t copied = 0;
+	u64 mr_end;
+	u64 end;
+	unsigned int i;
+
+	if (!len)
+		return 0;
+	if (check_add_overflow(addr, (u64)len, &end))
+		return -EINVAL;
+	if (check_add_overflow(start, length, &mr_end))
+		return -EINVAL;
+	if (addr < start || end > mr_end)
+		return -EFAULT;
+
+	offset = ib_umem_offset(umem) + addr - start;
+	for_each_sgtable_sg(sgt, sg, i) {
+		size_t seg_len = sg->length;
+		size_t seg_off;
+
+		if (offset >= seg_len) {
+			offset -= seg_len;
+			continue;
+		}
+
+		seg_off = sg->offset + offset;
+		seg_len -= offset;
+		offset = 0;
+
+		while (seg_len && copied < len) {
+			struct page *page;
+			size_t page_off = offset_in_page(seg_off);
+			size_t chunk = min_t(size_t, PAGE_SIZE - page_off,
+					     seg_len);
+			void *kaddr;
+
+			chunk = min_t(size_t, chunk, len - copied);
+
+			page = pfn_to_page(page_to_pfn(sg_page(sg)) +
+					   (seg_off >> PAGE_SHIFT));
+			kaddr = kmap_local_page(page);
+			memcpy((u8 *)kaddr + page_off, (const u8 *)src + copied,
+			       chunk);
+			flush_dcache_page(page);
+			kunmap_local(kaddr);
+
+			copied += chunk;
+			seg_off += chunk;
+			seg_len -= chunk;
+		}
+
+		if (copied == len)
+			return 0;
+	}
+
+	return -EFAULT;
+}
+
+static int tbv_ib_umem_copy_from(void *dst, struct ib_umem *umem, u64 start,
+				 u64 length, u64 addr, size_t len)
+{
+	u64 end;
+	u64 mr_end;
+
+	if (!len)
+		return 0;
+	if (check_add_overflow(addr, (u64)len, &end))
+		return -EINVAL;
+	if (check_add_overflow(start, length, &mr_end))
+		return -EINVAL;
+	if (addr < start || end > mr_end)
+		return -EFAULT;
+
+	return ib_umem_copy_from(dst, umem, addr - start, len);
+}
+
 static int tbv_umem_copy_to(struct tbv_mr *mr, u64 addr, const void *src,
 			    size_t len)
 {
 	struct sg_table *sgt = &mr->umem->sgt_append.sgt;
+	struct scatterlist *sg;
 	size_t offset;
-	size_t copied;
+	size_t copied = 0;
 	u64 mr_end;
 	u64 end;
+	unsigned int i;
 
 	if (!len)
 		return 0;
@@ -6190,10 +6734,75 @@ static int tbv_umem_copy_to(struct tbv_mr *mr, u64 addr, const void *src,
 	if (addr < mr->start || end > mr_end)
 		return -EFAULT;
 
+	if (mr->umem->is_dmabuf) {
+		struct ib_umem_dmabuf *umem_dmabuf =
+			to_ib_umem_dmabuf(mr->umem);
+		int ret;
+
+		ret = dma_buf_begin_cpu_access(umem_dmabuf->attach->dmabuf,
+					       DMA_TO_DEVICE);
+		if (ret)
+			return ret;
+	}
+
 	offset = ib_umem_offset(mr->umem) + addr - mr->start;
-	copied = sg_pcopy_from_buffer(sgt->sgl, sgt->orig_nents, src, len,
-				      offset);
-	return copied == len ? 0 : -EFAULT;
+	for_each_sgtable_sg(sgt, sg, i) {
+		size_t seg_len = sg->length;
+		size_t seg_off;
+
+		if (offset >= seg_len) {
+			offset -= seg_len;
+			continue;
+		}
+
+		seg_off = sg->offset + offset;
+		seg_len -= offset;
+		offset = 0;
+
+		while (seg_len && copied < len) {
+			struct page *page;
+			size_t page_off = offset_in_page(seg_off);
+			size_t chunk = min_t(size_t, PAGE_SIZE - page_off,
+					     seg_len);
+			void *kaddr;
+
+			chunk = min_t(size_t, chunk, len - copied);
+
+			page = pfn_to_page(page_to_pfn(sg_page(sg)) +
+					   (seg_off >> PAGE_SHIFT));
+			kaddr = kmap_local_page(page);
+			memcpy((u8 *)kaddr + page_off, (const u8 *)src + copied,
+			       chunk);
+			flush_dcache_page(page);
+			kunmap_local(kaddr);
+
+			copied += chunk;
+			seg_off += chunk;
+			seg_len -= chunk;
+		}
+
+		if (copied == len)
+			goto out_end_access;
+	}
+
+	if (mr->umem->is_dmabuf) {
+		struct ib_umem_dmabuf *umem_dmabuf =
+			to_ib_umem_dmabuf(mr->umem);
+
+		dma_buf_end_cpu_access(umem_dmabuf->attach->dmabuf,
+				       DMA_TO_DEVICE);
+	}
+	return -EFAULT;
+
+out_end_access:
+	if (mr->umem->is_dmabuf) {
+		struct ib_umem_dmabuf *umem_dmabuf =
+			to_ib_umem_dmabuf(mr->umem);
+
+		return dma_buf_end_cpu_access(umem_dmabuf->attach->dmabuf,
+					      DMA_TO_DEVICE);
+	}
+	return 0;
 }
 
 static int tbv_umem_copy_to_iova(struct tbv_mr *mr, u64 iova,
@@ -6246,6 +6855,7 @@ static int tbv_umem_copy_from_iova(struct tbv_mr *mr, u64 iova,
 {
 	u64 addr;
 	int ret;
+	int end_ret;
 
 	if (!len)
 		return 0;
@@ -6253,7 +6863,193 @@ static int tbv_umem_copy_from_iova(struct tbv_mr *mr, u64 iova,
 	if (ret)
 		return ret;
 
-	return ib_umem_copy_from(dst, mr->umem, addr - mr->start, len);
+	if (mr->umem->is_dmabuf) {
+		struct ib_umem_dmabuf *umem_dmabuf =
+			to_ib_umem_dmabuf(mr->umem);
+
+		ret = dma_buf_begin_cpu_access(umem_dmabuf->attach->dmabuf,
+					       DMA_FROM_DEVICE);
+		if (ret)
+			return ret;
+	}
+
+	ret = tbv_ib_umem_copy_from(dst, mr->umem, mr->start, mr->length, addr,
+				    len);
+
+	if (mr->umem->is_dmabuf) {
+		struct ib_umem_dmabuf *umem_dmabuf =
+			to_ib_umem_dmabuf(mr->umem);
+
+		end_ret = dma_buf_end_cpu_access(umem_dmabuf->attach->dmabuf,
+						 DMA_FROM_DEVICE);
+		if (!ret)
+			ret = end_ret;
+	}
+
+	return ret;
+}
+
+static int tbv_mr_atomic64(struct tbv_mr *mr, u64 iova, u32 op, u64 data,
+			   u64 compare, u64 *old_out)
+{
+	u64 old = 0;
+	u64 new = 0;
+	u64 addr;
+	int ret;
+
+	if (mr->dma_mr)
+		return -EOPNOTSUPP;
+	if (!(mr->access & IB_ACCESS_REMOTE_ATOMIC))
+		return -EACCES;
+
+	ret = tbv_umem_iova_to_addr(mr, iova, sizeof(old), &addr);
+	if (ret)
+		return ret;
+
+	mutex_lock(&mr->atomic_lock);
+	ret = tbv_umem_copy_from_iova(mr, iova, &old, sizeof(old));
+	if (ret)
+		goto out_unlock;
+
+	switch (op) {
+	case TBV_NATIVE_ATOMIC_FETCH_ADD:
+		new = old + data;
+		break;
+	case TBV_NATIVE_ATOMIC_SWAP:
+		new = data;
+		break;
+	case TBV_NATIVE_ATOMIC_CMP_SWAP:
+		new = old == compare ? data : old;
+		break;
+	default:
+		ret = -EOPNOTSUPP;
+		goto out_unlock;
+	}
+
+	ret = tbv_umem_copy_to(mr, addr, &new, sizeof(new));
+	if (!ret && old_out)
+		*old_out = old;
+
+out_unlock:
+	mutex_unlock(&mr->atomic_lock);
+	return ret;
+}
+
+static void tbv_send_atomic_resp_on_path(struct tbv_qp *tqp,
+					 struct tbv_path *rx_path, u32 dest_qp,
+					 u32 src_qp, u32 psn, u64 old_value,
+					 int status)
+{
+	struct tbv_native_data_header hdr = {};
+	u8 frame[TBV_NATIVE_DATA_HDR_SIZE + sizeof(old_value)];
+	int len;
+
+	hdr.opcode = TBV_NATIVE_DATA_OP_ATOMIC_RESP;
+	hdr.flags = TBV_NATIVE_DATA_F_LAST;
+	hdr.dest_qp = dest_qp;
+	hdr.src_qp = src_qp;
+	hdr.psn = psn;
+	hdr.length = sizeof(old_value);
+	hdr.imm_data = sizeof(old_value);
+	hdr.rkey = status ? 1 : 0;
+
+	len = tbv_native_data_build_header(frame, sizeof(frame), &hdr);
+	if (len < 0)
+		return;
+	tbv_wire_put_le64(frame + TBV_NATIVE_DATA_HDR_SIZE, old_value);
+
+	tbv_send_control_frame_on_path(tqp, rx_path, frame, sizeof(frame));
+}
+
+static void tbv_rx_handle_atomic_req(struct tbv_state *state,
+				     struct tbv_qp *tqp,
+				     const struct tbv_native_data_header *hdr,
+				     const void *payload,
+				     struct tbv_path *rx_path)
+{
+	struct tbv_mr *mr;
+	u64 data;
+	u64 compare = 0;
+	u64 old = 0;
+	int ret = 0;
+
+	if ((hdr->flags & ~TBV_NATIVE_DATA_F_LAST) ||
+	    !(hdr->flags & TBV_NATIVE_DATA_F_LAST) ||
+	    !(tqp->attr.qp_access_flags & IB_ACCESS_REMOTE_ATOMIC)) {
+		ret = -EINVAL;
+		goto out_resp;
+	}
+
+	switch (hdr->imm_data) {
+	case TBV_NATIVE_ATOMIC_FETCH_ADD:
+	case TBV_NATIVE_ATOMIC_SWAP:
+		if (hdr->length != sizeof(u64)) {
+			ret = -EINVAL;
+			goto out_resp;
+		}
+		data = tbv_wire_get_le64(payload);
+		break;
+	case TBV_NATIVE_ATOMIC_CMP_SWAP:
+		if (hdr->length != 2 * sizeof(u64)) {
+			ret = -EINVAL;
+			goto out_resp;
+		}
+		data = tbv_wire_get_le64(payload);
+		compare = tbv_wire_get_le64((const u8 *)payload + sizeof(u64));
+		break;
+	default:
+		ret = -EOPNOTSUPP;
+		goto out_resp;
+	}
+
+	mr = tbv_mr_get(state, hdr->rkey);
+	if (!mr) {
+		ret = -EACCES;
+		goto out_resp;
+	}
+	ret = tbv_mr_atomic64(mr, hdr->remote_addr, hdr->imm_data, data,
+			      compare, &old);
+	tbv_mr_put(mr);
+
+out_resp:
+	tbv_send_atomic_resp_on_path(tqp, rx_path, hdr->src_qp, hdr->dest_qp,
+				     hdr->psn, old, ret);
+}
+
+static void tbv_rx_handle_atomic_resp(struct tbv_state *state,
+				      struct tbv_qp *tqp,
+				      const struct tbv_native_data_header *hdr,
+				      const void *payload)
+{
+	struct tbv_read_ctx *read;
+	int ret = 0;
+
+	read = tbv_qp_find_read_get(tqp, hdr->psn);
+	if (!read) {
+		atomic64_inc(&state->data_rx_read_resp_duplicate);
+		return;
+	}
+
+	if ((hdr->flags & ~TBV_NATIVE_DATA_F_LAST) ||
+	    !(hdr->flags & TBV_NATIVE_DATA_F_LAST) ||
+	    hdr->length != sizeof(u64) ||
+	    hdr->imm_data != sizeof(u64)) {
+		ret = -EINVAL;
+		goto complete;
+	}
+	if (hdr->rkey) {
+		ret = -EIO;
+		goto complete;
+	}
+
+	ret = tbv_copy_to_read_segments(read, 0, payload, sizeof(u64));
+
+complete:
+	if (tbv_qp_unqueue_read(tqp, read)) {
+		tbv_read_complete(read, ret);
+		tbv_read_ctx_put(read);
+	}
+	tbv_read_ctx_put(read);
 }
 
 static int tbv_umem_page_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
@@ -8499,6 +9295,8 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 	case TBV_NATIVE_DATA_OP_RDMA_WRITE:
 	case TBV_NATIVE_DATA_OP_RDMA_WRITE_IMM:
 	case TBV_NATIVE_DATA_OP_MAD:
+	case TBV_NATIVE_DATA_OP_ATOMIC_REQ:
+	case TBV_NATIVE_DATA_OP_ATOMIC_RESP:
 		break;
 	default:
 		atomic64_inc(&state->data_rx_bad_header);
@@ -8514,6 +9312,10 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 
 	tqp = tbv_qp_get_by_num(state, hdr->dest_qp);
 	if (!tqp) {
+		if (hdr->opcode == TBV_NATIVE_DATA_OP_ATOMIC_REQ)
+			tbv_send_atomic_resp_on_path(NULL, rx_path, hdr->src_qp,
+						     hdr->dest_qp, hdr->psn, 0,
+						     -EINVAL);
 		atomic64_inc(&state->data_rx_no_qp);
 		return;
 	}
@@ -8643,6 +9445,18 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 		return;
 	}
 
+	if (hdr->opcode == TBV_NATIVE_DATA_OP_ATOMIC_REQ) {
+		tbv_rx_handle_atomic_req(state, tqp, hdr, payload, rx_path);
+		tbv_qp_put(tqp);
+		return;
+	}
+
+	if (hdr->opcode == TBV_NATIVE_DATA_OP_ATOMIC_RESP) {
+		tbv_rx_handle_atomic_resp(state, tqp, hdr, payload);
+		tbv_qp_put(tqp);
+		return;
+	}
+
 	atomic64_inc(&state->data_rx_send);
 	if (hdr->opcode == TBV_NATIVE_DATA_OP_SEND)
 		atomic64_inc(&state->data_rx_op_send);
@@ -8702,6 +9516,7 @@ static int tbv_mr_publish(struct tbv_mr *mr, struct ib_pd *pd)
 	mr->owner = owner;
 	refcount_set(&mr->refs, 1);
 	INIT_WORK(&mr->free_work, tbv_mr_free_work);
+	mutex_init(&mr->atomic_lock);
 
 	xa_lock_irqsave(&owner->verbs_mrs_xa, flags);
 	ret = __xa_insert(&owner->verbs_mrs_xa, key, mr, GFP_KERNEL);
@@ -8740,31 +9555,19 @@ static struct ib_mr *tbv_get_dma_mr(struct ib_pd *pd, int access)
 	return &mr->base;
 }
 
-static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
-				     u64 virt_addr, int access,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
-				     struct ib_dmah *dmah,
-#endif
-				     struct ib_udata *udata)
+static struct ib_mr *tbv_reg_mr_from_umem(struct ib_pd *pd,
+					  struct ib_umem *umem,
+					  u64 start, u64 length,
+					  u64 virt_addr, int access)
 {
 	struct tbv_mr *mr;
 	int ret;
-
-	if (!length)
-		return ERR_PTR(-EINVAL);
 
 	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
 	if (!mr)
 		return ERR_PTR(-ENOMEM);
 
-	mr->umem = ib_umem_get(pd->device, start, length, access);
-	if (IS_ERR(mr->umem)) {
-		struct ib_umem *umem = mr->umem;
-
-		kfree(mr);
-		return ERR_CAST(umem);
-	}
-
+	mr->umem = umem;
 	mr->base.type = IB_MR_TYPE_USER;
 	mr->base.iova = virt_addr;
 	mr->base.length = length;
@@ -8774,11 +9577,79 @@ static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	mr->access = access;
 	ret = tbv_mr_publish(mr, pd);
 	if (ret) {
-		ib_umem_release(mr->umem);
+		ib_umem_release(umem);
 		kfree(mr);
 		return ERR_PTR(ret);
 	}
 	return &mr->base;
+}
+
+static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+				     u64 virt_addr, int access,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+				     struct ib_dmah *dmah,
+#endif
+				     struct ib_udata *udata)
+{
+	struct ib_umem *umem;
+
+	if (!length)
+		return ERR_PTR(-EINVAL);
+
+	umem = ib_umem_get(pd->device, start, length, access);
+	if (IS_ERR(umem))
+		return ERR_CAST(umem);
+
+	return tbv_reg_mr_from_umem(pd, umem, start, length, virt_addr, access);
+}
+
+static struct ib_mr *tbv_reg_user_mr_dmabuf(struct ib_pd *pd, u64 offset,
+					    u64 length, u64 virt_addr,
+					    int fd, int access,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+					    struct ib_dmah *dmah,
+#endif
+					    struct uverbs_attr_bundle *attrs)
+{
+	struct ib_umem_dmabuf *umem_dmabuf;
+	int ret;
+
+	if (!length)
+		return ERR_PTR(-EINVAL);
+
+	umem_dmabuf = ib_umem_dmabuf_get_pinned(pd->device, offset, length, fd,
+						access);
+	if (PTR_ERR_OR_ZERO(umem_dmabuf) == -EOPNOTSUPP) {
+		pr_info_ratelimited("dmabuf MR pinned import unsupported; trying dynamic import device=%s dma_device=%s fd=%d offset=%llu length=%llu\n",
+				    dev_name(&pd->device->dev),
+				    pd->device->dma_device ?
+				    dev_name(pd->device->dma_device) : "<none>",
+				    fd, (unsigned long long)offset,
+				    (unsigned long long)length);
+		umem_dmabuf = ib_umem_dmabuf_get(pd->device, offset, length,
+						 fd, access,
+						 &tbv_dmabuf_attach_ops);
+		if (IS_ERR(umem_dmabuf)) {
+			pr_info_ratelimited("dmabuf MR dynamic import failed err=%ld\n",
+					    PTR_ERR(umem_dmabuf));
+			return ERR_CAST(umem_dmabuf);
+		}
+
+		dma_resv_lock(umem_dmabuf->attach->dmabuf->resv, NULL);
+		ret = ib_umem_dmabuf_map_pages(umem_dmabuf);
+		dma_resv_unlock(umem_dmabuf->attach->dmabuf->resv);
+		if (ret) {
+			pr_info_ratelimited("dmabuf MR map_pages failed err=%d\n",
+					    ret);
+			ib_umem_release(&umem_dmabuf->umem);
+			return ERR_PTR(ret);
+		}
+	}
+	if (IS_ERR(umem_dmabuf))
+		return ERR_CAST(umem_dmabuf);
+
+	return tbv_reg_mr_from_umem(pd, &umem_dmabuf->umem, offset, length,
+				    virt_addr, access);
 }
 
 static int tbv_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
@@ -8796,6 +9667,1251 @@ static int tbv_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
 	tbv_mr_put(mr);
 	return 0;
 }
+
+static int UVERBS_HANDLER(USB4_RDMA_DV_METHOD_QUERY_CAPS)(
+	struct uverbs_attr_bundle *attrs)
+{
+	struct usb4_rdma_dv_query_caps_resp resp = {
+		.abi_version = USB4_RDMA_DV_ABI_VERSION,
+		.caps = USB4_RDMA_DV_CAPS_V2,
+		.max_sq_entries = USB4_RDMA_DV_MAX_SQ_ENTRIES,
+		.max_cq_entries = USB4_RDMA_DV_MAX_CQ_ENTRIES,
+		.default_sq_entries = USB4_RDMA_DV_DEFAULT_SQ_ENTRIES,
+		.default_cq_entries = USB4_RDMA_DV_DEFAULT_CQ_ENTRIES,
+		.wqe_size = USB4_RDMA_DV_WQE_SIZE,
+		.cqe_size = USB4_RDMA_DV_CQE_SIZE,
+		.doorbell_record_size = USB4_RDMA_DV_DOORBELL_RECORD_SIZE,
+		.doorbell_page_size = USB4_RDMA_DV_DOORBELL_PAGE_SIZE,
+		.tail_index_bits = USB4_RDMA_DV_TAIL_INDEX_BITS,
+		.tail_generation_bits = USB4_RDMA_DV_TAIL_GENERATION_BITS,
+	};
+	struct ib_ucontext *ib_uctx;
+
+	BUILD_BUG_ON(sizeof(struct usb4_rdma_dv_wqe) !=
+		     USB4_RDMA_DV_WQE_SIZE);
+	BUILD_BUG_ON(sizeof(struct usb4_rdma_dv_cqe) !=
+		     USB4_RDMA_DV_CQE_SIZE);
+	BUILD_BUG_ON(sizeof(struct usb4_rdma_dv_doorbell_producer_line) !=
+		     USB4_RDMA_DV_DOORBELL_LINE_SIZE);
+	BUILD_BUG_ON(sizeof(struct usb4_rdma_dv_doorbell_consumer_line) !=
+		     USB4_RDMA_DV_DOORBELL_LINE_SIZE);
+	BUILD_BUG_ON(sizeof(struct usb4_rdma_dv_doorbell) !=
+		     USB4_RDMA_DV_DOORBELL_RECORD_SIZE);
+
+	ib_uctx = ib_uverbs_get_ucontext(attrs);
+	if (IS_ERR(ib_uctx))
+		return PTR_ERR(ib_uctx);
+	if (!tbv_ibdev_state(ib_uctx->device))
+		return -ENODEV;
+
+	return uverbs_copy_to(attrs, USB4_RDMA_DV_ATTR_QUERY_CAPS_RESP,
+			      &resp, sizeof(resp));
+}
+
+static bool tbv_dv_reserved_zero(const u32 *reserved, size_t count)
+{
+	size_t i;
+
+	for (i = 0; i < count; i++) {
+		if (reserved[i])
+			return false;
+	}
+	return true;
+}
+
+static u32 tbv_dv_next_generation(u32 generation)
+{
+	u32 mask = (1u << USB4_RDMA_DV_TAIL_GENERATION_BITS) - 1;
+	u32 next = (generation + 1) & mask;
+
+	return next ? next : 1;
+}
+
+static u32 tbv_dv_index_delta(u32 tail, u32 head)
+{
+	return (tail - head) & USB4_RDMA_DV_TAIL_INDEX_MASK;
+}
+
+static u32 tbv_dv_status_from_errno(int status)
+{
+	if (!status)
+		return USB4_RDMA_DV_CQE_SUCCESS;
+
+	switch (status) {
+	case -EMSGSIZE:
+		return USB4_RDMA_DV_CQE_LOCAL_LEN_ERR;
+	case -EACCES:
+	case -EFAULT:
+	case -EINVAL:
+		return USB4_RDMA_DV_CQE_LOCAL_PROT_ERR;
+	case -ETIMEDOUT:
+		return USB4_RDMA_DV_CQE_RETRY_EXC_ERR;
+	case -ECANCELED:
+		return USB4_RDMA_DV_CQE_WR_FLUSH_ERR;
+	default:
+		return USB4_RDMA_DV_CQE_GENERAL_ERR;
+	}
+}
+
+static int tbv_dv_umem_copy_from(struct ib_umem *umem, u64 start, u64 length,
+				 u64 addr, void *dst, size_t len)
+{
+	u64 end;
+	u64 mr_end;
+
+	if (check_add_overflow(addr, (u64)len, &end))
+		return -EINVAL;
+	if (check_add_overflow(start, length, &mr_end))
+		return -EINVAL;
+	if (addr < start || end > mr_end)
+		return -EFAULT;
+	return ib_umem_copy_from(dst, umem, addr - start, len);
+}
+
+static int tbv_dv_umem_copy_to(struct ib_umem *umem, u64 start, u64 length,
+			       u64 addr, const void *src, size_t len)
+{
+	return tbv_ib_umem_copy_to(umem, start, length, addr, src, len);
+}
+
+static size_t tbv_dv_db_consumer_offset(size_t field)
+{
+	return offsetof(struct usb4_rdma_dv_doorbell, consumer) + field;
+}
+
+static size_t tbv_dv_db_producer_offset(size_t field)
+{
+	return offsetof(struct usb4_rdma_dv_doorbell, producer) + field;
+}
+
+static int tbv_dv_read_doorbell_u32(struct tbv_qp *tqp, size_t offset,
+				    u32 *value)
+{
+	return tbv_dv_umem_copy_from(tqp->dv_doorbell_umem,
+				     tqp->dv_doorbell_addr,
+				     USB4_RDMA_DV_DOORBELL_PAGE_SIZE,
+				     tqp->dv_doorbell_addr + offset, value,
+				     sizeof(*value));
+}
+
+static int tbv_dv_write_doorbell_u32_umem(struct ib_umem *umem, u64 addr,
+					  size_t offset, u32 value)
+{
+	return tbv_dv_umem_copy_to(umem, addr,
+				   USB4_RDMA_DV_DOORBELL_PAGE_SIZE,
+				   addr + offset, &value, sizeof(value));
+}
+
+static int tbv_dv_write_doorbell_u32(struct tbv_qp *tqp, size_t offset,
+				     u32 value)
+{
+	return tbv_dv_write_doorbell_u32_umem(tqp->dv_doorbell_umem,
+					      tqp->dv_doorbell_addr, offset,
+					      value);
+}
+
+static int tbv_dv_write_consumer_line_umem(struct ib_umem *umem, u64 addr,
+					   u32 sq_head, u32 cq_tail,
+					   u32 qp_state, u32 generation)
+{
+	struct usb4_rdma_dv_doorbell_consumer_line line = {
+		.sq_head = sq_head,
+		.cq_tail = cq_tail,
+		.qp_state = qp_state,
+		.generation = generation,
+	};
+
+	return tbv_dv_umem_copy_to(
+		umem, addr, USB4_RDMA_DV_DOORBELL_PAGE_SIZE,
+		addr + offsetof(struct usb4_rdma_dv_doorbell, consumer),
+		&line, sizeof(line));
+}
+
+static void tbv_dv_release_resources(struct tbv_dv_queue_resources *res)
+{
+	if (!res)
+		return;
+	if (res->sq_umem)
+		ib_umem_release(res->sq_umem);
+	if (res->cq_umem)
+		ib_umem_release(res->cq_umem);
+	if (res->doorbell_umem)
+		ib_umem_release(res->doorbell_umem);
+	kfree(res->cqe_slots);
+	memset(res, 0, sizeof(*res));
+}
+
+static int tbv_dv_pin_queue(struct ib_device *dev,
+			    const struct usb4_rdma_dv_queue_create *req,
+			    struct tbv_dv_queue_resources *res)
+{
+	u64 sq_bytes = (u64)req->sq_entries * req->sq_stride;
+	u64 cq_bytes = (u64)req->cq_entries * req->cq_stride;
+	int access = IB_ACCESS_LOCAL_WRITE;
+
+	memset(res, 0, sizeof(*res));
+
+	res->cqe_slots = kcalloc(req->sq_entries, sizeof(*res->cqe_slots),
+				 GFP_KERNEL);
+	if (!res->cqe_slots)
+		return -ENOMEM;
+
+	res->sq_umem = ib_umem_get(dev, req->sq_addr, sq_bytes, access);
+	if (IS_ERR(res->sq_umem)) {
+		int ret = PTR_ERR(res->sq_umem);
+
+		res->sq_umem = NULL;
+		tbv_dv_release_resources(res);
+		return ret;
+	}
+
+	res->cq_umem = ib_umem_get(dev, req->cq_addr, cq_bytes, access);
+	if (IS_ERR(res->cq_umem)) {
+		int ret = PTR_ERR(res->cq_umem);
+
+		res->cq_umem = NULL;
+		tbv_dv_release_resources(res);
+		return ret;
+	}
+
+	res->doorbell_umem = ib_umem_get(dev, req->doorbell_addr,
+					 USB4_RDMA_DV_DOORBELL_PAGE_SIZE,
+					 access);
+	if (IS_ERR(res->doorbell_umem)) {
+		int ret = PTR_ERR(res->doorbell_umem);
+
+		res->doorbell_umem = NULL;
+		tbv_dv_release_resources(res);
+		return ret;
+	}
+
+	return 0;
+}
+
+static void tbv_dv_queue_clear_locked(struct tbv_qp *tqp)
+{
+	tqp->dv_queue_active = false;
+	tqp->dv_cq_overflow = false;
+	tqp->dv_sq_entries = 0;
+	tqp->dv_cq_entries = 0;
+	tqp->dv_sq_head = 0;
+	tqp->dv_cq_tail = 0;
+	tqp->dv_complete_head = 0;
+	tqp->dv_sq_addr = 0;
+	tqp->dv_cq_addr = 0;
+	tqp->dv_doorbell_addr = 0;
+	tqp->dv_sq_umem = NULL;
+	tqp->dv_cq_umem = NULL;
+	tqp->dv_doorbell_umem = NULL;
+	tqp->dv_cqe_slots = NULL;
+}
+
+static void tbv_dv_take_resources_locked(struct tbv_qp *tqp,
+					 struct tbv_dv_queue_resources *res)
+{
+	res->sq_umem = tqp->dv_sq_umem;
+	res->cq_umem = tqp->dv_cq_umem;
+	res->doorbell_umem = tqp->dv_doorbell_umem;
+	res->cqe_slots = tqp->dv_cqe_slots;
+	tbv_dv_queue_clear_locked(tqp);
+}
+
+static void tbv_dv_poll_attach_locked(struct tbv_qp *tqp)
+{
+	struct tbv_state *state = tqp->owner;
+
+	if (!state)
+		return;
+
+	mutex_lock(&state->dv_poll_lock);
+	if (!tqp->dv_poll_listed) {
+		list_add_tail(&tqp->dv_poll_node, &state->dv_poll_qps);
+		tqp->dv_poll_listed = true;
+		WRITE_ONCE(state->dv_poll_qp_count,
+			   state->dv_poll_qp_count + 1);
+	}
+	mutex_unlock(&state->dv_poll_lock);
+	wake_up(&state->dv_poll_wait);
+}
+
+static void tbv_dv_poll_detach_locked(struct tbv_qp *tqp)
+{
+	struct tbv_state *state = tqp->owner;
+
+	if (!state)
+		return;
+
+	mutex_lock(&state->dv_poll_lock);
+	if (tqp->dv_poll_listed) {
+		list_del_init(&tqp->dv_poll_node);
+		tqp->dv_poll_listed = false;
+		if (state->dv_poll_qp_count)
+			WRITE_ONCE(state->dv_poll_qp_count,
+				   state->dv_poll_qp_count - 1);
+	}
+	mutex_unlock(&state->dv_poll_lock);
+}
+
+static void tbv_dv_schedule_flush(struct tbv_qp *tqp)
+{
+	struct workqueue_struct *wq;
+
+	if (!refcount_inc_not_zero(&tqp->refs))
+		return;
+
+	wq = tqp->owner && tqp->owner->workqueue ? tqp->owner->workqueue :
+						   system_unbound_wq;
+	if (!queue_work(wq, &tqp->dv_completion_work))
+		tbv_qp_put(tqp);
+}
+
+static int tbv_dv_slot_start(struct tbv_qp *tqp, u32 index,
+			     const struct usb4_rdma_dv_wqe *wqe,
+			     bool cqe_needed)
+{
+	struct tbv_dv_cqe_slot *slot;
+	unsigned long flags;
+	int ret = 0;
+
+	spin_lock_irqsave(&tqp->lock, flags);
+	if (!tqp->dv_queue_active || tqp->dv_cq_overflow) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	slot = &tqp->dv_cqe_slots[index % tqp->dv_sq_entries];
+	if (slot->in_use) {
+		tqp->dv_cq_overflow = true;
+		ret = -EOVERFLOW;
+		goto out;
+	}
+
+	memset(slot, 0, sizeof(*slot));
+	slot->wr_id = wqe->wr_id;
+	slot->opcode = wqe->opcode;
+	slot->byte_len = wqe->length;
+	slot->imm_data = wqe->imm_data;
+	slot->cqe_needed = cqe_needed;
+	slot->in_use = true;
+out:
+	spin_unlock_irqrestore(&tqp->lock, flags);
+	return ret;
+}
+
+static void tbv_dv_slot_complete(struct tbv_qp *tqp, u32 index, u32 status,
+				 u32 opcode, u32 byte_len, u32 imm_data,
+				 bool cqe_needed)
+{
+	struct tbv_dv_cqe_slot *slot;
+	unsigned long flags;
+	bool completed = false;
+
+	spin_lock_irqsave(&tqp->lock, flags);
+	if (!tqp->dv_queue_active || !tqp->dv_cqe_slots)
+		goto out;
+
+	slot = &tqp->dv_cqe_slots[index % tqp->dv_sq_entries];
+	if (!slot->in_use)
+		goto out;
+
+	slot->status = status;
+	slot->opcode = opcode;
+	slot->byte_len = byte_len;
+	slot->imm_data = imm_data;
+	if (status != USB4_RDMA_DV_CQE_SUCCESS)
+		slot->cqe_needed = true;
+	else
+		slot->cqe_needed = cqe_needed;
+	slot->done = true;
+	completed = true;
+out:
+	spin_unlock_irqrestore(&tqp->lock, flags);
+	if (completed && status != USB4_RDMA_DV_CQE_SUCCESS &&
+	    status != USB4_RDMA_DV_CQE_STALE_GEN && tqp->owner)
+		atomic64_inc(&tqp->owner->dv_hard_error);
+	if (completed)
+		tbv_dv_schedule_flush(tqp);
+}
+
+static void tbv_dv_slot_cancel(struct tbv_qp *tqp, u32 index)
+{
+	struct tbv_dv_cqe_slot *slot;
+	unsigned long flags;
+
+	spin_lock_irqsave(&tqp->lock, flags);
+	if (!tqp->dv_cqe_slots)
+		goto out;
+	slot = &tqp->dv_cqe_slots[index % tqp->dv_sq_entries];
+	if (slot->in_use && !slot->done)
+		memset(slot, 0, sizeof(*slot));
+out:
+	spin_unlock_irqrestore(&tqp->lock, flags);
+}
+
+static int tbv_dv_mark_error(struct tbv_qp *tqp)
+{
+	unsigned long flags;
+	bool active;
+	int ret = 0;
+
+	spin_lock_irqsave(&tqp->lock, flags);
+	active = tqp->dv_queue_active;
+	if (active)
+		tqp->dv_cq_overflow = true;
+	spin_unlock_irqrestore(&tqp->lock, flags);
+
+	tbv_qp_mark_error(tqp);
+	if (active)
+		ret = tbv_dv_write_doorbell_u32(
+			tqp,
+			tbv_dv_db_consumer_offset(offsetof(
+				struct usb4_rdma_dv_doorbell_consumer_line,
+				qp_state)),
+			USB4_RDMA_DV_QP_ERR);
+	return ret;
+}
+
+static int tbv_dv_flush_completions_locked(struct tbv_qp *tqp)
+{
+	for (;;) {
+		struct tbv_dv_cqe_slot local = {};
+		struct usb4_rdma_dv_cqe cqe = {};
+		unsigned long flags;
+		u32 cq_head_packed = 0;
+		u32 cq_head = 0;
+		u32 cq_tail;
+		u32 cqe_index = 0;
+		u32 generation;
+		u32 cq_entries;
+		bool cqe_needed;
+		bool have_slot = false;
+		int ret;
+
+		spin_lock_irqsave(&tqp->lock, flags);
+		if (!tqp->dv_queue_active || tqp->dv_cq_overflow ||
+		    !tqp->dv_cqe_slots) {
+			spin_unlock_irqrestore(&tqp->lock, flags);
+			return 0;
+		}
+
+		local = tqp->dv_cqe_slots[tqp->dv_complete_head %
+					   tqp->dv_sq_entries];
+		if (!local.in_use || !local.done) {
+			spin_unlock_irqrestore(&tqp->lock, flags);
+			return 0;
+		}
+		cqe_needed = local.cqe_needed;
+		cq_tail = tqp->dv_cq_tail;
+		cq_entries = tqp->dv_cq_entries;
+		generation = tqp->dv_generation;
+		have_slot = true;
+		spin_unlock_irqrestore(&tqp->lock, flags);
+
+		if (!have_slot)
+			return 0;
+
+		if (cqe_needed) {
+			ret = tbv_dv_read_doorbell_u32(
+				tqp,
+				tbv_dv_db_producer_offset(offsetof(
+					struct usb4_rdma_dv_doorbell_producer_line,
+					cq_head)),
+				&cq_head_packed);
+			if (ret)
+				goto err_mark;
+			if (usb4_rdma_dv_tail_generation(cq_head_packed) !=
+			    generation)
+				goto err_mark;
+			cq_head = usb4_rdma_dv_tail_index(cq_head_packed);
+			if (tbv_dv_index_delta(cq_tail, cq_head) >= cq_entries)
+				goto err_mark;
+		}
+
+		spin_lock_irqsave(&tqp->lock, flags);
+		if (!tqp->dv_queue_active || tqp->dv_cq_overflow) {
+			spin_unlock_irqrestore(&tqp->lock, flags);
+			return 0;
+		}
+		if (cqe_needed) {
+			cqe_index = tqp->dv_cq_tail % tqp->dv_cq_entries;
+			tqp->dv_cq_tail = (tqp->dv_cq_tail + 1) &
+					   USB4_RDMA_DV_TAIL_INDEX_MASK;
+			cq_tail = tqp->dv_cq_tail;
+		}
+		memset(&tqp->dv_cqe_slots[tqp->dv_complete_head %
+					  tqp->dv_sq_entries],
+		       0, sizeof(tqp->dv_cqe_slots[0]));
+		tqp->dv_complete_head = (tqp->dv_complete_head + 1) &
+					 USB4_RDMA_DV_TAIL_INDEX_MASK;
+		generation = tqp->dv_generation;
+		spin_unlock_irqrestore(&tqp->lock, flags);
+
+		if (!cqe_needed)
+			continue;
+
+		cqe.wr_id = local.wr_id;
+		cqe.status = local.status;
+		cqe.opcode = local.opcode;
+		cqe.byte_len = local.byte_len;
+		cqe.imm_data = local.imm_data;
+		cqe.qp_state = USB4_RDMA_DV_QP_LIVE;
+
+		ret = tbv_dv_umem_copy_to(
+			tqp->dv_cq_umem, tqp->dv_cq_addr,
+			(u64)tqp->dv_cq_entries * USB4_RDMA_DV_CQE_SIZE,
+			tqp->dv_cq_addr +
+				(u64)cqe_index * USB4_RDMA_DV_CQE_SIZE,
+			&cqe, sizeof(cqe));
+		if (ret)
+			goto err_mark;
+
+		ret = tbv_dv_write_doorbell_u32(
+			tqp,
+			tbv_dv_db_consumer_offset(offsetof(
+				struct usb4_rdma_dv_doorbell_consumer_line,
+				cq_tail)),
+			usb4_rdma_dv_tail_pack(cq_tail, generation));
+		if (ret)
+			goto err_mark;
+	}
+
+err_mark:
+	tbv_dv_mark_error(tqp);
+	return -EOVERFLOW;
+}
+
+static void tbv_dv_completion_work(struct work_struct *work)
+{
+	struct tbv_qp *tqp = container_of(work, struct tbv_qp,
+					 dv_completion_work);
+
+	mutex_lock(&tqp->dv_mutex);
+	tbv_dv_flush_completions_locked(tqp);
+	mutex_unlock(&tqp->dv_mutex);
+	tbv_qp_put(tqp);
+}
+
+static void tbv_dv_send_complete(struct tbv_send_ctx *send, int status)
+{
+	u32 dv_status = tbv_dv_status_from_errno(status);
+	bool cqe_needed = send->dv_cqe_needed ||
+			  dv_status != USB4_RDMA_DV_CQE_SUCCESS;
+
+	tbv_dv_slot_complete(send->tqp, send->dv_index, dv_status,
+			     send->dv_opcode, send->dv_byte_len,
+			     send->dv_imm_data, cqe_needed);
+}
+
+static bool tbv_dv_wqe_flags_valid(u32 flags)
+{
+	u32 valid = USB4_RDMA_DV_WQE_F_SIGNALED |
+		    USB4_RDMA_DV_WQE_F_SOLICITED |
+		    USB4_RDMA_DV_WQE_F_FENCE |
+		    USB4_RDMA_DV_WQE_F_LOCAL_LOOPBACK;
+
+	return !(flags & ~valid);
+}
+
+static bool tbv_dv_fence_ready(struct tbv_qp *tqp, u32 index)
+{
+	unsigned long flags;
+	bool ready;
+
+	spin_lock_irqsave(&tqp->lock, flags);
+	ready = tqp->dv_queue_active && !tqp->dv_cq_overflow &&
+		tqp->dv_complete_head == index;
+	spin_unlock_irqrestore(&tqp->lock, flags);
+
+	return ready;
+}
+
+static int tbv_dv_post_wqe(struct tbv_qp *tqp, u32 index,
+			   const struct usb4_rdma_dv_wqe *wqe)
+{
+	struct tbv_dv_post dv_post = {
+		.index = index,
+		.opcode = wqe->opcode,
+		.byte_len = wqe->length,
+		.imm_data = wqe->imm_data,
+		.cqe_needed = !!(wqe->flags & USB4_RDMA_DV_WQE_F_SIGNALED),
+	};
+	struct ib_sge sge = {};
+	struct ib_rdma_wr rwr = {};
+	struct ib_send_wr *wr = &rwr.wr;
+	int ret;
+
+	if (tqp->owner)
+		atomic64_inc(&tqp->owner->dv_admission_attempts);
+
+	ret = tbv_dv_slot_start(tqp, index, wqe, dv_post.cqe_needed);
+	if (ret)
+		return ret;
+
+	if (wqe->generation != tqp->dv_generation) {
+		tbv_dv_slot_complete(tqp, index,
+				     USB4_RDMA_DV_CQE_STALE_GEN, wqe->opcode,
+				     wqe->length, wqe->imm_data, true);
+		return 0;
+	}
+
+	if (!tbv_dv_wqe_flags_valid(wqe->flags)) {
+		tbv_dv_slot_complete(tqp, index,
+				     USB4_RDMA_DV_CQE_LOCAL_PROT_ERR,
+				     wqe->opcode, wqe->length, wqe->imm_data,
+				     true);
+		return 0;
+	}
+
+	if ((wqe->flags & USB4_RDMA_DV_WQE_F_FENCE) &&
+	    !tbv_dv_fence_ready(tqp, index)) {
+		if (tqp->owner)
+			atomic64_inc(&tqp->owner->dv_fence_retry);
+		tbv_dv_slot_cancel(tqp, index);
+		return -EAGAIN;
+	}
+
+	if (wqe->opcode == USB4_RDMA_DV_WQE_NOP) {
+		tbv_dv_slot_complete(tqp, index, USB4_RDMA_DV_CQE_SUCCESS,
+				     wqe->opcode, 0, 0, dv_post.cqe_needed);
+		return 0;
+	}
+
+	if ((wqe->flags & USB4_RDMA_DV_WQE_F_LOCAL_LOOPBACK) &&
+	    wqe->opcode != USB4_RDMA_DV_WQE_ATOMIC_FETCH_ADD &&
+	    wqe->opcode != USB4_RDMA_DV_WQE_ATOMIC_SWAP &&
+	    wqe->opcode != USB4_RDMA_DV_WQE_ATOMIC_CMP_SWAP) {
+		tbv_dv_slot_complete(tqp, index,
+				     USB4_RDMA_DV_CQE_LOCAL_PROT_ERR,
+				     wqe->opcode, wqe->length, wqe->imm_data,
+				     true);
+		return 0;
+	}
+
+	wr->wr_id = wqe->wr_id;
+	wr->send_flags = 0;
+	if (wqe->flags & USB4_RDMA_DV_WQE_F_SIGNALED)
+		wr->send_flags |= IB_SEND_SIGNALED;
+	if (wqe->flags & USB4_RDMA_DV_WQE_F_SOLICITED)
+		wr->send_flags |= IB_SEND_SOLICITED;
+	if (wqe->flags & USB4_RDMA_DV_WQE_F_FENCE)
+		wr->send_flags |= IB_SEND_FENCE;
+
+	if (wqe->length) {
+		sge.addr = wqe->local_addr;
+		sge.length = wqe->length;
+		sge.lkey = wqe->lkey;
+		wr->sg_list = &sge;
+		wr->num_sge = 1;
+	}
+
+	switch (wqe->opcode) {
+	case USB4_RDMA_DV_WQE_SEND:
+		wr->opcode = IB_WR_SEND;
+		break;
+	case USB4_RDMA_DV_WQE_SEND_IMM:
+		wr->opcode = IB_WR_SEND_WITH_IMM;
+		wr->ex.imm_data = cpu_to_be32(wqe->imm_data);
+		break;
+	case USB4_RDMA_DV_WQE_RDMA_WRITE:
+		wr->opcode = IB_WR_RDMA_WRITE;
+		rwr.remote_addr = wqe->remote_addr;
+		rwr.rkey = wqe->rkey;
+		break;
+	case USB4_RDMA_DV_WQE_RDMA_WRITE_IMM:
+		wr->opcode = IB_WR_RDMA_WRITE_WITH_IMM;
+		wr->ex.imm_data = cpu_to_be32(wqe->imm_data);
+		rwr.remote_addr = wqe->remote_addr;
+		rwr.rkey = wqe->rkey;
+		break;
+	case USB4_RDMA_DV_WQE_RDMA_READ:
+		wr->opcode = IB_WR_RDMA_READ;
+		rwr.remote_addr = wqe->remote_addr;
+		rwr.rkey = wqe->rkey;
+		break;
+	case USB4_RDMA_DV_WQE_ATOMIC_FETCH_ADD:
+	case USB4_RDMA_DV_WQE_ATOMIC_SWAP:
+	case USB4_RDMA_DV_WQE_ATOMIC_CMP_SWAP:
+		ret = tbv_post_dv_atomic(tqp, wqe, &dv_post);
+		if (ret == -EAGAIN) {
+			tbv_dv_slot_cancel(tqp, index);
+			return ret;
+		}
+		if (ret)
+			tbv_dv_slot_complete(tqp, index,
+					     tbv_dv_status_from_errno(ret),
+					     wqe->opcode, wqe->length,
+					     wqe->imm_data, true);
+		return 0;
+	default:
+		tbv_dv_slot_complete(tqp, index,
+				     USB4_RDMA_DV_CQE_GENERAL_ERR,
+				     wqe->opcode, wqe->length, wqe->imm_data,
+				     true);
+		return 0;
+	}
+
+	ret = tbv_post_send_one(tqp, wr, &dv_post);
+	if (ret == -EAGAIN) {
+		tbv_dv_slot_cancel(tqp, index);
+		return ret;
+	}
+	if (ret) {
+		tbv_dv_slot_complete(tqp, index,
+				     tbv_dv_status_from_errno(ret),
+				     wqe->opcode, wqe->length, wqe->imm_data,
+				     true);
+		return 0;
+	}
+
+	return 0;
+}
+
+static int tbv_dv_advance_sq_head(struct tbv_qp *tqp, u32 generation)
+{
+	unsigned long flags;
+	u32 sq_head;
+
+	spin_lock_irqsave(&tqp->lock, flags);
+	tqp->dv_sq_head = (tqp->dv_sq_head + 1) &
+			  USB4_RDMA_DV_TAIL_INDEX_MASK;
+	sq_head = tqp->dv_sq_head;
+	spin_unlock_irqrestore(&tqp->lock, flags);
+
+	return tbv_dv_write_doorbell_u32(
+		tqp,
+		tbv_dv_db_consumer_offset(offsetof(
+			struct usb4_rdma_dv_doorbell_consumer_line,
+			sq_head)),
+		usb4_rdma_dv_tail_pack(sq_head, generation));
+}
+
+static int tbv_dv_drain_sq_locked(struct tbv_qp *tqp, u32 sq_tail_packed,
+				  u32 budget, u32 *wqes_done)
+{
+	unsigned long flags;
+	u32 producer_generation = 0;
+	u32 generation;
+	u32 sq_tail;
+	u32 sq_head;
+	u32 entries;
+	int ret;
+
+	spin_lock_irqsave(&tqp->lock, flags);
+	if (!tqp->dv_queue_active) {
+		spin_unlock_irqrestore(&tqp->lock, flags);
+		return -ENOENT;
+	}
+	if (tqp->closing) {
+		spin_unlock_irqrestore(&tqp->lock, flags);
+		return -EINVAL;
+	}
+	generation = tqp->dv_generation;
+	spin_unlock_irqrestore(&tqp->lock, flags);
+
+	if (usb4_rdma_dv_tail_generation(sq_tail_packed) != generation)
+		return -ESTALE;
+
+	ret = tbv_dv_read_doorbell_u32(
+		tqp,
+		tbv_dv_db_producer_offset(offsetof(
+			struct usb4_rdma_dv_doorbell_producer_line,
+			generation)),
+		&producer_generation);
+	if (ret)
+		return ret;
+	if (producer_generation != generation)
+		return -ESTALE;
+
+	smp_rmb();
+	sq_tail = usb4_rdma_dv_tail_index(sq_tail_packed);
+	if (!budget)
+		return tbv_dv_flush_completions_locked(tqp);
+
+	for (;;) {
+		struct usb4_rdma_dv_wqe wqe;
+		u32 index;
+
+		if (wqes_done && *wqes_done >= budget)
+			break;
+
+		spin_lock_irqsave(&tqp->lock, flags);
+		if (!tqp->dv_queue_active || tqp->dv_cq_overflow) {
+			spin_unlock_irqrestore(&tqp->lock, flags);
+			break;
+		}
+		sq_head = tqp->dv_sq_head;
+		entries = tqp->dv_sq_entries;
+		spin_unlock_irqrestore(&tqp->lock, flags);
+
+		if (!tbv_dv_index_delta(sq_tail, sq_head))
+			break;
+		if (tbv_dv_index_delta(sq_tail, sq_head) > entries) {
+			tbv_dv_mark_error(tqp);
+			return -EOVERFLOW;
+		}
+
+		index = sq_head & USB4_RDMA_DV_TAIL_INDEX_MASK;
+		ret = tbv_dv_umem_copy_from(
+			tqp->dv_sq_umem, tqp->dv_sq_addr,
+			(u64)tqp->dv_sq_entries * USB4_RDMA_DV_WQE_SIZE,
+			tqp->dv_sq_addr +
+				(u64)(index % entries) *
+					USB4_RDMA_DV_WQE_SIZE,
+			&wqe, sizeof(wqe));
+		if (ret) {
+			tbv_dv_mark_error(tqp);
+			return ret;
+		}
+
+		if (wqe.flags & USB4_RDMA_DV_WQE_F_FENCE)
+			tbv_dv_flush_completions_locked(tqp);
+
+		ret = tbv_dv_post_wqe(tqp, index, &wqe);
+		if (ret == -EAGAIN) {
+			if (tqp->owner)
+				atomic64_inc(&tqp->owner->dv_backpressure_retry);
+			break;
+		}
+		if (ret) {
+			tbv_dv_mark_error(tqp);
+			return ret;
+		}
+
+		ret = tbv_dv_advance_sq_head(tqp, generation);
+		if (ret) {
+			tbv_dv_mark_error(tqp);
+			return ret;
+		}
+		if (wqes_done)
+			(*wqes_done)++;
+	}
+
+	return tbv_dv_flush_completions_locked(tqp);
+}
+
+static u32 tbv_dv_poll_budget(void)
+{
+	return max_t(u32, READ_ONCE(dv_poll_budget), 1);
+}
+
+static struct tbv_qp *tbv_dv_poll_next_qp(struct tbv_state *state)
+{
+	struct tbv_qp *tqp = NULL;
+
+	mutex_lock(&state->dv_poll_lock);
+	if (!list_empty(&state->dv_poll_qps)) {
+		tqp = list_first_entry(&state->dv_poll_qps, struct tbv_qp,
+				       dv_poll_node);
+		list_move_tail(&tqp->dv_poll_node, &state->dv_poll_qps);
+		if (!refcount_inc_not_zero(&tqp->refs))
+			tqp = NULL;
+	}
+	mutex_unlock(&state->dv_poll_lock);
+	return tqp;
+}
+
+static int tbv_dv_poll_qp(struct tbv_qp *tqp, u32 budget, u32 *wqes_done)
+{
+	unsigned long flags;
+	u32 sq_tail_packed = 0;
+	bool active;
+	int ret = 0;
+
+	mutex_lock(&tqp->dv_mutex);
+	spin_lock_irqsave(&tqp->lock, flags);
+	active = tqp->dv_queue_active && !tqp->dv_cq_overflow &&
+		 !tqp->closing;
+	spin_unlock_irqrestore(&tqp->lock, flags);
+	if (!active)
+		goto out_unlock;
+
+	ret = tbv_dv_read_doorbell_u32(
+		tqp,
+		tbv_dv_db_producer_offset(offsetof(
+			struct usb4_rdma_dv_doorbell_producer_line, sq_tail)),
+		&sq_tail_packed);
+	if (ret)
+		goto out_unlock;
+
+	ret = tbv_dv_drain_sq_locked(tqp, sq_tail_packed, budget, wqes_done);
+out_unlock:
+	mutex_unlock(&tqp->dv_mutex);
+	return ret;
+}
+
+static bool tbv_dv_poll_scan(struct tbv_state *state)
+{
+	u32 budget = tbv_dv_poll_budget();
+	u32 qp_count;
+	u32 scanned = 0;
+	u32 total_done = 0;
+	bool budget_exhausted = false;
+
+	mutex_lock(&state->dv_poll_lock);
+	qp_count = state->dv_poll_qp_count;
+	mutex_unlock(&state->dv_poll_lock);
+
+	while (scanned < qp_count && total_done < budget &&
+	       !kthread_should_stop()) {
+		struct tbv_qp *tqp;
+		u32 done = 0;
+		int ret;
+
+		tqp = tbv_dv_poll_next_qp(state);
+		if (!tqp)
+			break;
+		ret = tbv_dv_poll_qp(tqp, budget - total_done, &done);
+		tbv_qp_put(tqp);
+
+		if (ret && ret != -ENOENT && ret != -EINVAL &&
+		    ret != -ESTALE)
+			atomic64_inc(&state->dv_poll_errors);
+		total_done += done;
+		scanned++;
+	}
+
+	if (total_done) {
+		atomic64_add(total_done, &state->dv_poll_wqes);
+		if (total_done >= budget) {
+			atomic64_inc(&state->dv_poll_budget_exhausted);
+			budget_exhausted = true;
+		}
+	}
+	return budget_exhausted;
+}
+
+static void tbv_dv_poll_sleep(struct tbv_state *state)
+{
+	uint interval_us;
+
+	if (!READ_ONCE(state->dv_poll_qp_count)) {
+		wait_event_interruptible(
+			state->dv_poll_wait,
+			kthread_should_stop() ||
+			 READ_ONCE(state->dv_poll_qp_count));
+		return;
+	}
+
+	interval_us = READ_ONCE(dv_poll_interval_us);
+	if (!interval_us) {
+		cond_resched();
+		return;
+	}
+
+	usleep_range(interval_us, interval_us + max_t(uint, interval_us / 2, 1));
+}
+
+static int tbv_dv_poll_thread(void *data)
+{
+	struct tbv_state *state = data;
+
+	while (!kthread_should_stop()) {
+		bool budget_exhausted;
+
+		atomic64_inc(&state->dv_poll_scans);
+		budget_exhausted = tbv_dv_poll_scan(state);
+		if (budget_exhausted) {
+			cond_resched();
+			continue;
+		}
+		tbv_dv_poll_sleep(state);
+	}
+	return 0;
+}
+
+static int tbv_dv_poll_start(struct tbv_state *state)
+{
+	struct task_struct *task;
+
+	if (state->dv_poll_task)
+		return 0;
+
+	task = kthread_run(tbv_dv_poll_thread, state, "tbv_dv_poll");
+	if (IS_ERR(task))
+		return PTR_ERR(task);
+	state->dv_poll_task = task;
+	return 0;
+}
+
+static void tbv_dv_poll_stop(struct tbv_state *state)
+{
+	struct task_struct *task = state->dv_poll_task;
+
+	if (!task)
+		return;
+	state->dv_poll_task = NULL;
+	wake_up(&state->dv_poll_wait);
+	kthread_stop(task);
+}
+
+static int tbv_dv_validate_queue_create(
+	const struct usb4_rdma_dv_queue_create *req)
+{
+	u64 sq_bytes;
+	u64 cq_bytes;
+	u64 end;
+
+	if (req->abi_version != USB4_RDMA_DV_ABI_VERSION)
+		return -EINVAL;
+	if (req->flags)
+		return -EINVAL;
+	if (!tbv_dv_reserved_zero(req->reserved, ARRAY_SIZE(req->reserved)))
+		return -EINVAL;
+	if (req->sq_entries < USB4_RDMA_DV_MIN_QUEUE_ENTRIES ||
+	    req->sq_entries > USB4_RDMA_DV_MAX_SQ_ENTRIES ||
+	    req->cq_entries < USB4_RDMA_DV_MIN_QUEUE_ENTRIES ||
+	    req->cq_entries > USB4_RDMA_DV_MAX_CQ_ENTRIES)
+		return -EINVAL;
+	if (req->sq_stride != USB4_RDMA_DV_WQE_SIZE ||
+	    req->cq_stride != USB4_RDMA_DV_CQE_SIZE)
+		return -EINVAL;
+	if (!req->sq_addr || !req->cq_addr || !req->doorbell_addr)
+		return -EINVAL;
+	if (!IS_ALIGNED(req->sq_addr, USB4_RDMA_DV_WQE_SIZE) ||
+	    !IS_ALIGNED(req->cq_addr, USB4_RDMA_DV_CQE_SIZE) ||
+	    !IS_ALIGNED(req->doorbell_addr, USB4_RDMA_DV_DOORBELL_PAGE_SIZE))
+		return -EINVAL;
+	if (check_mul_overflow((u64)req->sq_entries, (u64)req->sq_stride,
+			       &sq_bytes) ||
+	    check_add_overflow(req->sq_addr, sq_bytes, &end))
+		return -EINVAL;
+	if (check_mul_overflow((u64)req->cq_entries, (u64)req->cq_stride,
+			       &cq_bytes) ||
+	    check_add_overflow(req->cq_addr, cq_bytes, &end))
+		return -EINVAL;
+	if (check_add_overflow(req->doorbell_addr,
+			       (u64)USB4_RDMA_DV_DOORBELL_PAGE_SIZE, &end))
+		return -EINVAL;
+	return 0;
+}
+
+static int UVERBS_HANDLER(USB4_RDMA_DV_METHOD_CREATE_QUEUE)(
+	struct uverbs_attr_bundle *attrs)
+{
+	struct tbv_dv_queue_resources res = {};
+	struct tbv_dv_queue_resources old = {};
+	struct usb4_rdma_dv_queue_create req = {};
+	struct usb4_rdma_dv_queue_resp resp = {};
+	struct ib_qp *ibqp;
+	struct tbv_qp *tqp;
+	unsigned long flags;
+	int ret;
+
+	ibqp = uverbs_attr_get_obj(attrs, USB4_RDMA_DV_ATTR_CREATE_QUEUE_QP);
+	if (IS_ERR(ibqp))
+		return PTR_ERR(ibqp);
+
+	ret = uverbs_copy_from(&req, attrs,
+			       USB4_RDMA_DV_ATTR_CREATE_QUEUE_REQ);
+	if (ret)
+		return ret;
+
+	ret = tbv_dv_validate_queue_create(&req);
+	if (ret)
+		return ret;
+
+	ret = tbv_dv_pin_queue(ibqp->device, &req, &res);
+	if (ret)
+		return ret;
+
+	tqp = container_of(ibqp, struct tbv_qp, base);
+	mutex_lock(&tqp->dv_mutex);
+	spin_lock_irqsave(&tqp->lock, flags);
+	if (tqp->closing) {
+		ret = -EINVAL;
+	} else if (tqp->dv_queue_active) {
+		ret = -EBUSY;
+	} else {
+		tqp->dv_generation = tbv_dv_next_generation(tqp->dv_generation);
+		tqp->dv_sq_entries = req.sq_entries;
+		tqp->dv_cq_entries = req.cq_entries;
+		tqp->dv_sq_head = 0;
+		tqp->dv_cq_tail = 0;
+		tqp->dv_complete_head = 0;
+		tqp->dv_sq_addr = req.sq_addr;
+		tqp->dv_cq_addr = req.cq_addr;
+		tqp->dv_doorbell_addr = req.doorbell_addr;
+		tqp->dv_sq_umem = res.sq_umem;
+		tqp->dv_cq_umem = res.cq_umem;
+		tqp->dv_doorbell_umem = res.doorbell_umem;
+		tqp->dv_cqe_slots = res.cqe_slots;
+		res.sq_umem = NULL;
+		res.cq_umem = NULL;
+		res.doorbell_umem = NULL;
+		res.cqe_slots = NULL;
+		tqp->dv_queue_active = true;
+
+		resp.qp_num = ibqp->qp_num;
+		resp.generation = tqp->dv_generation;
+	}
+	spin_unlock_irqrestore(&tqp->lock, flags);
+	if (ret) {
+		mutex_unlock(&tqp->dv_mutex);
+		tbv_dv_release_resources(&res);
+		return ret;
+	}
+
+	ret = tbv_dv_write_consumer_line_umem(
+		tqp->dv_doorbell_umem, tqp->dv_doorbell_addr,
+		usb4_rdma_dv_tail_pack(0, resp.generation),
+		usb4_rdma_dv_tail_pack(0, resp.generation),
+		USB4_RDMA_DV_QP_LIVE, resp.generation);
+	if (ret) {
+		spin_lock_irqsave(&tqp->lock, flags);
+		if (tqp->dv_queue_active &&
+		    tqp->dv_generation == resp.generation) {
+			tqp->dv_generation =
+				tbv_dv_next_generation(tqp->dv_generation);
+			tbv_dv_take_resources_locked(tqp, &old);
+		}
+		spin_unlock_irqrestore(&tqp->lock, flags);
+		mutex_unlock(&tqp->dv_mutex);
+		tbv_dv_release_resources(&old);
+		return ret;
+	}
+
+	ret = uverbs_copy_to(attrs, USB4_RDMA_DV_ATTR_CREATE_QUEUE_RESP,
+			     &resp, sizeof(resp));
+	if (ret) {
+		spin_lock_irqsave(&tqp->lock, flags);
+		if (tqp->dv_queue_active &&
+		    tqp->dv_generation == resp.generation) {
+			tqp->dv_generation =
+				tbv_dv_next_generation(tqp->dv_generation);
+			tbv_dv_take_resources_locked(tqp, &old);
+		}
+		spin_unlock_irqrestore(&tqp->lock, flags);
+	} else {
+		tbv_dv_poll_attach_locked(tqp);
+	}
+	mutex_unlock(&tqp->dv_mutex);
+	tbv_dv_release_resources(&old);
+	tbv_dv_release_resources(&res);
+	return ret;
+}
+
+static int UVERBS_HANDLER(USB4_RDMA_DV_METHOD_DESTROY_QUEUE)(
+	struct uverbs_attr_bundle *attrs)
+{
+	struct tbv_dv_queue_resources old = {};
+	struct ib_qp *ibqp;
+	struct tbv_qp *tqp;
+	unsigned long flags;
+	u32 generation = 0;
+	u32 sq_head = 0;
+	u32 cq_tail = 0;
+	u64 doorbell_addr = 0;
+	int ret = 0;
+
+	ibqp = uverbs_attr_get_obj(attrs, USB4_RDMA_DV_ATTR_DESTROY_QUEUE_QP);
+	if (IS_ERR(ibqp))
+		return PTR_ERR(ibqp);
+
+	tqp = container_of(ibqp, struct tbv_qp, base);
+	mutex_lock(&tqp->dv_mutex);
+	tbv_dv_poll_detach_locked(tqp);
+	spin_lock_irqsave(&tqp->lock, flags);
+	if (!tqp->dv_queue_active) {
+		ret = -ENOENT;
+	} else {
+		sq_head = tqp->dv_sq_head;
+		cq_tail = tqp->dv_cq_tail;
+		doorbell_addr = tqp->dv_doorbell_addr;
+		tqp->dv_generation = tbv_dv_next_generation(tqp->dv_generation);
+		generation = tqp->dv_generation;
+		tbv_dv_take_resources_locked(tqp, &old);
+	}
+	spin_unlock_irqrestore(&tqp->lock, flags);
+
+	if (!ret && old.doorbell_umem)
+		(void)tbv_dv_write_consumer_line_umem(
+			old.doorbell_umem, doorbell_addr,
+			usb4_rdma_dv_tail_pack(sq_head, generation),
+			usb4_rdma_dv_tail_pack(cq_tail, generation),
+			USB4_RDMA_DV_QP_DEAD, generation);
+	mutex_unlock(&tqp->dv_mutex);
+	tbv_dv_release_resources(&old);
+	return ret;
+}
+
+static int UVERBS_HANDLER(USB4_RDMA_DV_METHOD_KICK)(
+	struct uverbs_attr_bundle *attrs)
+{
+	struct usb4_rdma_dv_kick req = {};
+	struct ib_qp *ibqp;
+	struct tbv_qp *tqp;
+	int ret;
+
+	ibqp = uverbs_attr_get_obj(attrs, USB4_RDMA_DV_ATTR_KICK_QP);
+	if (IS_ERR(ibqp))
+		return PTR_ERR(ibqp);
+
+	ret = uverbs_copy_from(&req, attrs, USB4_RDMA_DV_ATTR_KICK_REQ);
+	if (ret)
+		return ret;
+	if (req.flags ||
+	    !tbv_dv_reserved_zero(req.reserved, ARRAY_SIZE(req.reserved)))
+		return -EINVAL;
+
+	tqp = container_of(ibqp, struct tbv_qp, base);
+	mutex_lock(&tqp->dv_mutex);
+	ret = tbv_dv_drain_sq_locked(tqp, req.sq_tail, U32_MAX, NULL);
+	mutex_unlock(&tqp->dv_mutex);
+	return ret;
+}
+
+DECLARE_UVERBS_NAMED_METHOD(
+	USB4_RDMA_DV_METHOD_QUERY_CAPS,
+	UVERBS_ATTR_PTR_OUT(
+			USB4_RDMA_DV_ATTR_QUERY_CAPS_RESP,
+			UVERBS_ATTR_STRUCT(struct usb4_rdma_dv_query_caps_resp,
+					   reserved),
+			UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
+	USB4_RDMA_DV_METHOD_CREATE_QUEUE,
+	UVERBS_ATTR_IDR(USB4_RDMA_DV_ATTR_CREATE_QUEUE_QP,
+			UVERBS_OBJECT_QP,
+			UVERBS_ACCESS_READ,
+			UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(
+		USB4_RDMA_DV_ATTR_CREATE_QUEUE_REQ,
+		UVERBS_ATTR_STRUCT(struct usb4_rdma_dv_queue_create, reserved),
+		UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(
+		USB4_RDMA_DV_ATTR_CREATE_QUEUE_RESP,
+		UVERBS_ATTR_STRUCT(struct usb4_rdma_dv_queue_resp, reserved0),
+		UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
+	USB4_RDMA_DV_METHOD_DESTROY_QUEUE,
+	UVERBS_ATTR_IDR(USB4_RDMA_DV_ATTR_DESTROY_QUEUE_QP,
+			UVERBS_OBJECT_QP,
+			UVERBS_ACCESS_READ,
+			UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
+	USB4_RDMA_DV_METHOD_KICK,
+	UVERBS_ATTR_IDR(USB4_RDMA_DV_ATTR_KICK_QP,
+			UVERBS_OBJECT_QP,
+			UVERBS_ACCESS_READ,
+			UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(
+		USB4_RDMA_DV_ATTR_KICK_REQ,
+		UVERBS_ATTR_STRUCT(struct usb4_rdma_dv_kick, reserved),
+		UA_MANDATORY));
+
+DECLARE_UVERBS_GLOBAL_METHODS(
+	USB4_RDMA_DV_OBJECT_DEVICE,
+	&UVERBS_METHOD(USB4_RDMA_DV_METHOD_QUERY_CAPS),
+	&UVERBS_METHOD(USB4_RDMA_DV_METHOD_CREATE_QUEUE),
+	&UVERBS_METHOD(USB4_RDMA_DV_METHOD_DESTROY_QUEUE),
+	&UVERBS_METHOD(USB4_RDMA_DV_METHOD_KICK));
+
+static const struct uapi_definition tbv_uapi_defs[] = {
+	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(USB4_RDMA_DV_OBJECT_DEVICE),
+	{},
+};
 
 static const struct ib_device_ops tbv_ibdev_ops = {
 	.owner = THIS_MODULE,
@@ -8832,6 +10948,7 @@ static const struct ib_device_ops tbv_ibdev_ops = {
 	.poll_cq = tbv_poll_cq,
 	.req_notify_cq = tbv_req_notify_cq,
 	.reg_user_mr = tbv_reg_user_mr,
+	.reg_user_mr_dmabuf = tbv_reg_user_mr_dmabuf,
 	.dereg_mr = tbv_dereg_mr,
 
 	INIT_RDMA_OBJ_SIZE(ib_ucontext, tbv_ucontext, base),
@@ -8879,6 +10996,9 @@ static int tbv_ibdev_register_one(struct tbv_state *state,
 		BIT_ULL(IB_USER_VERBS_CMD_POST_RECV) |
 		BIT_ULL(IB_USER_VERBS_CMD_POLL_CQ) |
 		BIT_ULL(IB_USER_VERBS_CMD_REQ_NOTIFY_CQ);
+	if (backend == TBV_BACKEND_NATIVE &&
+	    IS_ENABLED(CONFIG_INFINIBAND_USER_ACCESS))
+		dev->base.driver_def = tbv_uapi_defs;
 
 	ib_set_device_ops(&dev->base, &tbv_ibdev_ops);
 
@@ -9267,6 +11387,11 @@ int tbv_ibdev_start(struct tbv_state *state, bool register_verbs)
 	ret = tbv_ibdev_register_netdev_notifier(state);
 	if (ret)
 		return ret;
+	ret = tbv_dv_poll_start(state);
+	if (ret) {
+		tbv_ibdev_unregister_netdev_notifier(state);
+		return ret;
+	}
 
 	state->verbs_registered = true;
 	mutex_lock(&state->rail_register_lock);
@@ -9350,6 +11475,7 @@ void tbv_ibdev_stop(struct tbv_state *state)
 	mutex_unlock(&state->rail_register_lock);
 
 	state->verbs_registered = false;
+	tbv_dv_poll_stop(state);
 	if (state->workqueue)
 		flush_workqueue(state->workqueue);
 
