@@ -461,9 +461,20 @@
             ]
             ++ lib.optionals isLinux [
               pkgs.bpftrace
+              pkgs.bpftools
+              pkgs.bcc
+              pkgs.ethtool
+              pkgs.gdb
+              pkgs.iproute2
               pkgs.kmod
+              pkgs.lsof
+              pkgs.ltrace
+              pkgs.pciutils
               pkgs.perf
+              pkgs.strace
+              pkgs.tcpdump
               pkgs.trace-cmd
+              pkgs.usbutils
               pkgsAt.rdma-core-usb4
             ];
             meta = {

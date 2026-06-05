@@ -16,6 +16,7 @@ let
   # LD_PRELOAD-style entrypoints.
   darwinPrograms = [
     "mac_tb_rdma_probe"
+    "rc_send_churn"
     "rc_write_poll"
     "rc_write_verify"
     "u4_pingpong"

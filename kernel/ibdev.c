@@ -1008,6 +1008,38 @@ enum tbv_rx_endpoint_status {
 	TBV_RX_ENDPOINT_QP_ERROR,
 };
 
+static void tbv_count_native_rx_opcode(struct tbv_state *state, u8 opcode)
+{
+	if (!state)
+		return;
+
+	switch (opcode) {
+	case TBV_NATIVE_DATA_OP_SEND:
+	case TBV_NATIVE_DATA_OP_SEND_IMM:
+	case TBV_NATIVE_DATA_OP_RDMA_WRITE:
+	case TBV_NATIVE_DATA_OP_RDMA_WRITE_IMM:
+		atomic64_inc(&state->native_rx_data);
+		break;
+	case TBV_NATIVE_DATA_OP_SEND_ACK:
+		atomic64_inc(&state->native_rx_send_ack);
+		break;
+	case TBV_NATIVE_DATA_OP_RECV_CREDIT:
+		atomic64_inc(&state->native_rx_recv_credit);
+		break;
+	case TBV_NATIVE_DATA_OP_RDMA_READ_ACK:
+		atomic64_inc(&state->native_rx_read_ack);
+		break;
+	case TBV_NATIVE_DATA_OP_RDMA_READ_REQ:
+		atomic64_inc(&state->native_rx_read_req);
+		break;
+	case TBV_NATIVE_DATA_OP_RDMA_READ_RESP:
+		atomic64_inc(&state->native_rx_read_resp);
+		break;
+	default:
+		break;
+	}
+}
+
 static enum tbv_rx_endpoint_status
 tbv_qp_validate_native_endpoint(struct tbv_qp *tqp,
 				const struct tbv_native_data_header *hdr)
@@ -8477,6 +8509,8 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 		tbv_rx_handle_mad(state, rx_path, hdr, payload);
 		return;
 	}
+
+	tbv_count_native_rx_opcode(state, hdr->opcode);
 
 	tqp = tbv_qp_get_by_num(state, hdr->dest_qp);
 	if (!tqp) {

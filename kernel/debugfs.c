@@ -199,6 +199,30 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_credit_send_error));
 	seq_printf(s, "data_rx_repost_failed: %lld\n",
 		   atomic64_read(&state->data_rx_repost_failed));
+	seq_printf(s, "native_tx_data: %lld\n",
+		   atomic64_read(&state->native_tx_data));
+	seq_printf(s, "native_tx_send_ack: %lld\n",
+		   atomic64_read(&state->native_tx_send_ack));
+	seq_printf(s, "native_tx_recv_credit: %lld\n",
+		   atomic64_read(&state->native_tx_recv_credit));
+	seq_printf(s, "native_tx_read_ack: %lld\n",
+		   atomic64_read(&state->native_tx_read_ack));
+	seq_printf(s, "native_tx_read_req: %lld\n",
+		   atomic64_read(&state->native_tx_read_req));
+	seq_printf(s, "native_tx_read_resp: %lld\n",
+		   atomic64_read(&state->native_tx_read_resp));
+	seq_printf(s, "native_rx_data: %lld\n",
+		   atomic64_read(&state->native_rx_data));
+	seq_printf(s, "native_rx_send_ack: %lld\n",
+		   atomic64_read(&state->native_rx_send_ack));
+	seq_printf(s, "native_rx_recv_credit: %lld\n",
+		   atomic64_read(&state->native_rx_recv_credit));
+	seq_printf(s, "native_rx_read_ack: %lld\n",
+		   atomic64_read(&state->native_rx_read_ack));
+	seq_printf(s, "native_rx_read_req: %lld\n",
+		   atomic64_read(&state->native_rx_read_req));
+	seq_printf(s, "native_rx_read_resp: %lld\n",
+		   atomic64_read(&state->native_rx_read_resp));
 	seq_printf(s, "data_rx_bad_frame: %lld\n",
 		   atomic64_read(&state->data_rx_bad_frame));
 	seq_printf(s, "data_rx_bad_header: %lld\n",
