@@ -2413,3 +2413,148 @@ data_rx_no_qp_reack=0
 data_rx_no_qp_error_ack=0
 data_rx_canceled=0
 ```
+
+## 2026-06-06 Safe Soak And App-Benchmark Readiness
+
+Baseline after the breadcrumb redeploy:
+
+```text
+kernel=7.0.10
+strix-1=/nix/store/g4ncxvshjv7m031z6i9pdq0xbrrl9zq2-nixos-system-strix-1-26.11pre-git
+strix-2=/nix/store/i63c0v4snl1q7hyibj06wnmaasfrpvx0-nixos-system-strix-2-26.11pre-git
+rdma devices per host: usb4_rdma0 usb4_rdma1 usb4_rdma5 usb4_rdma6
+native_qp_tombstone_reack=1
+native_retransmit_teardown_guard=1
+native_ack_drop_every=0
+```
+
+First safe soak:
+
+```text
+5 rounds x 4 RDMA devices x count=1024, fenced, no injected drops
+result: 20/20 passed
+
+sender strix-2:
+data_wr_send=40960
+data_wr_retransmit=6
+data_rx_ack_match_retried=6
+data_wr_timeout=0
+data_rx_canceled=0
+data_rx_no_qp=0
+
+receiver strix-1:
+data_tx_ack_ok=40966
+data_rx_duplicate_ack=6
+data_wr_timeout=0
+data_rx_canceled=0
+data_rx_no_qp=0
+```
+
+Longer safe soak:
+
+```text
+10 rounds x 4 RDMA devices x count=8192, fenced, no injected drops
+result: 40/40 passed
+
+sender strix-2:
+data_wr_send=655360
+data_wr_retransmit=38
+data_wr_retransmit_closing_qp=0
+data_wr_retransmit_no_live_path=0
+data_wr_retransmit_teardown_path=0
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_tx_posted=5898582
+data_tx_completed=5898582
+data_tx_errors=0
+data_tx_canceled=0
+data_rx_ack=1310794
+data_rx_ack_matched=655360
+data_rx_ack_match_retried=38
+data_rx_ack_match_max_ms=135
+data_rx_ack_match_over_10ms=38
+data_rx_ack_match_over_64ms=38
+data_rx_late_ack=655434
+data_rx_ack_miss=0
+data_rx_ack_history_miss=0
+data_rx_canceled=0
+data_rx_repost_failed=0
+data_rx_bad_frame=0
+data_rx_bad_header=0
+data_rx_no_qp=2
+
+receiver strix-1:
+data_tx_posted=1495125
+data_tx_completed=1495125
+data_tx_errors=0
+data_tx_canceled=0
+data_rx_completed=5898582
+data_tx_ack_ok=655398
+data_rx_duplicate_ack=38
+data_rx_no_qp=0
+data_rx_canceled=0
+data_rx_repost_failed=0
+data_rx_bad_frame=0
+data_rx_bad_header=0
+```
+
+No `BUG`, `Oops`, `panic`, watchdog, or lockup line appeared in the netconsole
+collector after the longer soak. `strix-2` dmesg showed ordinary ACK-loss
+retransmits that matched after retry at about 71 to 135 ms.
+
+Interpretation:
+
+1. The safe defaults have now survived both injected retransmit/teardown tests
+   and a non-injected two-host soak that naturally exercised 38 lost-ACK
+   retransmits. The retransmit/tombstone backstop is not just an artificial
+   injector path.
+2. The E2E-off data path stayed clean: posted/completed matched, no TX errors,
+   no TX cancels, no RX repost failures, and no bad frames or headers.
+3. The remaining correctness signal is small but not zero: sender
+   `data_rx_no_qp=2` appeared during the long soak without user-visible failure.
+   This is residual QP-lifecycle churn to keep watching in app-level tests, not
+   a blocker for the next smoke.
+4. This is enough to run cautious application-level smoke, but not enough to
+   declare the stack ready for long vLLM benchmarks. The next benchmark should
+   be RCCL/rocSHMEM all-to-all with driver counters, not vLLM first.
+
+App-benchmark packaging state:
+
+```text
+old RCCL test wrapper:
+/nix/store/4bhvq0qphnq9ardka495pmji5f5130a0-rccl-tests-usb4-hostheap-gfx1151-2.14.1-local
+
+old vLLM/PyTorch wrapper:
+/nix/store/3mr3fgrn6znah88jrc42r2wh692x24km-vllm-env-therock-usb4-hostheap-gfx1151
+
+strix-1 has both closures.
+strix-2 currently lacks both closures and the TheRock/rocSHMEM/RCCL dependencies
+needed by those wrappers.
+```
+
+The pre-existing app-level benchmark scripts in
+`/mnt/Home/src/rocm-systems/projects/rocshmem/scripts/functional_tests` are the
+right next bridge:
+
+```text
+usb4_raw_rocshmem_on_stream.sh
+usb4_rccl_alltoall_perf.sh
+usb4_rccl_smoke.sh
+usb4_pytorch_smoke.sh
+usb4_app_benchmark_matrix.sh
+```
+
+Run order after staging closures to both hosts:
+
+1. Raw rocSHMEM `Alltoallmem_On_Stream`.
+2. `rccl-tests alltoall_perf` with ordinary RCCL fallback and expected
+   `dv_poll_wqes=0`.
+3. `rccl-tests alltoall_perf` with host-stream GDA and expected positive
+   `dv_poll_wqes`.
+4. PyTorch/RCCL all-to-all host-stream smoke.
+
+Do not treat vLLM TP=2 as a USB4 GDA benchmark yet. vLLM tensor parallelism
+primarily stresses all-reduce/all-gather, while the USB4 RCCL/rocSHMEM route
+that has been validated is all-to-all/all-to-allv. vLLM can be run as a
+separate end-to-end application sanity check after the RCCL/rocSHMEM counter
+smoke passes on this rebased kernel.
