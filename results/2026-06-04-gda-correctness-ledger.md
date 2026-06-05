@@ -1982,3 +1982,127 @@ Interpretation:
    tombstone fix and dynamic lifetime/cap instrumentation, but without a fired
    sender guard or crash stack it remains a latent lower-frequency concern
    rather than a proven fixed sender-side race.
+
+### Tombstone-Off A/B
+
+Added `native_qp_tombstone_reack` as an A/B-only debug knob. Default is enabled.
+Disabling it suppresses both tombstone publication and no-QP tombstone re-ack,
+recreating the old behavior where late retransmits to a destroyed QP are dropped.
+
+Both Strix hosts booted the new closure:
+
+```text
+strix-1=/nix/store/ssm5q3x6nbkl4yjnvns9kvx63rxyys74-nixos-system-strix-1-26.11pre-git
+strix-2=/nix/store/dx1ckv6hs3a5fmsj6hj6lr1g5bxkdl6j-nixos-system-strix-2-26.11pre-git
+kernel=7.0.10
+```
+
+Capture rig state:
+
+```text
+trex listener: nc -u -k -l 6666 -> /var/log/netconsole/strix.log
+netconsole markers from both Strix hosts reached the log
+pstore empty before and after both A/B rows
+```
+
+Tombstone re-ack disabled:
+
+```text
+count=256 timeout_ms=60000 native_tx_max_inflight=6 qp_timeout_ms=200
+receiver native_ack_drop_every=2
+native_qp_tombstone_reack=0 on both hosts
+final_fence=0
+port=18560
+sender:   failed, wc error wr_id=513 status=12
+receiver: status=OK elapsed_sec=18.362758
+```
+
+Sender (`strix-2`) counters:
+
+```text
+data_wr_send=512
+data_wr_retransmit=262
+data_wr_retransmit_closing_qp=0
+data_wr_retransmit_no_live_path=0
+data_wr_retransmit_teardown_path=0
+data_wr_retry_exhausted=1
+data_wr_timeout=1
+data_rx_ack_matched=660
+data_rx_ack_match_retried=255
+data_rx_ack_match_over_64ms=255
+data_rx_late_ack=2230
+data_rx_canceled=0
+```
+
+Receiver (`strix-1`) counters:
+
+```text
+data_tx_ack_ok=2890
+data_tx_ack_drop_checked=2890 data_tx_ack_drop_injected=1445
+data_rx_duplicate_ack=2378
+data_rx_no_qp=7
+data_rx_no_qp_reack=0
+data_rx_no_qp_error_ack=0
+data_rx_canceled=0
+```
+
+Tombstone re-ack enabled, same trigger:
+
+```text
+count=256 timeout_ms=60000 native_tx_max_inflight=6 qp_timeout_ms=200
+receiver native_ack_drop_every=2
+native_qp_tombstone_reack=1 on both hosts
+final_fence=0
+port=18561
+sender:   status=OK elapsed_sec=18.433667
+receiver: status=OK elapsed_sec=18.361957
+```
+
+Sender (`strix-2`) counters:
+
+```text
+data_wr_send=512
+data_wr_retransmit=256
+data_wr_retransmit_closing_qp=0
+data_wr_retransmit_no_live_path=0
+data_wr_retransmit_teardown_path=0
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_rx_ack_matched=692
+data_rx_ack_match_retried=256
+data_rx_ack_match_over_64ms=256
+data_rx_late_ack=2519
+data_rx_canceled=0
+```
+
+Receiver (`strix-1`) counters:
+
+```text
+data_tx_ack_ok=3210
+data_tx_ack_drop_checked=3193 data_tx_ack_drop_injected=1596
+data_rx_duplicate_ack=2681
+data_rx_no_qp=17
+data_rx_no_qp_reack=17
+data_rx_no_qp_error_ack=0
+data_qp_tombstone_evicted=0
+data_rx_canceled=0
+```
+
+Interpretation:
+
+1. This is the first direct cause/effect A/B for the tombstone mechanism.
+   With tombstone re-ack disabled, the old no-QP drop behavior returns and one
+   sender WR exhausts retries. With tombstone re-ack enabled, the same unfenced
+   trigger passes and every no-QP post-destroy arrival is re-acked from
+   tombstone history.
+2. The sender teardown guards remained zero in both halves of the A/B. For this
+   workload, the demonstrated failure mechanism is receiver-side destroyed-QP
+   no-QP handling, not sender-side retransmit into a closing path.
+3. The tombstone fix removes the sender's failing precondition by promptly
+   re-acking late retransmits after receiver teardown. The older sender hard
+   reset is still not backed by a captured stack, but this A/B shows the
+   reproducible unfenced correctness failure is directly closed by the
+   tombstone path.
+4. After the A/B, both modules were reloaded and restored to safe defaults:
+   `native_qp_tombstone_reack=1`, `native_ack_drop_every=0`,
+   `qp_timeout_ms=30000`, `native_tx_max_inflight=6`.
