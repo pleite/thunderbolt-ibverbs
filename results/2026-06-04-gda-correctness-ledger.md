@@ -2092,18 +2092,26 @@ Interpretation:
 
 1. This is the first direct cause/effect A/B for the tombstone mechanism.
    With tombstone re-ack disabled, the old no-QP drop behavior returns and one
-   sender WR exhausts retries. With tombstone re-ack enabled, the same unfenced
-   trigger passes and every no-QP post-destroy arrival is re-acked from
-   tombstone history.
+   sender WR exhausts retries. With tombstone re-ack enabled, the same
+   unfenced trigger passes and every no-QP post-destroy arrival is re-acked
+   from tombstone history. This proves the tombstone fixes the graceful WR
+   timeout caused by retransmit-to-dead-QP.
 2. The sender teardown guards remained zero in both halves of the A/B. For this
    workload, the demonstrated failure mechanism is receiver-side destroyed-QP
    no-QP handling, not sender-side retransmit into a closing path.
-3. The tombstone fix removes the sender's failing precondition by promptly
-   re-acking late retransmits after receiver teardown. The older sender hard
-   reset is still not backed by a captured stack, but this A/B shows the
-   reproducible unfenced correctness failure is directly closed by the
-   tombstone path.
-4. After the A/B, both modules were reloaded and restored to safe defaults:
+3. The tombstone-off half did not reproduce the older strix-2 hard reset. It
+   failed gracefully with retry exhaustion and the box stayed up. Therefore
+   this A/B does not prove the sender teardown guard is the crash-fixing path;
+   the guard counters were zero precisely when tombstones were disabled.
+4. The older hard reset remains uncaptured and unexplained by this row. A
+   crash-era reproduction would need the sender guards disabled as well, with
+   netconsole/pstore armed, if we decide the remaining risk justifies the
+   destructive test.
+5. Crash attribution also has uncontrolled kernel-side variables: these runs
+   include the Nix-carried Thunderbolt XDomain hardening and resync patches.
+   Those patches are part of the tested baseline, but they prevent attributing
+   the absence of the old hard reset solely to GDA module changes.
+6. After the A/B, both modules were reloaded and restored to safe defaults:
    `native_qp_tombstone_reack=1`, `native_ack_drop_every=0`,
    `qp_timeout_ms=30000`, `native_tx_max_inflight=6`.
 
