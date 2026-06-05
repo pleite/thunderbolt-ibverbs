@@ -91,6 +91,7 @@
 #define TBV_GSI_MAD_META_DGID_OFF 16
 #define TBV_GSI_MAD_META_PKEY_OFF 32
 static char *roce_netdev;
+static bool native_qp_tombstone_reack = true;
 module_param(roce_netdev, charp, 0444);
 MODULE_PARM_DESC(roce_netdev,
 		 "Netdev used for RoCE GID metadata, for example br0.lan");
@@ -98,6 +99,11 @@ MODULE_PARM_DESC(roce_netdev,
 const char *tbv_ibdev_roce_netdev_name(void)
 {
 	return roce_netdev;
+}
+
+bool tbv_ibdev_native_qp_tombstone_reack_enabled(void)
+{
+	return READ_ONCE(native_qp_tombstone_reack);
 }
 
 static uint zcopy_min_bytes;
@@ -125,6 +131,10 @@ static uint native_ack_drop_every;
 module_param(native_ack_drop_every, uint, 0644);
 MODULE_PARM_DESC(native_ack_drop_every,
 		 "Fault injection: silently drop every Nth native OK SEND_ACK before rail fan-out; 0 disables");
+
+module_param(native_qp_tombstone_reack, bool, 0644);
+MODULE_PARM_DESC(native_qp_tombstone_reack,
+		 "Re-ACK duplicate native SEND/WRITE frames that arrive after QP teardown using destroyed-QP tombstone history; disabling recreates old no-QP drop behavior for A/B testing");
 
 static uint apple_tx_max_inflight_wr = 16;
 module_param(apple_tx_max_inflight_wr, uint, 0644);
@@ -1491,6 +1501,8 @@ static void tbv_qp_publish_tombstone(struct tbv_qp *tqp)
 	u32 tombstone_count;
 	u32 remote_qpn;
 
+	if (!READ_ONCE(native_qp_tombstone_reack))
+		return;
 	if (!state || !tqp->qpn_allocated || tqp->type == IB_QPT_GSI)
 		return;
 
@@ -1591,7 +1603,8 @@ static void tbv_rx_no_qp_ack_or_error(struct tbv_state *state,
 	int status = TBV_NATIVE_SEND_ACK_ERROR;
 	int ret;
 
-	if (!state || !tbv_native_data_op_has_send_ack(hdr->opcode))
+	if (!state || !READ_ONCE(native_qp_tombstone_reack) ||
+	    !tbv_native_data_op_has_send_ack(hdr->opcode))
 		return;
 
 	spin_lock_irqsave(&state->qp_tombstone_lock, flags);
