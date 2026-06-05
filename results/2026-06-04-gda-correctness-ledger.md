@@ -1732,3 +1732,64 @@ Interpretation:
    this fixed no-QP lifecycle bug from the older uncaptured hard reset/ring
    cancel race, which remains a separate latent issue until a stack or a direct
    teardown guard trigger proves otherwise.
+
+### Repeated Unfenced Stress After Commit
+
+After committing the tombstone fix, ran three fresh module-reload trials with
+the same aggressive teardown/loss shape:
+
+```text
+count=256 timeout_ms=60000 native_tx_max_inflight=6 qp_timeout_ms=200
+receiver native_ack_drop_every=2
+final_fence=0
+ports=18531,18532,18533
+```
+
+All three trials passed:
+
+```text
+trial 1: sender OK elapsed_sec=18.433222 receiver OK elapsed_sec=18.361304
+trial 2: sender OK elapsed_sec=18.430722 receiver OK elapsed_sec=18.359194
+trial 3: sender OK elapsed_sec=18.432509 receiver OK elapsed_sec=18.360856
+```
+
+Sender (`strix-2`) invariants in each trial:
+
+```text
+data_wr_retransmit=256
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_wr_retransmit_closing_qp=0
+data_wr_retransmit_no_live_path=0
+data_wr_retransmit_teardown_path=0
+data_rx_canceled=0
+data_rx_ack_match_retried=256
+data_rx_ack_miss=0
+```
+
+Receiver (`strix-1`) post-destroy behavior:
+
+```text
+trial 1: data_tx_ack_drop_injected=1583 data_rx_duplicate_ack=2655 data_rx_no_qp=16 data_rx_no_qp_reack=16
+trial 2: data_tx_ack_drop_injected=1552 data_rx_duplicate_ack=2593 data_rx_no_qp=16 data_rx_no_qp_reack=16
+trial 3: data_tx_ack_drop_injected=1544 data_rx_duplicate_ack=2577 data_rx_no_qp=17 data_rx_no_qp_reack=17
+
+all trials:
+data_rx_no_qp_error_ack=0
+data_rx_ack_history_miss=0
+data_rx_canceled=0
+```
+
+Pstore remained empty on both Strix hosts. Netconsole recorded only deliberate
+test markers, with no panic/oops/watchdog output.
+
+Interpretation:
+
+1. The no-QP teardown fix is repeatable across reloads and not a one-off pass.
+   The strict invariant held: every post-destroy no-QP arrival was re-acked from
+   tombstone history, and the sender never exhausted or timed out.
+2. The older `data_rx_canceled=4096` / hard-reset concern did not reproduce in
+   this three-trial series. This is evidence that the reproducible unfenced
+   artifact was the remote no-QP ACK-history gap, but it is not proof that the
+   older ring-cancel race is impossible. It remains tracked as latent unless a
+   direct ring teardown guard fires or a captured crash stack says otherwise.
