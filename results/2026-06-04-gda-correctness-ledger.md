@@ -2147,3 +2147,170 @@ data_rx_no_qp_reack=0
 data_rx_no_qp_error_ack=0
 data_rx_canceled=0
 ```
+
+### Unsafe Guard-Off Crash Reproduction
+
+Added `native_unsafe_retransmit_teardown_guard_disable` as an explicitly
+unsafe debug knob. Default is `0`, which keeps the sender retransmit teardown
+guard enabled. Setting it to `1` keeps the observation/counter code but allows a
+retry retransmit to proceed after selecting a tearing-down native path.
+
+Both Strix hosts were redeployed/rebooted through Colmena with the new module:
+
+```text
+strix-1=/nix/store/4x5wcywcaxscxrds93hpbjq89cxw5h1g-nixos-system-strix-1-26.11pre-git
+strix-2=/nix/store/f45362p11si1cx0fp6qbcmx958igwg1d-nixos-system-strix-2-26.11pre-git
+kernel=7.0.10
+```
+
+Initial safe sanity, fenced:
+
+```text
+count=256 timeout_ms=60000 native_tx_max_inflight=6 qp_timeout_ms=30000
+native_ack_drop_every=0
+native_qp_tombstone_reack=1
+native_retransmit_teardown_guard=1
+final_fence=1
+port=18563
+sender:   status=OK elapsed_sec=0.054901
+receiver: status=OK elapsed_sec=0.054981
+
+sender:
+data_wr_send=512
+data_wr_retransmit=0
+data_wr_retransmit_closing_qp=0
+data_wr_retransmit_no_live_path=0
+data_wr_retransmit_teardown_path=0
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_rx_ack=1024
+data_rx_ack_matched=512
+data_rx_ack_match_retried=0
+data_rx_canceled=0
+data_rx_no_qp=0
+
+receiver:
+data_tx_ack_ok=512
+data_tx_ack_drop_checked=0 data_tx_ack_drop_injected=0
+data_rx_duplicate_ack=0
+data_rx_no_qp=0
+data_rx_no_qp_reack=0
+data_rx_no_qp_error_ack=0
+data_rx_canceled=0
+```
+
+Unsafe crash-era row:
+
+```text
+count=256 timeout_ms=60000 native_tx_max_inflight=6 qp_timeout_ms=200
+receiver native_ack_drop_every=2
+native_qp_tombstone_reack=0 on both hosts
+native_retransmit_teardown_guard=0 on both hosts
+final_fence=0
+port=18564
+sender:   SSH died with exit code 255, no probe result
+receiver: status=OK elapsed_sec=18.358444
+```
+
+`strix-2` reset during the sender run:
+
+```text
+pre-run boot:  155855bcc5c246dd81d6f6f9f74f3320
+pre-run journal last persisted line: 2026-06-05 23:24:37.524
+current boot:  73b5247a2da14cd992a024f0e2761e86
+current boot start: 2026-06-05 23:26:29
+post-reset uptime when checked: <1 minute
+pstore: empty
+netconsole: no panic/oops captured for this reset
+```
+
+Receiver (`strix-1`) counters after the reset:
+
+```text
+data_tx_posted=3136 data_tx_completed=3136
+data_tx_canceled=0 data_tx_errors=0
+data_rx_completed=7128
+data_rx_canceled=4096
+data_rx_repost_failed=0
+data_rx_bad_frame=0 data_rx_bad_header=0
+data_rx_send=7009
+data_tx_ack_ok=2913
+native_tx_send_ack=2914
+data_tx_ack_drop_checked=2913 data_tx_ack_drop_injected=1456
+data_rx_duplicate_ack=2401
+data_rx_no_qp=119
+data_rx_no_qp_reack=0
+data_rx_no_qp_error_ack=0
+```
+
+Receiver journal showed the peer disappearing during the run:
+
+```text
+2026-06-05 23:25:42 thunderbolt retimers disconnected
+2026-06-05 23:25:42 thunderbolt_ibverbs unregistered per-rail ib_devices
+2026-06-05 23:25:42 thunderbolt 0-2/1-2 host disconnected
+2026-06-05 23:26:37 new XDomain/peer bring-up after strix-2 reboot
+```
+
+After restoring safe defaults and reloading both modules, a final fenced sanity
+row passed:
+
+```text
+count=256 timeout_ms=60000 native_tx_max_inflight=6 qp_timeout_ms=30000
+native_ack_drop_every=0
+native_qp_tombstone_reack=1
+native_retransmit_teardown_guard=1
+final_fence=1
+port=18565
+sender:   status=OK elapsed_sec=0.054349
+receiver: status=OK elapsed_sec=0.054420
+
+sender:
+data_wr_send=512
+data_wr_retransmit=0
+data_wr_retransmit_closing_qp=0
+data_wr_retransmit_no_live_path=0
+data_wr_retransmit_teardown_path=0
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_rx_ack=1024
+data_rx_ack_matched=512
+data_rx_ack_match_retried=0
+data_rx_canceled=0
+data_rx_no_qp=0
+
+receiver:
+data_tx_ack_ok=512
+data_tx_ack_drop_checked=0 data_tx_ack_drop_injected=0
+data_rx_duplicate_ack=0
+data_rx_no_qp=0
+data_rx_no_qp_reack=0
+data_rx_no_qp_error_ack=0
+data_rx_canceled=0
+```
+
+Interpretation:
+
+1. Disabling both tombstone re-ack and the sender retransmit teardown guard
+   reproduced the destructive `strix-2` hard reset. The earlier
+   tombstone-off/guard-on row failed gracefully with retry exhaustion and the
+   host stayed up. That is strong evidence the guard is not cosmetic: removing
+   it reopens the crash-era behavior.
+2. This still did not produce a stack. The sender rebooted without pstore
+   contents and without a netconsole panic/oops. Persistent journald has no
+   final kernel line after the unsafe parameters were written; normal logging
+   stopped before reset.
+3. The old receiver-side near-miss signature returned at the same time:
+   `data_rx_canceled=4096` and `data_rx_no_qp=119`, followed by peer/ring
+   teardown on `strix-1`. The tombstone/guard-safe rows keep this at zero.
+4. The previous guard-on tombstone-off A/B had sender guard counters at zero,
+   so there is still no non-destructive counter trace from the exact sender
+   line that reset. The honest statement is: guard-off makes the crash
+   reproducible again; guard-on has so far converted this test family to either
+   graceful timeout (tombstone off) or success (tombstone on).
+5. Netconsole requires explicit high-priority markers (`<0>...`) for reliable
+   operator breadcrumbs. A post-run `<0>` live check from both hosts reached the
+   collector; the plain `/dev/kmsg` marker used before this unsafe row did not.
+6. Operational default remains safe: `native_qp_tombstone_reack=1`,
+   `native_unsafe_retransmit_teardown_guard_disable=0`,
+   `native_ack_drop_every=0`, and `qp_timeout_ms=30000`.
