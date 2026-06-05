@@ -1793,3 +1793,59 @@ Interpretation:
    artifact was the remote no-QP ACK-history gap, but it is not proof that the
    older ring-cancel race is impossible. It remains tracked as latent unless a
    direct ring teardown guard fires or a captured crash stack says otherwise.
+
+### Longer Unfenced Stress Row
+
+Ran one longer row with the same loss shape:
+
+```text
+count=1024 timeout_ms=120000 native_tx_max_inflight=6 qp_timeout_ms=200
+receiver native_ack_drop_every=2
+final_fence=0
+port=18540
+sender:   status=OK elapsed_sec=73.729803
+receiver: status=OK elapsed_sec=73.657998
+```
+
+Sender (`strix-2`) counters:
+
+```text
+data_wr_send=2048
+data_wr_retransmit=1024
+data_wr_retry_enqueue_error=0
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_wr_retransmit_closing_qp=0
+data_wr_retransmit_no_live_path=0
+data_wr_retransmit_teardown_path=0
+data_tx_posted=28716 data_tx_completed=28716 data_tx_errors=0
+data_rx_completed=13230 data_rx_canceled=0
+data_rx_ack=12333 data_rx_ack_matched=2741
+data_rx_ack_match_retried=1024 data_rx_late_ack=9592
+data_rx_ack_miss=0
+```
+
+Receiver (`strix-1`) counters:
+
+```text
+data_tx_ack_ok=12332
+data_tx_ack_drop_checked=12315 data_tx_ack_drop_injected=6157
+data_rx_duplicate_ack=10267
+data_rx_ack_history_miss=0
+data_rx_no_qp=17
+data_rx_no_qp_reack=17
+data_rx_no_qp_error_ack=0
+data_tx_posted=13230 data_tx_completed=13230 data_tx_errors=0
+data_rx_completed=28716 data_rx_canceled=0
+```
+
+Pstore was empty on both hosts. Netconsole recorded only deliberate markers.
+
+Interpretation:
+
+1. The tombstone fix scales through at least 1024 retransmits in this workload.
+   The no-QP post-destroy invariant still holds exactly.
+2. The RX-cancel/hard-reset concern still did not reappear under longer
+   high-loss unfenced pressure. Current evidence points to the no-QP ACK-history
+   gap as the reproducible correctness bug fixed here; the older hard reset is
+   now lower-frequency or a separate trigger, not reproduced by this row.
