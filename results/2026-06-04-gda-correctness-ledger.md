@@ -2710,3 +2710,137 @@ Interpretation:
    cap is no longer hypothetical under application workloads. Before longer
    benchmark sweeps, raise the cap or make it tunable so heavy QP churn cannot
    evict a tombstone that a late retransmit still needs.
+
+## 2026-06-06 Tombstone Cap Deploy And RCCL Re-Smoke
+
+Implemented and deployed a tunable destroyed-QP tombstone cap:
+
+```text
+default native_qp_tombstone_max=4096
+module param: /sys/module/thunderbolt_ibverbs/parameters/native_qp_tombstone_max
+debugfs summary: native_qp_tombstone_max: 4096
+```
+
+Deployment used a clean detached worktree at `89bcec0` and a temporary
+`nixos-config` lock pointing at that path, then sequential Colmena boot/reboot:
+
+```text
+strix-1=/nix/store/9zfprpxqf4dhl0r0i04yw4ffrv7nfkmz-nixos-system-strix-1-26.11pre-git
+strix-2=/nix/store/w7smq1fxv81dm8wmldxnq6j5bq209k9c-nixos-system-strix-2-26.11pre-git
+kernel=7.0.10
+rdma devices per host: usb4_rdma0 usb4_rdma1 usb4_rdma5 usb4_rdma6
+native_qp_tombstone_reack=Y
+native_unsafe_retransmit_teardown_guard_disable=N
+native_ack_drop_every=0
+native_qp_tombstone_max=4096
+native_e2e=-1
+```
+
+Baseline note: `strix-1` showed `data_rx_canceled=4096` immediately after boot,
+before the RCCL re-smoke. During the re-smoke the `data_rx_canceled` delta stayed
+zero, so this was treated as a boot/reload baseline counter rather than a new
+runtime regression.
+
+Post-deploy full RCCL smoke:
+
+```text
+log root: /tmp/usb4-rccl-gda-20260606-89bcec0/smoke-device
+MPI TCP iface: eno1
+RCCL tests:
+  /nix/store/4bhvq0qphnq9ardka495pmji5f5130a0-rccl-tests-usb4-hostheap-gfx1151-2.14.1-local/bin
+RCCL:
+  /nix/store/gkickq51z5rlysmdlp74sxswhcyib740-rccl-usb4-hostheap-gfx1151-2.28.9-local
+rocSHMEM:
+  /nix/store/6k7p8rayvrpq95r89q9hakc5967m5xmh-rocshmem-usb4-hostheap-gfx1151-3.4.0-local
+```
+
+Result:
+
+```text
+broadcast/all_gather/all_reduce:
+  completed, no DV assertion expected
+
+alltoall_perf -b 65536 -e 1048576 -n 3 -w 1 -c 1:
+  65536 B out-of-place: 567.55 us, wrong=0
+  262144 B out-of-place: 1294.55 us, wrong=0
+  1048576 B out-of-place: 4342.33 us, wrong=0
+  dv_poll_wqes sum +140
+
+alltoallv_perf -b 65536 -e 1048576 -n 3 -w 1 -c 1:
+  65536 B out-of-place: 1271.59 us, wrong=0
+  262144 B out-of-place: 82503.1 us, wrong=0
+  1048576 B out-of-place: 188222 us, wrong=0
+  dv_poll_wqes sum +140
+
+all smoke labels:
+  dv_hard_error sum              +0
+  data_wr_copy_error sum         +0
+  data_wr_timeout sum            +0
+  data_wr_retry_exhausted sum    +0
+  data_tx_errors sum             +0
+  data_rx_canceled sum           +0
+  data_rx_no_qp sum              +0
+  data_rx_no_qp_reack sum        +0
+  data_rx_no_qp_error_ack sum    +0
+  data_qp_tombstone_evicted sum  +0
+```
+
+Post-run driver health:
+
+```text
+strix-1:
+dv_poll_wqes=140
+dv_hard_error=0
+data_wr_copy_error=0
+data_wr_retransmit=18
+data_wr_retransmit_closing_qp=0
+data_wr_retransmit_no_live_path=0
+data_wr_retransmit_teardown_path=0
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_tx_posted=18234
+data_tx_completed=18234
+data_tx_errors=0
+data_rx_canceled=4096
+data_rx_duplicate_ack=1
+data_rx_no_qp=0
+data_rx_no_qp_reack=0
+data_rx_no_qp_error_ack=0
+data_qp_tombstone_evicted=0
+
+strix-2:
+dv_poll_wqes=140
+dv_hard_error=0
+data_wr_copy_error=0
+data_wr_retransmit=1
+data_wr_retransmit_closing_qp=0
+data_wr_retransmit_no_live_path=0
+data_wr_retransmit_teardown_path=0
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_tx_posted=16449
+data_tx_completed=16449
+data_tx_errors=0
+data_rx_canceled=0
+data_rx_duplicate_ack=10
+data_rx_no_qp=0
+data_rx_no_qp_reack=0
+data_rx_no_qp_error_ack=0
+data_qp_tombstone_evicted=0
+```
+
+No matching `BUG`, `Oops`, `panic`, watchdog, lockup, hard-error, timeout,
+GPU-fault, or tombstone-cap warning appeared in the last 400 dmesg lines on
+either host.
+
+Interpretation:
+
+1. The 4096 tombstone cap closes the immediate app-level QP-churn issue seen
+   with the old 128 cap: the same RCCL smoke that previously evicted 350
+   tombstones per host now evicts zero.
+2. RCCL/rocSHMEM all-to-all and all-to-allv are now reasonable application-level
+   correctness smoke targets on this GDA branch. They exercise DV, report
+   `wrong=0`, and leave the driver in a clean state.
+3. This is still smoke, not a performance-ready conclusion. The GDA collective
+   path is functionally alive, but performance remains volatile and much slower
+   than the fallback path in several rows, especially alltoallv.
