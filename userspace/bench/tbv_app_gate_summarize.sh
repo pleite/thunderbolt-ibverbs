@@ -366,6 +366,103 @@ print_usb4_a2a_post_layouts() {
   ' "${logs[@]}" | sort -V
 }
 
+print_usb4_a2a_timing_aggregates() {
+  local -a logs=("$@")
+
+  ((${#logs[@]} > 0)) || return 0
+  if ! grep -h 'USB4_GDA_A2A_TIMING' "${logs[@]}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  printf '\nusb4_a2a_timing aggregates:\n'
+  printf 'app_mode my_pe team_my_pe pe_size dest_pe bytes src_heap_off dst_heap_off count post_avg post_p50 post_p90 post_max quiet_avg quiet_p50 quiet_p90 quiet_max total_avg total_p50 total_p90 total_max\n'
+  awk '
+    function file_mode(path, parts, n, i) {
+      n = split(path, parts, "/")
+      for (i = 1; i <= n; i++) {
+        if (parts[i] == "pytorch" && i + 1 <= n)
+          return parts[i + 1]
+      }
+      return "unknown"
+    }
+    function field(name, m) {
+      if (match($0, name "=([^[:space:]]+)", m))
+        return m[1]
+      return "NA"
+    }
+    function percentile(src, len, pct, tmp, i, pos) {
+      delete tmp
+      for (i = 1; i <= len; i++)
+        tmp[i] = src[i]
+      asort(tmp)
+      pos = int((len * pct) + 0.999999)
+      if (pos < 1)
+        pos = 1
+      if (pos > len)
+        pos = len
+      return tmp[pos]
+    }
+    FNR == 1 {
+      app_mode = file_mode(FILENAME)
+    }
+    /USB4_GDA_A2A_TIMING/ {
+      my_pe = field("my_pe")
+      team_my_pe = field("team_my_pe")
+      pe_size = field("pe_size")
+      dest_pe = field("dest_pe")
+      bytes = field("bytes")
+      src_heap_off = field("src_heap_off")
+      dst_heap_off = field("dst_heap_off")
+      post_ticks = field("post_ticks") + 0
+      quiet_ticks = field("quiet_ticks") + 0
+      total_ticks = field("total_ticks") + 0
+      key = app_mode SUBSEP my_pe SUBSEP team_my_pe SUBSEP pe_size \
+        SUBSEP dest_pe SUBSEP bytes SUBSEP src_heap_off SUBSEP dst_heap_off
+      idx = ++count[key]
+      post_v[key, idx] = post_ticks
+      quiet_v[key, idx] = quiet_ticks
+      total_v[key, idx] = total_ticks
+      post_sum[key] += post_ticks
+      quiet_sum[key] += quiet_ticks
+      total_sum[key] += total_ticks
+      if (post_ticks > post_max[key])
+        post_max[key] = post_ticks
+      if (quiet_ticks > quiet_max[key])
+        quiet_max[key] = quiet_ticks
+      if (total_ticks > total_max[key])
+        total_max[key] = total_ticks
+    }
+    END {
+      for (key in count) {
+        split(key, p, SUBSEP)
+        len = count[key]
+        for (i = 1; i <= len; i++) {
+          post[i] = post_v[key, i]
+          quiet[i] = quiet_v[key, i]
+          total[i] = total_v[key, i]
+        }
+        printf "%s %s %s %s %s %s %s %s %d %.1f %.1f %.1f %d %.1f %.1f %.1f %d %.1f %.1f %.1f %d\n",
+          p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], len,
+          post_sum[key] / len,
+          percentile(post, len, 0.50),
+          percentile(post, len, 0.90),
+          post_max[key],
+          quiet_sum[key] / len,
+          percentile(quiet, len, 0.50),
+          percentile(quiet, len, 0.90),
+          quiet_max[key],
+          total_sum[key] / len,
+          percentile(total, len, 0.50),
+          percentile(total, len, 0.90),
+          total_max[key]
+        delete post
+        delete quiet
+        delete total
+      }
+    }
+  ' "${logs[@]}" | sort -V
+}
+
 print_rccl_timing_aggregates() {
   local -a logs=("$@")
 
@@ -572,6 +669,7 @@ print_pytorch_timing_aggregates "${pytorch_rank0_logs[@]}"
 print_hoststream_phase_aggregates "${pytorch_rank_logs[@]}"
 print_hoststream_addr_layouts "${pytorch_rank_logs[@]}"
 print_usb4_a2a_post_layouts "${pytorch_rank_logs[@]}"
+print_usb4_a2a_timing_aggregates "${pytorch_rank_logs[@]}"
 print_loaded_collective_lib_counts "${pytorch_rank_logs[@]}"
 print_rccl_timing_aggregates "${rccl_logs[@]}"
 print_counter_aggregates "${counter_logs[@]}"

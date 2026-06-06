@@ -1746,3 +1746,60 @@ same slots, so it cannot explain the tens-to-hundreds of milliseconds observed
 when the payload RDMA write is enabled. This narrows the next inspection to the
 payload `put_nbi_single`/`quiet_single` path and the thunderbolt-ibverbs DV
 RDMA WRITE handling for larger heap offsets.
+
+### USB4 Payload Post vs Quiet Timing
+
+Added `ROCSHMEM_GDA_USB4_A2A_TIMING_LOG` in rocSHMEM and exposed it through
+the app gate as `--usb4-a2a-timing-log`. The device-side log wraps the USB4
+all-to-all payload `put_nbi_single()` and its following `quiet_single()` with
+`wall_clock64()` so the payload-only phase can be split into post cost and
+completion-wait cost. This is a diagnostic log; in payload-only mode the
+all-to-all sequence number does not advance, so a positive timing log count
+prints every payload iteration for these short runs.
+
+Ran payload-only mode with the rebuilt RCCL/rocSHMEM installs, `numSymBuf=4`,
+validation disabled, `RCCL_ROCSHMEM_THRESHOLD=4194304`, `iters=3`, `reps=3`,
+and `--usb4-a2a-post-log 1 --usb4-a2a-timing-log 1`.
+
+```text
+sym slot_offset exchange_avg post_avg_combined quiet_avg_combined quiet_p90_max total_avg_combined dirs tx_post tx_comp wr_retx rnr_retx ack_retry write_gap_rnr dv_hard wr_to wr_exh tx_err
+0   0           19.543ms     654.7             1912165.4          8695832       1912820.0          2    15342   15342   0       32       511       953           0       0     0      0
+1   67108864    55.576ms     580.9             5508802.2          11996532      5509383.1          2    17230   17230   0       39       712       1413          0       0     0      0
+2   134217728   63.733ms     746.0             6323129.2          17631188      6323875.2          2    12700   12700   0       24       332       917           0       0     0      0
+3   201326592   101.133ms    613.8             10056030.4         17887092      10056644.2         2    13349   13349   0       26       212       1025          0       0     0      0
+```
+
+Directional timing, in raw `wall_clock64()` ticks:
+
+```text
+sym slot_offset exchange_avg direction src_heap_off dst_heap_off count post_avg quiet_avg quiet_p90 quiet_max total_avg total_p90 total_max
+0   0           19.543ms     0->1      1084672      268471680    9     681.8    1025081.8 2347532   2347532   1025763.6 2348384   2348384
+0   0           19.543ms     1->0      36096        269520256    9     627.6    2799248.9 8695832   8695832   2799876.4 8696176   8696176
+1   67108864    55.576ms     0->1      68193536     335580544    9     634.7    7239489.8 11996532  11996532  7240124.4 11996932  11996932
+1   67108864    55.576ms     1->0      67144960     336629120    9     527.1    3778114.7 5002636   5002636   3778641.8 5002964   5002964
+2   134217728   63.733ms     0->1      135302400    402689408    9     728.0    6728267.6 17631188  17631188  6728995.6 17631984  17631984
+2   134217728   63.733ms     1->0      134253824    403737984    9     764.0    5917990.7 7909720   7909720   5918754.7 7910656   7910656
+3   201326592   101.133ms    0->1      202411264    469798272    9     739.6    9536994.7 14567276  14567276  9537734.2 14567696  14567696
+3   201326592   101.133ms    1->0      201362688    470846848    9     488.0    10575066.2 17887092  17887092  10575554.2 17887496  17887496
+```
+
+Log roots:
+
+```text
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-a2atiming-mode1-nsym4-fixedsym0-20260606-203627
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-a2atiming-mode1-nsym4-fixedsym1-20260606-203652
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-a2atiming-mode1-nsym4-fixedsym2-20260606-203716
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-a2atiming-mode1-nsym4-fixedsym3-20260606-203740
+```
+
+All four timing roots passed with `dv_hard_error=0`, `wr_timeout=0`,
+`wr_retry_exhausted=0`, `data_tx_errors=0`, and state-level TX
+posted/completed equal.
+
+Interpretation: `put_nbi_single()` posting is flat and tiny across slots and
+directions, while `quiet_single()` accounts for the offset-dependent latency.
+That rules out WQE construction, doorbell/post cost, and immediate lkey/rkey
+lookup as the source of the slot penalty. The remaining target is the posted
+RDMA WRITE completion path: rocSHMEM's wait on the GDA QP, thunderbolt-ibverbs'
+DV WR completion path, NHI transfer/completion behavior, or an interaction
+with the RNR/write-gap recovery that scales with the absolute heap address.
