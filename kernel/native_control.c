@@ -19,7 +19,45 @@
 #define TBV_NATIVE_HELLO_RETRY_DELAY_MS 200
 #define TBV_NATIVE_HELLO_INITIAL_DELAY_MS 100
 
+static bool native_control_trace;
+module_param(native_control_trace, bool, 0644);
+MODULE_PARM_DESC(native_control_trace,
+		 "Dump native control XDomain packets during HELLO/READY negotiation");
+
+static bool native_ready_timeout_optimistic;
+module_param(native_ready_timeout_optimistic, bool, 0644);
+MODULE_PARM_DESC(native_ready_timeout_optimistic,
+		 "Treat READY_ACK timeouts as ready after HELLO/tunnel setup");
+
 static void tbv_native_control_work(struct work_struct *work);
+
+static void tbv_native_control_dump_packet(const char *tag, const void *buf,
+					   size_t size)
+{
+	const u8 *p = buf;
+	size_t limit;
+	size_t off;
+
+	if (!READ_ONCE(native_control_trace) || !p)
+		return;
+
+	limit = min_t(size_t, size, 96);
+	for (off = 0; off + sizeof(u32) <= limit; off += 8 * sizeof(u32)) {
+		u32 word[8] = {};
+		size_t nwords;
+		size_t i;
+
+		nwords = min_t(size_t, (limit - off) / sizeof(u32),
+			       ARRAY_SIZE(word));
+		for (i = 0; i < nwords; i++)
+			word[i] = tbv_wire_get_le32(p + off + i * sizeof(u32));
+
+		pr_info("native pkt %s size=%zu off=%02zu %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			tag, size, off / sizeof(u32), word[0], word[1],
+			word[2], word[3], word[4], word[5], word[6],
+			word[7]);
+	}
+}
 
 static bool tbv_native_control_same_route_key(const struct tb_xdomain *a,
 					      const struct tb_xdomain *b)
@@ -371,6 +409,17 @@ static bool tbv_native_control_rail_data_ready(struct tbv_state *state,
 	return ready;
 }
 
+static bool tbv_native_control_rail_remote_ready(struct tbv_state *state,
+						 const struct tbv_rail *rail)
+{
+	bool ready;
+
+	mutex_lock(&state->lock);
+	ready = rail->native_remote_ready;
+	mutex_unlock(&state->lock);
+	return ready;
+}
+
 int tbv_native_control_handle_packet(struct tbv_state *state,
 				     struct tb_xdomain *source_xd,
 				     const void *buf, size_t size)
@@ -386,8 +435,12 @@ int tbv_native_control_handle_packet(struct tbv_state *state,
 		return 0;
 
 	ret = tbv_native_wire_parse_hello(buf, size, &remote, &info);
-	if (ret)
+	if (ret) {
+		tbv_native_control_dump_packet("handler-parse-fail", buf, size);
 		return 0;
+	}
+
+	tbv_native_control_dump_packet("handler-rx", buf, size);
 
 	if (info.op == TBV_NATIVE_WIRE_OP_HELLO_ACK) {
 		ret = tbv_native_control_apply_ack(state, source_xd, &info,
@@ -406,8 +459,22 @@ int tbv_native_control_handle_packet(struct tbv_state *state,
 		return 0;
 	}
 
-	if (info.op == TBV_NATIVE_WIRE_OP_READY_ACK)
+	if (info.op == TBV_NATIVE_WIRE_OP_READY_ACK) {
+		ret = tbv_native_control_mark_remote_ready(state, source_xd,
+							  &info, &remote);
+		if (!ret)
+			ret = tbv_native_control_mark_local_ready_sent(state,
+								      source_xd,
+								      &info,
+								      info.seq);
+		if (!ret)
+			pr_info("native READY_ACK received route=0x%llx rail=0x%x remote_out=%u remote_tx=%u remote_rx=%u\n",
+				info.route, info.seq, remote.transmit_path,
+				remote.tx_hop, remote.rx_hop);
+		tbv_native_control_kick_matching_rail(state, source_xd, &info,
+						      info.seq);
 		return 0;
+	}
 
 	if (info.op == TBV_NATIVE_WIRE_OP_READY) {
 		memset(&local, 0, sizeof(local));
@@ -446,9 +513,12 @@ int tbv_native_control_handle_packet(struct tbv_state *state,
 						  TBV_NATIVE_WIRE_OP_READY_ACK,
 						  0, info.seq, local.route,
 						  info.xdomain_sequence);
-		if (ret >= 0)
+		if (ret >= 0) {
+			tbv_native_control_dump_packet("ready-ack-tx", reply,
+						       sizeof(reply));
 			ret = tb_xdomain_response(xd, reply, sizeof(reply),
 						  TB_CFG_PKG_XDOMAIN_RESP);
+		}
 
 		if (ret < 0)
 			pr_warn("native READY_ACK route=0x%llx rail=0x%x failed: %d\n",
@@ -488,9 +558,12 @@ int tbv_native_control_handle_packet(struct tbv_state *state,
 					  TBV_NATIVE_WIRE_OP_HELLO_ACK,
 					  0, info.seq, local.route,
 					  info.xdomain_sequence);
-	if (ret >= 0)
+	if (ret >= 0) {
+		tbv_native_control_dump_packet("hello-ack-tx", reply,
+					       sizeof(reply));
 		ret = tb_xdomain_response(xd, reply, sizeof(reply),
 					  TB_CFG_PKG_XDOMAIN_RESP);
+	}
 
 	if (ret < 0)
 		pr_warn("native HELLO_ACK route=0x%llx failed: %d\n",
@@ -542,6 +615,7 @@ static int tbv_native_control_exchange_once(struct tbv_state *state,
 		goto out_unlock;
 
 	memset(response, 0, sizeof(response));
+	tbv_native_control_dump_packet("hello-tx", request, sizeof(request));
 	ret = tb_xdomain_request(peer->xd, request, sizeof(request),
 				 TB_CFG_PKG_XDOMAIN_REQ, response,
 				 sizeof(response),
@@ -550,10 +624,14 @@ static int tbv_native_control_exchange_once(struct tbv_state *state,
 	if (ret)
 		goto out_unlock;
 
+	tbv_native_control_dump_packet("hello-rx", response, sizeof(response));
 	ret = tbv_native_wire_parse_hello(response, sizeof(response), &remote,
 					 &info);
-	if (ret)
+	if (ret) {
+		tbv_native_control_dump_packet("hello-rx-parse-fail",
+					       response, sizeof(response));
 		goto out_unlock;
+	}
 	if (info.op != TBV_NATIVE_WIRE_OP_HELLO_ACK) {
 		ret = -EPROTO;
 		goto out_unlock;
@@ -599,18 +677,40 @@ static int tbv_native_control_ready_once(struct tbv_state *state,
 		goto out_unlock;
 
 	memset(response, 0, sizeof(response));
+	tbv_native_control_dump_packet("ready-tx", request, sizeof(request));
 	ret = tb_xdomain_request(peer->xd, request, sizeof(request),
 				 TB_CFG_PKG_XDOMAIN_REQ, response,
 				 sizeof(response),
 				 TB_CFG_PKG_XDOMAIN_RESP,
 				 TBV_NATIVE_HELLO_TIMEOUT_MS);
+	if (ret == -ETIMEDOUT &&
+	    READ_ONCE(native_ready_timeout_optimistic) &&
+	    tbv_native_control_rail_remote_ready(state, rail)) {
+		struct tbv_native_wire_info timeout_info = {
+			.op = TBV_NATIVE_WIRE_OP_READY_ACK,
+			.seq = rail->rail_id,
+			.route = local.route,
+			.xdomain_sequence = tbv_native_control_sequence(rail),
+		};
+
+		pr_warn("native READY_ACK route=0x%llx rail=0x%x timed out after peer READY; optimistic ready enabled\n",
+			rail->key.route, rail->rail_id);
+		ret = tbv_native_control_mark_local_ready_sent(state, peer->xd,
+							       &timeout_info,
+							       rail->rail_id);
+		goto out_unlock;
+	}
 	if (ret)
 		goto out_unlock;
 
+	tbv_native_control_dump_packet("ready-rx", response, sizeof(response));
 	ret = tbv_native_wire_parse_hello(response, sizeof(response), &remote,
 					 &info);
-	if (ret)
+	if (ret) {
+		tbv_native_control_dump_packet("ready-rx-parse-fail",
+					       response, sizeof(response));
 		goto out_unlock;
+	}
 	if (info.op != TBV_NATIVE_WIRE_OP_READY_ACK ||
 	    remote.rail_id != rail->rail_id) {
 		ret = -EPROTO;
