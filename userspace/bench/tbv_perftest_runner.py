@@ -282,6 +282,8 @@ PERFTEST_DARWIN = os.environ.get("TBV_PERFTEST_DARWIN", "")
 
 # Set once per run by detect_systems(); maps hostname -> "Linux" / "Darwin".
 HOST_SYSTEM: dict[str, str] = {}
+SSH_CONFIG = ""
+SSH_OPTIONS: list[str] = []
 
 
 def perftest_for(host: str) -> str:
@@ -294,15 +296,24 @@ def rdma_core_for(host: str) -> str:
 
 
 def ssh_args(target: str, command: str) -> list[str]:
-    return [
+    args = [
         "ssh",
+    ]
+    if SSH_CONFIG:
+        args.extend(["-F", SSH_CONFIG])
+    args.extend([
         "-o",
         "ConnectTimeout=8",
         "-o",
         "BatchMode=yes",
+    ])
+    for option in SSH_OPTIONS:
+        args.extend(["-o", option])
+    args.extend([
         target,
         "sudo -n bash -lc " + shlex.quote(command),
-    ]
+    ])
+    return args
 
 
 def run_local(args: list[str], *, check: bool = True, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
@@ -983,6 +994,8 @@ def main() -> int:
     parser.add_argument("--server-data-addr", help="address clients should use to connect to the server host")
     parser.add_argument("--client-data-addr", help="address clients should use to connect to the client host when directions reverse")
     parser.add_argument("--data-addrs", help="comma-separated host=addr map for perftest's data connection target")
+    parser.add_argument("--ssh-config", help="ssh_config file passed to ssh with -F")
+    parser.add_argument("--ssh-option", action="append", default=[], help="extra ssh -o option; may be repeated")
     parser.add_argument("--dev")
     parser.add_argument("--server-dev", help="override --dev on the server side (asymmetric pairs)")
     parser.add_argument("--client-dev", help="override --dev on the client side (asymmetric pairs)")
@@ -1012,6 +1025,9 @@ def main() -> int:
     args = parser.parse_args()
     if args.repeat < 1:
         die("--repeat must be >= 1")
+    global SSH_CONFIG, SSH_OPTIONS
+    SSH_CONFIG = args.ssh_config or os.environ.get("TBV_SSH_CONFIG", "")
+    SSH_OPTIONS = list(args.ssh_option or [])
 
     plan = json.loads(Path(args.plan).read_text())
     defaults = dict(plan.get("defaults", {}))

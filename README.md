@@ -194,6 +194,16 @@ nix build github:hellas-ai/thunderbolt-ibverbs#bench-tools      # u4_pingpong, u
 `nix develop` drops you in a shell with the module headers, `rdma-core-usb4`,
 `perftest`, and the bench tools on PATH.
 
+For benchmark hosts that need SSH aliases or a jump host, pass an SSH config to
+the generated runner:
+
+```sh
+nix run .#tbv-perftest -- \
+  --ssh-config /tmp/tbv_ssh_config \
+  --hosts goblin,mbp-tb \
+  --data-addrs goblin=192.168.0.1,mbp-tb=192.168.0.2
+```
+
 On NixOS, add the flake input and import the module:
 
 ```nix
