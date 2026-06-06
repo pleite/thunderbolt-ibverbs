@@ -1288,3 +1288,73 @@ faster than alternation. The next performance discriminator should compare
 heap-backed scratch against host-coherent scratch, and/or log the actual local
 and remote scratch addresses/keys per slot, because slot 1 is a fixed
 `+128MiB` offset into the same symmetric allocations.
+
+### Host-Coherent Scratch Slot A/B
+
+Added app-gate knobs for the RCCL scratch backing and fixed scratch slot:
+
+```text
+--source-heap 0|1
+--dest-heap 0|1
+--hoststream-fixed-symid N
+```
+
+Then reran the fixed-slot PyTorch all-to-all probe with both source and
+destination scratch forced to host-coherent memory instead of rocSHMEM heap
+memory:
+
+```text
+symId=0 log: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-coherent-fixedsym0-writegaprnr5-qptimeout14-20260606-180804
+symId=1 log: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-coherent-fixedsym1-writegaprnr5-qptimeout14-20260606-180908
+status: both pass, 5/5
+options: --source-heap 0 --dest-heap 0 --hoststream-fixed-symid {0,1}
+```
+
+Application timing:
+
+```text
+host-coherent fixed symId=0:
+  1MiB/rank n=5 min=4013.7us  avg=13313.7us  max=31467.4us
+  2MiB/rank n=5 min=8449.9us  avg=26804.7us  max=55542.0us
+
+host-coherent fixed symId=1:
+  1MiB/rank n=5 min=20184.1us avg=33354.9us  max=63318.9us
+  2MiB/rank n=5 min=62957.3us avg=108596.8us max=233660.6us
+```
+
+Host-stream exchange timing:
+
+```text
+host-coherent fixed symId=0:
+  msgSize=2097152  n=90 exchange_avg=13.254ms  p50=9.820ms  p90=30.773ms  p99=39.307ms  max=39.307ms
+  msgSize=4194304  n=90 exchange_avg=26.152ms  p50=15.616ms p90=52.488ms  p99=75.614ms  max=75.614ms
+
+host-coherent fixed symId=1:
+  msgSize=2097152  n=90 exchange_avg=33.470ms  p50=21.757ms p90=64.699ms  p99=84.108ms  max=84.108ms
+  msgSize=4194304  n=90 exchange_avg=105.277ms p50=83.815ms p90=185.558ms p99=421.988ms max=421.988ms
+```
+
+Counters again stayed correctness-clean:
+
+```text
+host-coherent fixed symId=0:
+  wr_retx=0 rnr_retx=196 write_gap_rnr=5954
+  dv_hard=0 wr_timeout=0 wr_retry_exhausted=0
+  reorder_timeout=0 active_timeout=0 tx=166469/166469
+
+host-coherent fixed symId=1:
+  wr_retx=0 rnr_retx=86 write_gap_rnr=4958
+  dv_hard=0 wr_timeout=0 wr_retry_exhausted=0
+  reorder_timeout=0 active_timeout=0 tx=122817/122817
+```
+
+Post-run host counters remained healthy on both Strix hosts: no no-QP frames,
+no RX cancels, no active/reorder timeouts, no DV hard errors, and balanced TX.
+
+Interpretation: host-coherent scratch improves the fixed `symId=1` tail versus
+heap-backed slot 1, but it does not remove the slot asymmetry. Slot 1 remains
+substantially slower than slot 0 when source/destination backing is held
+constant. That rules out "rocSHMEM heap allocation only" as the whole cause and
+keeps the next discriminator focused on the per-slot address/translation path:
+log the actual scratch addresses and registration keys for each slot, then
+split source-vs-destination backing if needed.
