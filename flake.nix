@@ -25,6 +25,7 @@
       integrationThunderboltKernelPatches = import ./kernel-workflow/patches/local.nix;
       kernelPatchSets = {
         kernelPatches = portableThunderboltKernelPatches;
+        portableKernelPatches = portableThunderboltKernelPatches;
         integrationKernelPatches = integrationThunderboltKernelPatches;
         upstreamKernelPatches = upstreamThunderboltKernelPatches;
         portableLocalKernelPatches = portableLocalThunderboltKernelPatches;
