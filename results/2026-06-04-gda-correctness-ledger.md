@@ -2941,3 +2941,147 @@ Interpretation:
    fallback rerun, and default/device GDA is slower and more volatile than
    host-stream GDA. The next optimization work should stay in RCCL/rocSHMEM
    integration before moving to vLLM-scale measurements.
+
+### Repeated RCCL All-To-All Gate
+
+Ran a repeated, validation-enabled all-to-all gate after the one-off comparison:
+
+```text
+sizes: 262144, 524288, 1048576
+iters/warmup: 5/2
+validation: enabled (-c 1)
+MPI TCP iface: eno1
+counter hosts: strix-1,strix-2
+```
+
+The first mixed sequence interleaved fallback, host-stream GDA, and device GDA:
+
+```text
+log root: /tmp/usb4-rccl-gda-20260606-89bcec0/repeated-alltoall-050803
+completed:
+  fallback: reps 1-3 complete
+  host-stream GDA: reps 1-3 complete
+  device GDA: reps 1-3 complete
+stopped:
+  fallback rep 4 returned RCCL/NCCL unhandled system error after completing
+  262144 and 524288 rows
+```
+
+The fallback failure did not show a driver failure signature:
+
+```text
+dv_poll_wqes sum              +0
+dv_hard_error sum             +0
+data_wr_copy_error sum        +0
+data_wr_timeout sum           +0
+data_wr_retry_exhausted sum   +0
+data_tx_errors sum            +0
+data_rx_canceled sum          +0
+data_rx_no_qp sum             +0
+data_qp_tombstone_evicted sum +0
+data_tx_posted sum            +13599
+data_tx_completed sum         +13599
+```
+
+No leftover MPI/RCCL processes remained afterwards. A fallback-only rerun with
+`NCCL_DEBUG=INFO` passed 5/5:
+
+```text
+log root: /tmp/usb4-rccl-gda-20260606-89bcec0/fallback-only-051108
+
+fallback RCCL, RCCL_ROCSHMEM_ENABLE=0:
+  262144 B out-of-place median: 2307.05 us (min 2006.47, max 2608.32)
+  524288 B out-of-place median: 2395.38 us (min 1995.69, max 2796.42)
+  1048576 B out-of-place median: 2594.82 us (min 2391.38, max 2795.56)
+  dv_poll_wqes sum +0 for every rep
+```
+
+Host-stream GDA isolated rerun:
+
+```text
+log root: /tmp/usb4-rccl-gda-20260606-89bcec0/hoststream-only-051211
+
+host-stream GDA, RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL=1:
+  262144 B out-of-place median: 3327.68 us (min 3121.81, max 3727.74)
+  524288 B out-of-place median: 4466.82 us (min 4248.42, max 5019.20)
+  1048576 B out-of-place median: 7479.26 us (min 7203.55, max 7597.54)
+  dv_poll_wqes sum +192 for every rep
+```
+
+Device/default GDA isolated rerun:
+
+```text
+log root: /tmp/usb4-rccl-gda-20260606-89bcec0/device-only-051300
+
+device/default GDA, RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL=0:
+  262144 B out-of-place median: 5580.57 us (min 5570.04, max 6770.07)
+  524288 B out-of-place median: 6586.57 us (min 6188.54, max 6590.24)
+  1048576 B out-of-place median: 9384.91 us (min 9184.05, max 9982.36)
+  dv_poll_wqes sum +192 for every rep
+```
+
+All isolated repeated runs were correctness-clean:
+
+```text
+wrong=0 for every out-of-place validated row
+dv_hard_error sum              +0
+data_wr_copy_error sum         +0
+data_wr_timeout sum            +0
+data_wr_retry_exhausted sum    +0
+data_tx_errors sum             +0
+data_rx_canceled sum           +0
+data_rx_no_qp sum              +0
+data_rx_no_qp_reack sum        +0
+data_rx_no_qp_error_ack sum    +0
+data_qp_tombstone_evicted sum  +0
+```
+
+Final post-gate driver health:
+
+```text
+strix-1:
+dv_poll_wqes=2052
+dv_hard_error=0
+data_wr_copy_error=0
+data_wr_retransmit=21
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_tx_posted=177183
+data_tx_completed=177183
+data_tx_errors=0
+data_rx_canceled=4096
+data_rx_no_qp=0
+data_qp_tombstone_evicted=0
+
+strix-2:
+dv_poll_wqes=2052
+dv_hard_error=0
+data_wr_copy_error=0
+data_wr_retransmit=22
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_tx_posted=176749
+data_tx_completed=176749
+data_tx_errors=0
+data_rx_canceled=0
+data_rx_no_qp=0
+data_qp_tombstone_evicted=0
+```
+
+No matching `BUG`, `Oops`, `panic`, watchdog, lockup, hard-error, timeout,
+GPU-fault, or tombstone-cap warning appeared in the last 400 dmesg lines on
+either host.
+
+Interpretation:
+
+1. This is the first balanced repeated application benchmark gate on the rebased
+   GDA stack. It clears the kernel correctness bar: repeated validated
+   all-to-all through fallback, host-stream GDA, and device/default GDA leaves
+   the driver clean with no tombstone evictions.
+2. The performance ranking is now stable enough to act on for this size range:
+   fallback is fastest, host-stream GDA is about 1.4x/1.9x/2.9x slower at
+   256 KiB/512 KiB/1 MiB, and device/default GDA is slower again.
+3. The mixed-sequence fallback failure is real but not yet attributed to GDA:
+   it happened with DV inactive, the kernel counters were clean, and a
+   fallback-only 5x rerun passed. Treat it as an app/RCCL benchmark-harness
+   flake to watch, not a GDA correctness failure.
