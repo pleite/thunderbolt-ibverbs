@@ -4622,7 +4622,12 @@ Current app-level benchmark readiness:
 2. Larger 4 MiB and 8 MiB PyTorch all-to-all passes in this configuration but is
    not a GDA/DV benchmark at the 4 MiB threshold; use `--dv-check forbid` to
    record that intentionally.
-3. The next reusable packaging task is to carry the rocSHMEM wait-budget patch in
-   the Nix recipe, just like the RCCL threshold and host-stream patches.
+3. The reusable Nix packaging task is now done:
+   `nix-strix-halo` commit `a6b010a` carries the tested rocm-systems USB4 GDA
+   branch state, including the wait-budget fix, as a TheRock source patch. The
+   configure-only derivation applied the patch stack and completed CMake
+   configure; it failed only in the known configure-only fixup path because no
+   `bin/therock-hip-clang++` is installed when the build is intentionally
+   skipped.
 4. The next performance task is still the rocSHMEM exchange-phase tail, not a
    currently observed kernel correctness counter.
