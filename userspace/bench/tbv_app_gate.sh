@@ -424,6 +424,28 @@ require_exe() {
   fi
 }
 
+resolve_pytorch_python() {
+  local candidate
+  local target
+
+  if [[ -n "$pytorch_python" ]]; then
+    printf '%s\n' "$pytorch_python"
+    return 0
+  fi
+
+  candidate="$pytorch_wrapper/bin/python3"
+  [[ -x "$candidate" ]] || candidate="$pytorch_wrapper/bin/python"
+  target=
+  if [[ -r "$candidate" ]]; then
+    target=$(sed -n 's/^exec "\([^"]*\)".*/\1/p' "$candidate" | head -n 1)
+  fi
+  if [[ -n "$target" && -x "$target" ]]; then
+    printf '%s\n' "$target"
+  else
+    printf '%s\n' "$candidate"
+  fi
+}
+
 prepend_path() {
   local var=$1
   local path=$2
@@ -499,9 +521,8 @@ setup_app_env() {
   if [[ "$run_pytorch" == 1 ]]; then
     require_dir "TBV_PYTORCH_WRAPPER/VLLM_USB4_ENV" "$pytorch_wrapper"
     require_dir "ROCM_PATH" "$rocm_path"
-    if [[ -n "$pytorch_python" ]]; then
-      require_exe "TBV_TORCH_PYTHON" "$pytorch_python"
-    fi
+    pytorch_python=$(resolve_pytorch_python)
+    require_exe "TBV_TORCH_PYTHON" "$pytorch_python"
   fi
   if [[ -n "$rdma_core_lib" && ! -d "$rdma_core_lib" ]]; then
     echo "WARN: rdma lib not found: $rdma_core_lib" >&2
@@ -698,7 +719,7 @@ pytorch_rccl_lib_value() {
 
 build_torch_remote_command() {
   local rank=$1
-  local python_bin="${pytorch_python:-$pytorch_wrapper/bin/python}"
+  local python_bin="$pytorch_python"
   local torch_ld_path
   local torch_ld_preload
   local torch_rccl_lib
@@ -901,6 +922,9 @@ echo "  usb4_a2a_timing_log=${usb4_a2a_timing_log:-0}"
 echo "  usb4_a2a_chunk_bytes=${usb4_a2a_chunk_bytes:-0}"
 echo "  usb4_alltoall_mode=${usb4_alltoall_mode:-0}"
 echo "  usb4_alltoall_ack=${usb4_alltoall_ack:-0}"
+if [[ "$run_pytorch" == 1 ]]; then
+  echo "  pytorch_python=$pytorch_python"
+fi
 
 gate_status=0
 
