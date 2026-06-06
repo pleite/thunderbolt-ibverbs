@@ -1999,3 +1999,24 @@ application-level gates. It does not eliminate the underlying native
 write-gap/RNR recovery path; those counters still move, but they now recover
 without hard errors, timeouts, TX errors, or TX completion leaks in the tested
 matrix.
+
+Longer durability check, same 512 KiB chunking, validated 4/16 MiB,
+`iters=4`, `reps=5`:
+
+```text
+log root: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-chunk512k-full-4m16m-reps5-20260606-2253
+
+bytes     count avg_us   min_us   max_us   gbps_max
+4MiB      5     5693.3   4306.1   7224.5   7.79
+16MiB     5     22828.4  20228.1  27333.5  6.64
+
+aggregate counters:
+wr_retx=0 rnr_retx=29 ack_retry=30 late_ack=2956 dup_ack=28
+write_gap_rnr=261 dv_hard=0 wr_timeout=0 wr_retry_exhausted=0
+data_tx_errors=0 data_tx_posted=279698 data_tx_completed=279698
+```
+
+This makes 512 KiB chunking the current app-benchmark candidate setting. The
+remaining risk is not correctness in this sample; it is that the non-fatal
+write-gap/RNR path still activates under load and may show longer tails at
+larger scale or under vLLM-style overlap.
