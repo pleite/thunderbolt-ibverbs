@@ -36,6 +36,8 @@ pytorch_validate=${TBV_TORCH_VALIDATE:-1}
 pytorch_master_addr=${TBV_TORCH_MASTER_ADDR:-192.168.23.136}
 pytorch_master_port=${TBV_TORCH_MASTER_PORT:-29617}
 pytorch_timeout=${TBV_TORCH_TIMEOUT:-240}
+pytorch_ld_preload=${TBV_TORCH_LD_PRELOAD:-off}
+pytorch_rccl_lib=${TBV_TORCH_RCCL_LIB:-auto}
 pytorch_remote_script=${TBV_TORCH_REMOTE_SCRIPT:-/tmp/tbv_pytorch_smoke_${USER:-tbv}_$$.py}
 expected_rccl_lib=${RCCL_EXPECTED_LIB:-}
 
@@ -76,6 +78,8 @@ Options:
   --pytorch-iters N         Default: $pytorch_iters
   --torch-validate 0|1      Default: $pytorch_validate
   --pytorch-timeout SECONDS Default: $pytorch_timeout
+  --torch-ld-preload PATH   PyTorch LD_PRELOAD value, auto, or off. Default: $pytorch_ld_preload
+  --torch-rccl-lib PATH      PyTorch rocm_sdk RCCL preload override, auto, or off. Default: $pytorch_rccl_lib
   --pytorch-remote-script P Remote script path. Default: $pytorch_remote_script
   --torch-collectives CSV   Default: $pytorch_collectives
   --master-addr ADDR        Default: $pytorch_master_addr
@@ -112,6 +116,8 @@ while (($#)); do
     --pytorch-iters) pytorch_iters=$2; shift 2 ;;
     --torch-validate) pytorch_validate=$2; shift 2 ;;
     --pytorch-timeout) pytorch_timeout=$2; shift 2 ;;
+    --torch-ld-preload) pytorch_ld_preload=$2; shift 2 ;;
+    --torch-rccl-lib) pytorch_rccl_lib=$2; shift 2 ;;
     --pytorch-remote-script) pytorch_remote_script=$2; shift 2 ;;
     --torch-collectives) pytorch_collectives=$2; shift 2 ;;
     --master-addr) pytorch_master_addr=$2; shift 2 ;;
@@ -372,6 +378,7 @@ setup_app_env() {
   export ROCM_HOME="$rocm_path"
   export HIP_PATH="$rocm_path"
   export HIP_PLATFORM=amd
+  export RCCL_ROCR_PATH=${RCCL_ROCR_PATH:-$rocm_path/lib/}
   prepend_path PATH "$mpi_home/bin"
   prepend_path PATH "$rocm_path/bin"
   prepend_path LD_LIBRARY_PATH "$rccl_install/lib"
@@ -470,6 +477,7 @@ run_rccl_case() {
     timeout "$timeout_s" mpirun -np 2 --host "$hosts" --map-by ppr:1:node \
       --mca pml ob1 --mca btl self,tcp --mca btl_tcp_if_include "$iface" \
       -x LD_LIBRARY_PATH -x PATH -x ROCM_PATH -x ROCM_HOME -x HIP_PATH -x HIP_PLATFORM \
+      -x RCCL_ROCR_PATH \
       -x HIP_VISIBLE_DEVICES -x ROCR_VISIBLE_DEVICES -x HSA_NO_SCRATCH_RECLAIM -x HSA_OVERRIDE_GFX_VERSION \
       -x ROCSHMEM_GDA_PROVIDER -x ROCSHMEM_GDA_ENABLE_DMABUF -x ROCSHMEM_HCA_LIST -x ROCSHMEM_HEAP_SIZE \
       -x ROCSHMEM_MAX_NUM_TEAMS -x ROCSHMEM_DEBUG_LEVEL -x ROCSHMEM_GDA_USB4_ROUTE_TRACE -x IB_GID_INDEX \
@@ -488,12 +496,74 @@ stage_pytorch_smoke() {
   done
 }
 
+pytorch_ld_library_path() {
+  local out=
+  local path
+
+  for path in \
+    "$rccl_install/lib" \
+    "$rocshmem_install/lib" \
+    "$rdma_core_lib" \
+    "$numactl_lib" \
+    "$mpi_home/lib" \
+    "$pytorch_wrapper"/lib/python*/site-packages/_rocm_sdk_core/lib; do
+    [[ -d "$path" ]] || continue
+    case ":$out:" in
+      *":$path:"*) ;;
+      *) out="${out:+$out:}$path" ;;
+    esac
+  done
+
+  printf '%s' "$out"
+}
+
+pytorch_ld_preload_value() {
+  case "$pytorch_ld_preload" in
+    ""|0|off|none|false)
+      return 0
+      ;;
+    auto)
+      if [[ -n "$rccl_install" && -e "$rccl_install/lib/librccl.so.1" ]]; then
+        printf '%s' "$rccl_install/lib/librccl.so.1"
+      fi
+      ;;
+    *)
+      printf '%s' "$pytorch_ld_preload"
+      ;;
+  esac
+}
+
+pytorch_rccl_lib_value() {
+  case "$pytorch_rccl_lib" in
+    ""|0|off|none|false)
+      return 0
+      ;;
+    auto)
+      if [[ -n "$rccl_install" && -e "$rccl_install/lib/librccl.so.1" ]]; then
+        printf '%s' "$rccl_install/lib/librccl.so.1"
+      fi
+      ;;
+    *)
+      printf '%s' "$pytorch_rccl_lib"
+      ;;
+  esac
+}
+
 build_torch_remote_command() {
   local rank=$1
   local python_bin="$pytorch_wrapper/bin/python"
+  local torch_ld_path
+  local torch_ld_preload
+  local torch_rccl_lib
   local cmd=(timeout "$pytorch_timeout" env)
+
+  torch_ld_path=$(pytorch_ld_library_path)
+  torch_ld_preload=$(pytorch_ld_preload_value)
+  torch_rccl_lib=$(pytorch_rccl_lib_value)
   cmd+=(
     "PATH=$(dirname "$python_bin"):$mpi_home/bin:/run/current-system/sw/bin:/usr/bin:/bin"
+    "LD_LIBRARY_PATH=$torch_ld_path"
+    "RCCL_ROCR_PATH=${RCCL_ROCR_PATH:-$rocm_path/lib/}"
     "HSA_NO_SCRATCH_RECLAIM=${HSA_NO_SCRATCH_RECLAIM:-1}"
     "HSA_ENABLE_INTERRUPT=${HSA_ENABLE_INTERRUPT:-0}"
     "HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE_GFX_VERSION:-11.5.1}"
@@ -529,6 +599,12 @@ build_torch_remote_command() {
     "TBV_TORCH_VALIDATE=$pytorch_validate"
     "PYTHONUNBUFFERED=1"
   )
+  if [[ -n "$torch_rccl_lib" ]]; then
+    cmd+=("TBV_TORCH_RCCL_LIB=$torch_rccl_lib")
+  fi
+  if [[ -n "$torch_ld_preload" ]]; then
+    cmd+=("LD_PRELOAD=$torch_ld_preload")
+  fi
   cmd+=(
     "$python_bin"
     -m torch.distributed.run
@@ -553,6 +629,7 @@ run_pytorch_case() {
   local rank=0
   local host
   local cmd
+  local expected_rccl_realpath
 
   require_dir "TBV_PYTORCH_WRAPPER/VLLM_USB4_ENV" "$pytorch_wrapper"
   configure_mode "$mode"
@@ -561,7 +638,10 @@ run_pytorch_case() {
   capture_counters "$before_label" "$logdir/counters" "$counter_hosts"
   for host in $(host_list "$hosts"); do
     cmd=$(build_torch_remote_command "$rank")
-    run_remote "$host" "$cmd" >"$logdir/rank${rank}.${host}.log" 2>&1 &
+    {
+      printf 'command: %s\n' "$cmd"
+    } >"$logdir/rank${rank}.${host}.log"
+    run_remote "$host" "$cmd" >>"$logdir/rank${rank}.${host}.log" 2>&1 &
     pids+=("$!")
     rank=$((rank + 1))
   done
@@ -587,9 +667,13 @@ run_pytorch_case() {
     if ! assert_dv_delta "$before_label" "$after_label" "$logdir/counters" "$counter_hosts" "$(resolve_dv_expectation "$TBV_EXPECT_DV")" >>"$logdir/counters.log" 2>&1; then
       status=1
     fi
-    if [[ -n "$expected_rccl_lib" ]] && ! grep -q "$expected_rccl_lib" "$logdir"/rank*.log; then
-      echo "ERROR: expected RCCL library not reported: $expected_rccl_lib" | tee -a "$logdir/counters.log" >&2
-      status=1
+    if [[ -n "$expected_rccl_lib" ]]; then
+      expected_rccl_realpath=$(readlink -f "$expected_rccl_lib" 2>/dev/null || printf '%s' "$expected_rccl_lib")
+      if ! grep -Fq "loaded_collective_lib=$expected_rccl_lib" "$logdir"/rank*.log &&
+         ! grep -Fq "loaded_collective_lib=$expected_rccl_realpath" "$logdir"/rank*.log; then
+        echo "ERROR: expected RCCL library not reported: $expected_rccl_lib" | tee -a "$logdir/counters.log" >&2
+        status=1
+      fi
     fi
   fi
 

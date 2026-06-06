@@ -3938,3 +3938,118 @@ Validation:
 Next app-level timing run must use a rebuilt RCCL whose `librccl.so.1` contains
 `RCCL_ROCSHMEM_HOST_STREAM_TIMING`; otherwise `RCCL_ROCSHMEM_GDA_BENCH_MODE`
 cannot be assumed to split host-stream copy-in/exchange/copy-out phases.
+
+### 2026-06-06 PyTorch with rebuilt host-stream timing RCCL
+
+Built RCCL from `/mnt/Home/src/rocm-systems/projects/rccl` commit
+`a9c630f886` into:
+
+```text
+/mnt/Home/tmp/rccl-hoststream-timing-install-a9c630/lib/librccl.so.1
+```
+
+The rebuilt library contains:
+
+```text
+RCCL_ROCSHMEM_HOST_STREAM_TIMING
+RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL
+RCCL_ROCSHMEM_GDA_BENCH_MODE
+```
+
+PyTorch-specific loader finding:
+
+1. The raw TheRock SDK `lib` and `lib/rocm_sysdeps/lib` directories must not be
+   placed on PyTorch's `LD_LIBRARY_PATH`; doing so segfaults the dynamic loader
+   during `import torch`.
+2. `LD_PRELOAD=/mnt/Home/tmp/.../librccl.so.1` is not sufficient. The TheRock
+   PyTorch wheel calls `torch/_rocm_init.py`, which asks `rocm_sdk` to preload
+   the shortname `rccl` by absolute wheel path. With only `LD_PRELOAD`, both the
+   packaged RCCL and the rebuilt RCCL are mapped.
+3. The app gate now installs a narrow PyTorch smoke override before importing
+   torch: `TBV_TORCH_RCCL_LIB` intercepts only the `rocm_sdk` `rccl` preload
+   shortname and substitutes the rebuilt RCCL. All other ROCm wheel preloads are
+   left intact.
+4. The smoke now reports mapped collective libraries from `/proc/self/maps`, and
+   `--expected-rccl-lib` checks that `loaded_collective_lib=...` line rather
+   than relying on RCCL log text or the command line.
+
+Loader validation:
+
+```text
+log root: /tmp/tbv-app-gate-pytorch-standalone-rccl-smoke-a9c630-20260606-070325
+status: pass
+loaded_collective_lib:
+  /mnt/Home/tmp/rccl-hoststream-timing-install-a9c630/lib/librccl.so.1.0
+```
+
+Corrected host-stream GDA smoke, with `RCCL_ROCSHMEM_THRESHOLD=1048576`
+(`msgSize <= threshold` is the GDA condition):
+
+```text
+log root: /tmp/tbv-app-gate-pytorch-standalone-rccl-gda-smoke-a9c630-20260606-070422
+status: pass
+dv_poll_wqes sum: +4
+hard counters: clean
+timing emitted: yes
+```
+
+The previous exploratory run with `RCCL_ROCSHMEM_THRESHOLD=0` did not exercise
+GDA; threshold is an upper bound, not a lower bound.
+
+Load-bearing PyTorch host-stream component matrix:
+
+```text
+log root: /tmp/tbv-app-gate-pytorch-hoststream-timing-a9c630-20260606-070458
+collective: torch.distributed all_to_all_single
+sizes: 65536,262144 bytes/rank
+iters: 2
+expected RCCL: /mnt/Home/tmp/rccl-hoststream-timing-install-a9c630/lib/librccl.so.1
+status: pass
+```
+
+Phase timing means across ranks/iterations:
+
+```text
+mode msgSize rankOffset n total_ms copyIn_ms exchange_ms copyOut_ms
+0    131072      65536 4    1.124     0.008       1.106      0.010
+0    524288     262144 4    3.704     0.015       3.675      0.014
+1    131072      65536 4    0.014     0.008       0.002      0.003
+1    524288     262144 4    0.022     0.017       0.003      0.003
+2    131072      65536 4    1.278     0.003       1.273      0.003
+2    524288     262144 4    5.018     0.003       5.013      0.003
+3    131072      65536 4    0.014     0.002       0.002      0.009
+3    524288     262144 4    0.020     0.002       0.002      0.015
+4    131072      65536 4    0.019     0.008       0.002      0.008
+4    524288     262144 4    0.032     0.016       0.002      0.013
+5    131072      65536 4    1.198     0.003       1.187      0.008
+5    524288     262144 4   39.317     0.002      39.300      0.014
+```
+
+Interpretation:
+
+1. The corrected timing matrix falsifies the earlier copy-dominated reading.
+   Copy-in and copy-out are consistently tens of microseconds. The dominant
+   cost is the rocSHMEM exchange phase.
+2. Mode 0 and mode 2 agree qualitatively: full host-stream and exchange-only
+   are exchange-bound. Mode 4 (copy-in + copy-out) is cheap.
+3. Mode 5 at 256 KiB had one severe outlier and one small software-reliability
+   event (`data_wr_retransmit +1`, `data_rx_duplicate_ack +1`). Repeating mode 5
+   gave normal exchange timings but exposed a lifecycle counter:
+
+```text
+log root: /tmp/tbv-app-gate-pytorch-hoststream-mode5-rerun-a9c630-20260606-070605
+application: completed
+gate status: fail
+failure: data_rx_no_qp +2 on strix-1
+data_rx_no_qp_reack: +0
+data_rx_no_qp_error_ack: +0
+data_wr_timeout: +0
+data_wr_retry_exhausted: +0
+data_tx_posted == data_tx_completed
+```
+
+Because the no-QP increments did not pair with `data_rx_no_qp_reack` or
+`data_rx_no_qp_error_ack`, they are not from the SEND/WRITE tombstone re-ACK
+path. The remaining no-QP sites include MAD and non-ackable native opcodes
+arriving after QP teardown. Add opcode/site-specific no-QP instrumentation
+before relaxing the gate or treating this as benign teardown noise.

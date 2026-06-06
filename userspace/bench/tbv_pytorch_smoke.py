@@ -11,8 +11,52 @@ import os
 import time
 from typing import Callable
 
-import torch
-import torch.distributed as dist
+torch = None
+dist = None
+
+
+def configure_rocm_sdk_rccl_override() -> None:
+    rccl_lib = os.environ.get("TBV_TORCH_RCCL_LIB")
+    if not rccl_lib:
+        return
+
+    import ctypes
+    import rocm_sdk
+
+    original_preload_libraries = rocm_sdk.preload_libraries
+    handles = []
+
+    def preload_libraries(*shortnames: str, rtld_global: bool = True) -> None:
+        mode = ctypes.RTLD_GLOBAL if rtld_global else ctypes.RTLD_LOCAL
+        pending: list[str] = []
+
+        def flush_pending() -> None:
+            if pending:
+                original_preload_libraries(*pending, rtld_global=rtld_global)
+                pending.clear()
+
+        for shortname in shortnames:
+            if shortname == "rccl":
+                flush_pending()
+                handles.append(ctypes.CDLL(rccl_lib, mode=mode))
+            else:
+                pending.append(shortname)
+        flush_pending()
+
+    rocm_sdk.preload_libraries = preload_libraries
+    rocm_sdk._tbv_rccl_override_handles = handles
+
+
+def import_torch() -> None:
+    global dist
+    global torch
+
+    configure_rocm_sdk_rccl_override()
+    import torch as torch_module
+    import torch.distributed as dist_module
+
+    torch = torch_module
+    dist = dist_module
 
 
 def env_int(name: str, default: int) -> int:
@@ -46,6 +90,27 @@ def env_collectives() -> set[str]:
         if name:
             selected.add(aliases.get(name, name))
     return selected
+
+
+def loaded_library_paths(*needles: str) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    try:
+        with open("/proc/self/maps", encoding="utf-8") as maps:
+            for line in maps:
+                fields = line.strip().split()
+                if len(fields) < 6:
+                    continue
+                path = fields[-1]
+                if not path.startswith("/"):
+                    continue
+                if any(needle in os.path.basename(path) for needle in needles):
+                    if path not in seen:
+                        paths.append(path)
+                        seen.add(path)
+    except OSError:
+        return []
+    return paths
 
 
 def barrier() -> None:
@@ -236,6 +301,8 @@ def run_all_to_all(
 
 
 def main() -> None:
+    import_torch()
+
     if not torch.cuda.is_available():
         raise RuntimeError("torch.cuda is not available; ROCm PyTorch not loaded")
 
@@ -251,6 +318,9 @@ def main() -> None:
 
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
+
+    for path in loaded_library_paths("librccl", "libnccl"):
+        print(f"rank={rank} loaded_collective_lib={path}", flush=True)
 
     if rank == 0:
         print(
