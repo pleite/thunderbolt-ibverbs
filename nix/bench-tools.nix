@@ -39,6 +39,7 @@ let
     "tbv_pytorch_smoke.py"
     "tbv_rdma_sweep.py"
     "tbv_uc_stress.py"
+    "tbv_vllm_smoke.sh"
   ];
 
   cPrograms = if isDarwin then darwinPrograms else linuxPrograms;

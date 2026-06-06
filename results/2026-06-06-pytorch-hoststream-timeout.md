@@ -2020,3 +2020,64 @@ This makes 512 KiB chunking the current app-benchmark candidate setting. The
 remaining risk is not correctness in this sample; it is that the non-fatal
 write-gap/RNR path still activates under load and may show longer tails at
 larger scale or under vLLM-style overlap.
+
+### Reusable vLLM TP=2 Smoke
+
+Added `tbv_vllm_smoke.sh` to the bench tools. It regenerates a tiny local
+Qwen3-shaped dummy model from the cached `Qwen/Qwen3-4B` tokenizer/config,
+starts a two-host Ray cluster, runs `vllm bench throughput`, records logs, and
+cleans Ray up. The default model path is:
+
+```text
+/mnt/Home/tmp/tbv-vllm-tiny-qwen3-gda
+```
+
+Two setup details are load-bearing:
+
+1. Do not prepend the TheRock SDK `lib` directory to `LD_LIBRARY_PATH` for
+   vLLM. Doing so caused an immediate loader-time SIGSEGV, matching the earlier
+   HSA-runtime-mixing warning. The runner prepends only the rebuilt RCCL and
+   rocSHMEM install `lib` directories and leaves the vLLM wrapper's ROCm runtime
+   in control.
+2. Pin the CPU-side distributed interface with `GLOO_SOCKET_IFNAME=eno1`
+   alongside `NCCL_SOCKET_IFNAME=eno1`/`RCCL_SOCKET_IFNAME=eno1`. Without the
+   Gloo pin, TP=2 Ray startup formed a two-node cluster but failed the CPU
+   process group by trying to connect to `127.0.0.x` across hosts.
+
+The tiny model generation also needs `vocab_size=len(tokenizer)`, not
+`tokenizer.vocab_size`, because the Qwen tokenizer's special token IDs are
+above the base vocabulary size. `--runner generate` is required to keep vLLM
+on the causal generation path instead of auto-converting the tiny config to an
+embedding runner.
+
+Passing scripted run:
+
+```text
+log root: /mnt/Home/tmp/tbv-vllm-smoke/gda-chunk512-20260606-2355
+hosts: 192.168.23.136,192.168.23.192
+RCCL: /mnt/Home/tmp/rccl-hoststream-waitbudget-install
+rocSHMEM: /mnt/Home/tmp/rocshmem-waitbudget-install
+ROCSHMEM_GDA_USB4_A2A_CHUNK_BYTES=524288
+```
+
+Results:
+
+```text
+single-node preflight:
+  elapsed_time=0.0822s requests_per_second=24.33 tokens_per_second=291.94
+
+Ray TP=2:
+  elapsed_time=0.2791s requests_per_second=7.16 tokens_per_second=85.98
+  world_size=2
+  rank 0: 192.168.23.136 TP rank 0
+  rank 1: 192.168.23.192 TP rank 1
+  vLLM nccl version log: 2.28.3
+```
+
+Interpretation: the current Strix pair can run a reproducible two-node vLLM
+TP=2 lifecycle smoke with the rebuilt RCCL/rocSHMEM libraries selected. This is
+not evidence that a real vLLM workload is using the USB4 all-to-all GDA fast
+path; the tiny dense Qwen smoke mostly validates vLLM/Ray/NCCL process
+lifecycle, library selection, and interface binding. The next application-level
+GDA benchmark still needs either an MoE workload that issues all-to-all or a
+vLLM/RCCL path where the relevant collective routes through rocSHMEM/GDA.
