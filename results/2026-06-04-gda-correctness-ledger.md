@@ -3880,3 +3880,61 @@ Interpretation:
    exhaustion, teardown guard, or tombstone eviction counter moved. This remains
    expected control-channel loss handled by the current software reliability
    layer, not a correctness failure.
+
+### 2026-06-06 RCCL host-stream timing packaging correction
+
+Follow-up inspection found that the live RCCL package used for the PyTorch
+host-stream component matrix was not built from the same host-stream diagnostic
+source now in `/mnt/Home/src/rocm-systems`.
+
+Evidence:
+
+```text
+tested librccl:
+  /nix/store/74kx31vim3ynwpivjlxq04wbdl62nrbg-rccl-usb4-hostheap-gfx1151-2.28.9-local/lib/librccl.so.1
+
+deriver source:
+  /nix/store/axg3z5n0w1bhbfiza209bbj9rmd2i963-source
+
+present in tested lib:
+  RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL
+  RCCL_ROCSHMEM_GDA_BENCH_MODE
+
+absent from tested lib:
+  RCCL_ROCSHMEM_HOST_STREAM_TIMING
+```
+
+The deriver source's host-stream `ncclAlltoAll_impl()` path does not consult
+`RCCL_ROCSHMEM_GDA_BENCH_MODE`; that knob is defined for the device enqueue
+path. Therefore the 2026-06-06 PyTorch "component matrix" remains a useful
+correctness/stability run, but its per-component timing interpretation is not
+load-bearing until the host-stream mode/timing RCCL patch is rebuilt and used.
+
+Packaging fix landed in the `nix-strix-halo` GDA worktree:
+
+```text
+/mnt/Home/src/nix-strix-halo/.worktrees/gda
+commit 2811e61 therock: carry RCCL host-stream diagnostics patch
+```
+
+The patch is carried in both Nix source build paths:
+
+```text
+pkgs/therock/rocm-modules/rccl/rccl-usb4-host-stream-alltoall-diagnostics.diff
+pkgs/therock/rocm-from-source/patches/rccl-usb4-host-stream-alltoall-diagnostics.patch
+```
+
+Validation:
+
+1. The source-module patch dry-runs against the pinned sliced RCCL source:
+   `/nix/store/vy4xg916mxq44hwfw29b78wh9vbdshd8-therock-rocm-source-rocm-systems-projects-rccl`.
+2. The monolithic TheRock patch dry-runs against the full source tree:
+   `/nix/store/gqqzrj0n81q0713k29wxm2pg8vi6kn0n-therock-rocm-source-gfx1151-full-6d2136cd12be`.
+3. `therock-rocm-from-source-gfx1151-configure` applied the new RCCL patch to
+   `collectives.cc` and `enqueue.cc`, reached `Configuring done`, and then
+   failed only in configure-only fixup because no `therock-hip-clang++` wrapper
+   is installed when the build phase is intentionally skipped.
+
+Next app-level timing run must use a rebuilt RCCL whose `librccl.so.1` contains
+`RCCL_ROCSHMEM_HOST_STREAM_TIMING`; otherwise `RCCL_ROCSHMEM_GDA_BENCH_MODE`
+cannot be assumed to split host-stream copy-in/exchange/copy-out phases.
