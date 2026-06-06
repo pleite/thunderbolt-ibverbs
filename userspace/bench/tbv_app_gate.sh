@@ -28,6 +28,7 @@ collectives=${TBV_RCCL_COLLECTIVES:-alltoall,alltoallv}
 modes=${TBV_MODES:-fallback,hoststream,device}
 rccl_source_heap=${TBV_RCCL_SOURCE_HEAP:-${RCCL_ROCSHMEM_SOURCE_HEAP:-}}
 rccl_dest_heap=${TBV_RCCL_DEST_HEAP:-${RCCL_ROCSHMEM_DEST_HEAP:-}}
+rccl_num_sym_buf=${TBV_RCCL_NUM_SYM_BUF:-${RCCL_ROCSHMEM_NUM_SYM_BUF:-}}
 hoststream_fixed_symid=${TBV_RCCL_HOSTSTREAM_FIXED_SYMID:-${RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID:-}}
 hoststream_addr_log=${TBV_RCCL_HOSTSTREAM_ADDR_LOG:-${RCCL_ROCSHMEM_HOST_STREAM_ADDR_LOG:-}}
 usb4_a2a_post_log=${TBV_ROCSHMEM_USB4_A2A_POST_LOG:-${ROCSHMEM_GDA_USB4_A2A_POST_LOG:-}}
@@ -85,6 +86,7 @@ Options:
   --modes CSV               fallback,hoststream,device. Default: $modes
   --source-heap 0|1         Override RCCL_ROCSHMEM_SOURCE_HEAP for GDA modes
   --dest-heap 0|1           Override RCCL_ROCSHMEM_DEST_HEAP for GDA modes
+  --rocshmem-num-sym-buf N  Set RCCL_ROCSHMEM_NUM_SYM_BUF
   --hoststream-fixed-symid N
                             Set RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID
   --hoststream-addr-log 0|1
@@ -133,6 +135,7 @@ while (($#)); do
     --modes) modes=$2; shift 2 ;;
     --source-heap) rccl_source_heap=$2; shift 2 ;;
     --dest-heap) rccl_dest_heap=$2; shift 2 ;;
+    --rocshmem-num-sym-buf) rccl_num_sym_buf=$2; shift 2 ;;
     --hoststream-fixed-symid) hoststream_fixed_symid=$2; shift 2 ;;
     --hoststream-addr-log) hoststream_addr_log=$2; shift 2 ;;
     --usb4-a2a-post-log) usb4_a2a_post_log=$2; shift 2 ;;
@@ -514,6 +517,7 @@ setup_app_env() {
   export IB_GID_INDEX=${IB_GID_INDEX:-1}
   export RCCL_FORCE_ENABLE_DMABUF=${RCCL_FORCE_ENABLE_DMABUF:-1}
   export RCCL_INIT_CHANNELS=${RCCL_INIT_CHANNELS:-1}
+  export RCCL_ROCSHMEM_NUM_SYM_BUF=${RCCL_ROCSHMEM_NUM_SYM_BUF:-2}
   export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 }
 
@@ -595,7 +599,8 @@ run_rccl_case() {
       -x ROCSHMEM_GDA_USB4_A2A_POST_LOG \
       -x ROCSHMEM_GDA_QP_TIMEOUT -x ROCSHMEM_GDA_QP_RETRY_CNT -x ROCSHMEM_GDA_QP_RNR_RETRY \
       -x RCCL_ROCSHMEM_ENABLE -x RCCL_ROCSHMEM_FORCE_ENABLE -x RCCL_ROCSHMEM_THRESHOLD \
-      -x RCCL_ROCSHMEM_SOURCE_HEAP -x RCCL_ROCSHMEM_DEST_HEAP -x RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL \
+      -x RCCL_ROCSHMEM_SOURCE_HEAP -x RCCL_ROCSHMEM_DEST_HEAP -x RCCL_ROCSHMEM_NUM_SYM_BUF \
+      -x RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL \
       -x RCCL_ROCSHMEM_GDA_BENCH_MODE -x RCCL_ROCSHMEM_HOST_STREAM_TIMING \
       -x RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID -x RCCL_ROCSHMEM_HOST_STREAM_ADDR_LOG \
       -x RCCL_FORCE_ENABLE_DMABUF -x RCCL_INIT_CHANNELS -x NCCL_DEBUG \
@@ -706,6 +711,7 @@ build_torch_remote_command() {
     "RCCL_ROCSHMEM_THRESHOLD=$RCCL_ROCSHMEM_THRESHOLD"
     "RCCL_ROCSHMEM_SOURCE_HEAP=$RCCL_ROCSHMEM_SOURCE_HEAP"
     "RCCL_ROCSHMEM_DEST_HEAP=$RCCL_ROCSHMEM_DEST_HEAP"
+    "RCCL_ROCSHMEM_NUM_SYM_BUF=$RCCL_ROCSHMEM_NUM_SYM_BUF"
     "RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL=$RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL"
     "RCCL_ROCSHMEM_GDA_BENCH_MODE=$RCCL_ROCSHMEM_GDA_BENCH_MODE"
     "RCCL_ROCSHMEM_HOST_STREAM_TIMING=$RCCL_ROCSHMEM_HOST_STREAM_TIMING"
@@ -818,6 +824,9 @@ fi
 if [[ -n "$usb4_a2a_post_log" ]]; then
   export ROCSHMEM_GDA_USB4_A2A_POST_LOG=$usb4_a2a_post_log
 fi
+if [[ -n "$rccl_num_sym_buf" ]]; then
+  export RCCL_ROCSHMEM_NUM_SYM_BUF=$rccl_num_sym_buf
+fi
 
 echo "TBV app gate"
 echo "  hosts=$hosts"
@@ -829,6 +838,7 @@ echo "  collectives=$collectives"
 echo "  dv_check=$dv_check"
 echo "  source_heap=${rccl_source_heap:-gda-default}"
 echo "  dest_heap=${rccl_dest_heap:-gda-default}"
+echo "  rocshmem_num_sym_buf=${rccl_num_sym_buf:-2}"
 echo "  hoststream_fixed_symid=${hoststream_fixed_symid:-auto}"
 echo "  hoststream_addr_log=${hoststream_addr_log:-0}"
 echo "  usb4_a2a_post_log=${usb4_a2a_post_log:-0}"

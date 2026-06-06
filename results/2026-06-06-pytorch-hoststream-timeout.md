@@ -1630,3 +1630,66 @@ and copy-out from the timed path. Mode 2 is not an application-correctness mode,
 but as a performance discriminator it tightens the target: the slow slot is in
 the rocSHMEM USB4 exchange/address path itself, not in CPU/GPU staging copies
 around the scratch buffer.
+
+### Corrected Scratch Slot Spacing Discriminator
+
+Added an RCCL diagnostic knob, `RCCL_ROCSHMEM_NUM_SYM_BUF`, and exposed it in
+`tbv_app_gate.sh` as `--rocshmem-num-sym-buf`. The first attempt to run
+`numSymBuf=4` was invalid: the configured RCCL build tree regenerated
+`hipify/src/init.cc` from a staged source copy under
+`/mnt/Home/tmp/rccl-hoststream-timing-src-a9c630`, and that staged copy still
+contained the old `#define NUM_SYM_BUF 2`. The app gate forwarded
+`RCCL_ROCSHMEM_NUM_SYM_BUF=4`, but the runtime logs still showed
+`numSymBuf=2`, with fixed sym IDs 2/3 wrapping back to slots 0/1. Those rows
+must not be used for slot-spacing conclusions.
+
+After patching the staged source and rebuilding/installing RCCL, a smoke run
+proved the knob end to end:
+
+```text
+log: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-exchangeonly-nsym4-fixedsym2-knobsmoke4
+status: pass
+fixedSymId=2 numSymBuf=4 bufThreshold=67108864 slotOffset=134217728
+dv_poll_wqes=4 tx=700/700 wr_timeout=0 wr_retry_exhausted=0
+```
+
+Then ran the corrected exchange-only discriminator:
+
+```text
+RCCL_ROCSHMEM_GDA_BENCH_MODE=2
+RCCL_ROCSHMEM_HOST_STREAM_TIMING=1
+RCCL_ROCSHMEM_THRESHOLD=4194304
+--torch-validate 0
+--source-heap 0 --dest-heap 0
+--hoststream-addr-log 1
+--usb4-a2a-post-log 4
+--pytorch-sizes 1048576
+--pytorch-iters 3
+--reps 3
+```
+
+Corrected same-binary results:
+
+```text
+numSymBuf sym slot_offset exchange_avg exchange_p50 exchange_p90 exchange_max torch_avg
+2         0   0           19.022ms     13.858ms     47.382ms     47.440ms     34.000ms
+2         1   134217728   113.599ms    83.689ms     194.895ms    195.130ms    184.348ms
+4         0   0           21.394ms     18.892ms     39.174ms     39.281ms     31.461ms
+4         1   67108864    35.635ms     35.999ms     51.094ms     51.138ms     43.031ms
+4         2   134217728   62.949ms     44.850ms     146.516ms    146.551ms    106.567ms
+4         3   201326592   100.249ms    78.996ms     246.412ms    246.497ms    140.790ms
+```
+
+All six corrected roots passed with `wr_timeout=0`, `wr_retry_exhausted=0`,
+`dv_hard_error=0`, `data_tx_errors=0`, no `data_rx_no_qp` gate failures, and
+state-level TX posted/completed equal. Non-fatal RNR/write-gap and late-ACK
+counters still move during these exchange-only runs, but they do not explain
+the monotonic slot-offset timing curve.
+
+Interpretation: the slow path follows absolute symmetric-heap slot offset, not
+just "the second slot" or sym-ID parity. Splitting the 256MiB scratch region
+into four 64MiB slots makes the 64MiB slot intermediate, the 128MiB slot slow,
+and the 192MiB slot slower still. The same rebuilt RCCL still reproduces the
+two-slot 128MiB penalty. This points below RCCL's sym-ID selection and below
+copy-in/copy-out: the next target is the rocSHMEM USB4 address/chunking path or
+the thunderbolt-ibverbs mapping/DV post path as heap offsets grow.
