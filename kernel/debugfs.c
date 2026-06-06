@@ -47,6 +47,7 @@ static int tbv_debugfs_ring_e2e_tx_hop(const struct tb_ring *ring)
 static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 {
 	struct tbv_state *state = s->private;
+	u32 i;
 
 	seq_printf(s, "profile: %s\n", tbv_profile_name(state->cfg.profile));
 	seq_printf(s, "native_enabled: %u\n", state->cfg.native_enabled);
@@ -395,6 +396,17 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_read_req_resp_error));
 	seq_printf(s, "data_rx_no_qp: %lld\n",
 		   atomic64_read(&state->data_rx_no_qp));
+	seq_printf(s, "data_rx_no_qp_apple: %lld\n",
+		   atomic64_read(&state->data_rx_no_qp_apple));
+	seq_printf(s, "data_rx_no_qp_mad: %lld\n",
+		   atomic64_read(&state->data_rx_no_qp_mad));
+	seq_printf(s, "data_rx_no_qp_native_ackable: %lld\n",
+		   atomic64_read(&state->data_rx_no_qp_native_ackable));
+	seq_printf(s, "data_rx_no_qp_native_non_ack: %lld\n",
+		   atomic64_read(&state->data_rx_no_qp_native_non_ack));
+	for (i = 0; i < TBV_RX_NO_QP_OPCODE_SLOTS; i++)
+		seq_printf(s, "data_rx_no_qp_opcode_%u: %lld\n", i,
+			   atomic64_read(&state->data_rx_no_qp_opcode[i]));
 	seq_printf(s, "data_rx_bad_peer: %lld\n",
 		   atomic64_read(&state->data_rx_bad_peer));
 	seq_printf(s, "data_rx_unconnected_qp: %lld\n",

@@ -1231,6 +1231,12 @@ static void tbv_count_native_rx_opcode(struct tbv_state *state, u8 opcode)
 	}
 }
 
+static void tbv_count_native_rx_no_qp_opcode(struct tbv_state *state, u8 opcode)
+{
+	if (opcode < TBV_RX_NO_QP_OPCODE_SLOTS)
+		atomic64_inc(&state->data_rx_no_qp_opcode[opcode]);
+}
+
 static enum tbv_rx_endpoint_status
 tbv_qp_validate_native_endpoint(struct tbv_qp *tqp,
 				const struct tbv_native_data_header *hdr)
@@ -6289,6 +6295,7 @@ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 	tqp = tbv_qp_get_by_num(state, qpn);
 	if (!tqp) {
 		atomic64_inc(&state->data_rx_no_qp);
+		atomic64_inc(&state->data_rx_no_qp_apple);
 		return;
 	}
 
@@ -9670,6 +9677,8 @@ static void tbv_rx_handle_mad(struct tbv_state *state, struct tbv_path *rx_path,
 	tqp = tbv_path_get_gsi_qp(rx_path);
 	if (!tqp) {
 		atomic64_inc(&state->data_rx_no_qp);
+		atomic64_inc(&state->data_rx_no_qp_mad);
+		tbv_count_native_rx_no_qp_opcode(state, hdr->opcode);
 		return;
 	}
 
@@ -9757,6 +9766,11 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 			tbv_send_atomic_resp_on_path(NULL, rx_path, hdr->src_qp,
 						     hdr->dest_qp, hdr->psn, 0,
 						     -EINVAL);
+		tbv_count_native_rx_no_qp_opcode(state, hdr->opcode);
+		if (tbv_native_data_op_has_send_ack(hdr->opcode))
+			atomic64_inc(&state->data_rx_no_qp_native_ackable);
+		else
+			atomic64_inc(&state->data_rx_no_qp_native_non_ack);
 		tbv_rx_no_qp_ack_or_error(state, rx_path, hdr);
 		atomic64_inc(&state->data_rx_no_qp);
 		return;

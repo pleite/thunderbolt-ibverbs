@@ -37,6 +37,7 @@
 #define TBV_APPLE_QPN_SHIFT 8
 #define TBV_APPLE_FRAME_SIZE SZ_4K
 #define TBV_APPLE_MAX_MSG_SIZE SZ_16M
+#define TBV_RX_NO_QP_OPCODE_SLOTS 16
 
 static inline bool tbv_dma_device_ready(const struct device *dev)
 {
@@ -577,6 +578,11 @@ struct tbv_state {
 	atomic64_t data_rx_read_req_resp_busy;
 	atomic64_t data_rx_read_req_resp_error;
 	atomic64_t data_rx_no_qp;
+	atomic64_t data_rx_no_qp_apple;
+	atomic64_t data_rx_no_qp_mad;
+	atomic64_t data_rx_no_qp_native_ackable;
+	atomic64_t data_rx_no_qp_native_non_ack;
+	atomic64_t data_rx_no_qp_opcode[TBV_RX_NO_QP_OPCODE_SLOTS];
 	atomic64_t data_rx_bad_peer;
 	atomic64_t data_rx_unconnected_qp;
 	atomic64_t data_rx_qp_error;
