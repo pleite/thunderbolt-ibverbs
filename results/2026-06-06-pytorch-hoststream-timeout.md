@@ -519,3 +519,107 @@ is the RX active/reorder timeout and RNR recovery path for large RDMA_WRITE
 operations: why a partially received 2 MiB write stalls near completion, and
 why the RNR retry path can surface as a DV hard error even though host TX
 completion accounting stays balanced.
+
+## RX Timeout Multiplier Control
+
+Added `qp_rx_timeout_multiplier` as a runtime module parameter so receiver
+active/reorder timeout can be scaled without changing the sender's verbs
+`attr.timeout` retry cadence. Default is `1`; `0` maps to `1`; the runtime cap
+is `32`. This is a diagnostic knob, not a default behavior change.
+
+Two same-length PyTorch hoststream runs were made with `native_ack_probe=N`,
+`ROCSHMEM_GDA_QP_TIMEOUT=14`, `ROCSHMEM_GDA_QP_RETRY_CNT=7`,
+`ROCSHMEM_GDA_QP_RNR_RETRY=7`, and 10 reps of 1 MiB + 2 MiB `all_to_all`.
+
+`qp_rx_timeout_multiplier=2`:
+
+```text
+log root: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-rxmult2-qptimeout14-20260606-145819
+status: fail, 9/10 passed, rep 4 failed
+wr_retx/rnr_retx: 113/1
+ack_retry/ack64: 52/52
+data_rx_reorder_timeout/retry/drop: 2/2/2
+data_rx_active_timeout/retry: 1/1
+data_tx_ack_rnr/data_rx_ack_rnr: 3/1
+data_wr_timeout/data_wr_retry_exhausted: 1/1
+data_wr_rnr_retry_exhausted: 0
+dv_hard_error: 1
+data_tx_posted/completed: balanced in every rep
+```
+
+Failed rep 4:
+
+```text
+rank0: USB4 alltoall DATA wait timed out ctx=8 expected=8 observed=6
+rank1: USB4 GDA CQE error status=5 opcode=3 byte_len=2097152
+```
+
+Kernel logs showed the receiver timeout window was actually extended: one
+RNR-assisted incomplete reorder on strix-1 was acknowledged by strix-2 around
+1.08 s total age and eventually completed at 1.73 s. A later 2 MiB WRITE on
+strix-1 still timed out while active/reorder state was partially populated:
+
+```text
+native RX reorder timeout qpn=0xa17 src_qp=0xa16
+  received=1603296 total=2097152 frags=397/519
+
+native RDMA_WRITE active timeout qpn=0xa17 src_qp=0xa16
+  received=1562528 total=2097152
+```
+
+Matching `qp_rx_timeout_multiplier=1` control:
+
+```text
+log root: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-rxmult1-control-qptimeout14-20260606-150243
+status: fail, 9/10 passed, rep 2 failed
+wr_retx/rnr_retx: 160/7
+ack_retry/ack64: 83/83
+data_rx_reorder_timeout/retry/drop: 9/9/9
+data_rx_active_timeout/retry: 1/1
+data_tx_ack_rnr/data_rx_ack_rnr: 10/9
+data_wr_timeout/data_wr_retry_exhausted: 0/0
+data_wr_rnr_retry_exhausted: 1
+dv_hard_error: 1
+data_tx_posted/completed: balanced in every rep
+```
+
+Failed rep 2:
+
+```text
+rank0: USB4 GDA CQE error status=255 opcode=3 byte_len=2097152
+rank1: USB4 alltoall DATA wait timed out ctx=8 expected=8 observed=6
+```
+
+The control failure is also a receive-side partial-WR/RNR case. strix-2 logged
+several incomplete reorder timeouts and one active WRITE timeout, including:
+
+```text
+native RX reorder timeout qpn=0xca2 src_qp=0xca3
+  received=1983808 total=2097152 frags=491/519
+
+native RDMA_WRITE active timeout qpn=0xca6 src_qp=0xca7
+  received=841984 total=2097152
+```
+
+Interpretation: increasing receiver timeout to `2x` did not eliminate the
+large-WR failure class. It may help some incomplete receives finish after RNR,
+but it can also delay RNR recovery relative to the sender retry cadence and
+still allows WR timeout/exhaustion. The more precise next question is not
+"larger RX timeout?" but "why do large WRITE fragments repeatedly stop arriving
+before completion, and is `data_wr_rnr_retry_exhausted` a cause or a
+post-failure teardown/QP-error consequence?"
+
+Added follow-up counters in `749bb23` to split the RNR `-EAGAIN` completion
+branch:
+
+```text
+data_wr_rnr_complete_retry_exhausted
+data_wr_rnr_complete_closing_qp
+data_wr_rnr_complete_qp_error
+```
+
+The next failing app-gate run should report these. If
+`data_wr_rnr_complete_retry_exhausted` fires with `rnr_retry=7`/infinite, the
+RNR retry accounting is wrong. If `closing_qp` or `qp_error` fires, the
+existing `data_wr_rnr_retry_exhausted` total is a downstream symptom after the
+first hard error, not the original cause.
