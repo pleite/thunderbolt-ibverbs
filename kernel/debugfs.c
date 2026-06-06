@@ -378,6 +378,12 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_ack_req_miss_past));
 	seq_printf(s, "data_rx_ack_req_miss_current: %lld\n",
 		   atomic64_read(&state->data_rx_ack_req_miss_current));
+	seq_printf(s, "data_rx_ack_req_miss_current_active: %lld\n",
+		   atomic64_read(&state->data_rx_ack_req_miss_current_active));
+	seq_printf(s, "data_rx_ack_req_miss_current_reorder: %lld\n",
+		   atomic64_read(&state->data_rx_ack_req_miss_current_reorder));
+	seq_printf(s, "data_rx_ack_req_miss_current_idle: %lld\n",
+		   atomic64_read(&state->data_rx_ack_req_miss_current_idle));
 	seq_printf(s, "data_rx_ack_req_miss_future: %lld\n",
 		   atomic64_read(&state->data_rx_ack_req_miss_future));
 	seq_printf(s, "data_rx_no_qp_reack: %lld\n",

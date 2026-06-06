@@ -728,6 +728,8 @@ static void tbv_qp_flush_error(struct tbv_qp *tqp);
 static void tbv_rx_drop_reorder_msg_locked(struct tbv_state *state,
 					   struct tbv_qp *tqp,
 					   struct tbv_rx_reorder_msg *msg);
+static struct tbv_rx_reorder_msg *tbv_rx_reorder_find(struct tbv_qp *tqp,
+						      u32 psn);
 static void tbv_rx_drain_reorder_locked(struct tbv_state *state,
 					struct tbv_qp *tqp,
 					struct tbv_path *rx_path);
@@ -1717,10 +1719,22 @@ static void tbv_count_ack_req_miss_position_locked(struct tbv_state *state,
 
 	if (delta < 0)
 		atomic64_inc(&state->data_rx_ack_req_miss_past);
-	else if (!delta)
+	else if (!delta) {
+		bool active = (tqp->rx_msg.active &&
+			       tqp->rx_msg.psn == (psn & TBV_PSN_MASK)) ||
+			      (tqp->rx_write.active &&
+			       tqp->rx_write.psn == (psn & TBV_PSN_MASK));
+
 		atomic64_inc(&state->data_rx_ack_req_miss_current);
-	else
+		if (active)
+			atomic64_inc(&state->data_rx_ack_req_miss_current_active);
+		else if (tbv_rx_reorder_find(tqp, psn))
+			atomic64_inc(&state->data_rx_ack_req_miss_current_reorder);
+		else
+			atomic64_inc(&state->data_rx_ack_req_miss_current_idle);
+	} else {
 		atomic64_inc(&state->data_rx_ack_req_miss_future);
+	}
 }
 
 static void tbv_rx_no_qp_send_ack_req(struct tbv_state *state,
