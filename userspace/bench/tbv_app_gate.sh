@@ -11,6 +11,7 @@ log_root=${TBV_APP_LOG_ROOT:-$log_parent/$(date +%Y%m%d-%H%M%S)}
 ssh_cmd=${TBV_SSH:-ssh}
 timeout_s=${TBV_APP_TIMEOUT:-300}
 dv_check=${TBV_DV_CHECK:-auto}
+pytorch_dv_check=${TBV_PYTORCH_DV_CHECK:-$dv_check}
 
 rccl_tests_dir=${RCCL_TESTS_DIR:-}
 rccl_install=${RCCL_INSTALL_DIR:-}
@@ -77,6 +78,7 @@ Options:
                             Set TBV_APP_LOG_PARENT for dated logs under a parent directory
   --timeout SECONDS         RCCL test timeout. Default: $timeout_s
   --dv-check MODE           auto, require, forbid, off. Default: $dv_check
+  --pytorch-dv-check MODE   auto, require, forbid, off. Default: $pytorch_dv_check
   --rccl-tests-dir DIR      Directory containing alltoall_perf/alltoallv_perf
   --rccl-install DIR        RCCL install prefix
   --rocshmem-install DIR    rocSHMEM install prefix
@@ -134,6 +136,7 @@ while (($#)); do
     --log-root) log_root=$2; shift 2 ;;
     --timeout) timeout_s=$2; shift 2 ;;
     --dv-check) dv_check=$2; shift 2 ;;
+    --pytorch-dv-check) pytorch_dv_check=$2; shift 2 ;;
     --rccl-tests-dir) rccl_tests_dir=$2; shift 2 ;;
     --rccl-install) rccl_install=$2; shift 2 ;;
     --rocshmem-install) rocshmem_install=$2; shift 2 ;;
@@ -392,13 +395,14 @@ assert_dv_delta() {
 
 resolve_dv_expectation() {
   local mode_default=$1
+  local check=${2:-$dv_check}
 
-  case "$dv_check" in
+  case "$check" in
     auto) printf '%s\n' "$mode_default" ;;
     require) printf '1\n' ;;
     forbid) printf '0\n' ;;
     off|skip|none) printf 'skip\n' ;;
-    *) echo "ERROR: unknown --dv-check mode: $dv_check" >&2; exit 2 ;;
+    *) echo "ERROR: unknown DV check mode: $check" >&2; exit 2 ;;
   esac
 }
 
@@ -851,7 +855,7 @@ run_pytorch_case() {
     if ! assert_clean_counters "$before_label" "$after_label" "$logdir/counters" "$counter_hosts" >>"$logdir/counters.log" 2>&1; then
       status=1
     fi
-    if ! assert_dv_delta "$before_label" "$after_label" "$logdir/counters" "$counter_hosts" "$(resolve_dv_expectation "$TBV_EXPECT_DV")" >>"$logdir/counters.log" 2>&1; then
+    if ! assert_dv_delta "$before_label" "$after_label" "$logdir/counters" "$counter_hosts" "$(resolve_dv_expectation "$TBV_EXPECT_DV" "$pytorch_dv_check")" >>"$logdir/counters.log" 2>&1; then
       status=1
     fi
     if [[ -n "$expected_rccl_lib" ]]; then
@@ -924,6 +928,7 @@ echo "  usb4_alltoall_mode=${usb4_alltoall_mode:-0}"
 echo "  usb4_alltoall_ack=${usb4_alltoall_ack:-0}"
 if [[ "$run_pytorch" == 1 ]]; then
   echo "  pytorch_python=$pytorch_python"
+  echo "  pytorch_dv_check=$pytorch_dv_check"
 fi
 
 gate_status=0
