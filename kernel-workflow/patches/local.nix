@@ -22,4 +22,8 @@
     name = "usb4-xdomain-pin-protocol-handler-owner";
     patch = ./0008-thunderbolt-xdomain-pin-protocol-handler-owner.patch;
   }
+  {
+    name = "usb4-net-tx-e2e-param";
+    patch = ./0012-thunderbolt-net-add-TX-E2E-module-parameter.patch;
+  }
 ]
