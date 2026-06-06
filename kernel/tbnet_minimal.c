@@ -43,6 +43,9 @@
 #define TBV_TBNET_E2E			BIT(0)
 #define TBV_TBNET_MATCH_FRAGS_ID	BIT(1)
 #define TBV_TBNET_64K_FRAMES		BIT(2)
+/* Matches Apple's ThunderboltIP service advertisement. Ring E2E stays separate. */
+#define TBV_TBNET_APPLE_PRTCSTNS	(BIT(31) | TBV_TBNET_MATCH_FRAGS_ID | \
+					 TBV_TBNET_E2E)
 #define TBV_TBNET_L0_PORT_NUM(route)	((route) & GENMASK(5, 0))
 #define TBV_TBNET_PDF_FRAME_START	1
 #define TBV_TBNET_PDF_FRAME_END		2
@@ -1478,7 +1481,7 @@ static struct tb_service_driver tbv_tbnet_minimal_driver = {
 
 int tbv_tbnet_minimal_start(struct tbv_tbnet_identity *identity)
 {
-	u32 prtcstns = TBV_TBNET_MATCH_FRAGS_ID | TBV_TBNET_64K_FRAMES;
+	u32 prtcstns = TBV_TBNET_APPLE_PRTCSTNS;
 	int ret;
 
 	if (identity->minimal_started)
