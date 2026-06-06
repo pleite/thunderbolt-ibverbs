@@ -5353,6 +5353,7 @@ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 {
 	struct tbv_apple_pending_rx *pending;
 	struct tbv_qp *tqp;
+	bool starts_message;
 	bool raw_rx;
 	u32 qpn;
 	u32 user_len = 0;
@@ -5380,12 +5381,19 @@ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 		return;
 	}
 
+	/*
+	 * macOS emits short single-frame SENDs as EOF=3 without SOF.  Treat
+	 * those as a complete message start, but keep rejecting idle non-final
+	 * fragments because there is no Apple-side sequence number to recover
+	 * the missing prefix.
+	 */
+	starts_message = sof || raw_rx || eof == TBV_DATA_PDF_FRAME_END;
 	mutex_lock(&tqp->rx_lock);
 	if (tqp->apple_pending_ready_count)
 		tbv_apple_rx_drain_pending_locked(state, tqp);
 	if (sof && tqp->apple_pending_active >= 0)
 		atomic64_inc(&state->apple_rx_sof_while_active);
-	if (tqp->apple_pending_active < 0 && !sof && !raw_rx) {
+	if (tqp->apple_pending_active < 0 && !starts_message) {
 		atomic64_inc(&state->apple_rx_no_sof_when_idle);
 		atomic64_inc(&state->data_rx_bad_frame);
 		mutex_unlock(&tqp->rx_lock);
