@@ -139,6 +139,97 @@ print_pytorch_timing_aggregates() {
   ' "${logs[@]}" | sort -V
 }
 
+print_hoststream_phase_aggregates() {
+  local -a logs=("$@")
+
+  ((${#logs[@]} > 0)) || return 0
+  if ! grep -h 'NCCL WARN RCCL_ROCSHMEM_HOST_STREAM_TIMING' "${logs[@]}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  printf '\nhoststream_phase aggregates:\n'
+  printf 'app_mode bench_mode msg_size rank_offset sym_id count copyin_avg exchange_avg exchange_p50 exchange_p90 exchange_p95 exchange_p99 exchange_max copyout_avg total_avg total_p90 total_max\n'
+  awk '
+    function file_mode(path, parts, n, i) {
+      n = split(path, parts, "/")
+      for (i = 1; i <= n; i++) {
+        if (parts[i] == "pytorch" && i + 1 <= n)
+          return parts[i + 1]
+      }
+      return "unknown"
+    }
+    function metric(name, m) {
+      if (match($0, name "=([0-9.]+)", m))
+        return m[1] + 0
+      return 0
+    }
+    function percentile(src, len, pct, tmp, i, pos) {
+      delete tmp
+      for (i = 1; i <= len; i++)
+        tmp[i] = src[i]
+      asort(tmp)
+      pos = int((len * pct) + 0.999999)
+      if (pos < 1)
+        pos = 1
+      if (pos > len)
+        pos = len
+      return tmp[pos]
+    }
+    FNR == 1 {
+      app_mode = file_mode(FILENAME)
+    }
+    /NCCL WARN RCCL_ROCSHMEM_HOST_STREAM_TIMING/ {
+      bench_mode = metric("mode")
+      msg_size = metric("msgSize")
+      rank_offset = metric("rankOffset")
+      sym_id = metric("symId")
+      copy_in = metric("copyInMs")
+      exchange = metric("exchangeMs")
+      copy_out = metric("copyOutMs")
+      total = metric("totalMs")
+      key = app_mode SUBSEP bench_mode SUBSEP msg_size SUBSEP rank_offset SUBSEP sym_id
+      idx = ++count[key]
+      copy_in_v[key, idx] = copy_in
+      exchange_v[key, idx] = exchange
+      copy_out_v[key, idx] = copy_out
+      total_v[key, idx] = total
+      copy_in_sum[key] += copy_in
+      exchange_sum[key] += exchange
+      copy_out_sum[key] += copy_out
+      total_sum[key] += total
+      if (exchange > exchange_max[key])
+        exchange_max[key] = exchange
+      if (total > total_max[key])
+        total_max[key] = total
+    }
+    END {
+      for (key in count) {
+        split(key, p, SUBSEP)
+        len = count[key]
+        for (i = 1; i <= len; i++) {
+          ex[i] = exchange_v[key, i]
+          tot[i] = total_v[key, i]
+        }
+        printf "%s %s %s %s %s %d %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f\n",
+          p[1], p[2], p[3], p[4], p[5], len,
+          copy_in_sum[key] / len,
+          exchange_sum[key] / len,
+          percentile(ex, len, 0.50),
+          percentile(ex, len, 0.90),
+          percentile(ex, len, 0.95),
+          percentile(ex, len, 0.99),
+          exchange_max[key],
+          copy_out_sum[key] / len,
+          total_sum[key] / len,
+          percentile(tot, len, 0.90),
+          total_max[key]
+        delete ex
+        delete tot
+      }
+    }
+  ' "${logs[@]}" | sort -V
+}
+
 print_rccl_timing_aggregates() {
   local -a logs=("$@")
 
@@ -342,6 +433,7 @@ mapfile -d '' -t counter_logs < <(
 )
 
 print_pytorch_timing_aggregates "${pytorch_rank0_logs[@]}"
+print_hoststream_phase_aggregates "${pytorch_rank_logs[@]}"
 print_loaded_collective_lib_counts "${pytorch_rank_logs[@]}"
 print_rccl_timing_aggregates "${rccl_logs[@]}"
 print_counter_aggregates "${counter_logs[@]}"
