@@ -4823,3 +4823,50 @@ copy time and enqueue/TX-complete time. If bucket 3 is already slow during
 `tbv_copy_send_range()`, the issue is CPU/coherent-memory read behavior from
 that rocSHMEM source slot. If copy time is flat and the post-copy TX drain is
 slow, the issue is in native frame queueing/TX/DMA completion.
+
+### 2026-06-06 DV WRITE source-copy split
+
+Added per-bucket split timing:
+
+```text
+thunderbolt-ibverbs:
+  ca32618 kernel: split DV write copy and TX timing
+
+debugfs counters:
+  dv_write_copy_mr_bucket_<0..7>_ns
+  dv_write_postcopy_mr_bucket_<0..7>_ns
+```
+
+The same payload-only PyTorch host-stream all-to-all gate was rerun after
+deploying the split counters:
+
+```text
+roots:
+  /mnt/Home/tmp/tbv-app-gate-logs/pytorch-copybucket-src0-dst0-20260606-2150
+  /mnt/Home/tmp/tbv-app-gate-logs/pytorch-copybucket-src3-dst0-20260606-2150
+  /mnt/Home/tmp/tbv-app-gate-logs/pytorch-copybucket-src0-dst3-20260606-2150
+
+case       pytorch_avg_us  exchange_avg_ms range        bucket writes bytes     total_ms copy_ms postcopy_ms
+src0/dst0        1875.7        2.5-5.4     source MR    0       16  16777216     1.493   0.229     1.264
+src3/dst0       42508.8       29.3-38.9    source MR    3       16  16777216    30.665  29.582     1.082
+src0/dst3        2197.9        1.7-2.5     source MR    0       16  16777216     1.293   0.240     1.053
+```
+
+All three runs completed with balanced TX posted/completed counters, no DV hard
+error, no WR timeout, no retry exhaustion, and no TX error.
+
+Interpretation:
+
+1. The source-slot penalty is almost entirely source-copy time inside
+   `tbv_copy_send_range()`. Moving from source bucket 0 to source bucket 3 adds
+   about 29.35 ms to the copy span for a 1 MiB DV WRITE.
+2. The post-copy/native-TX span stays flat, about 1.1-1.3 ms, across the fast
+   and slow source cases. Native frame queueing, Thunderbolt TX completion, and
+   the remote write path are not the dominant cause of the slot-3 regression.
+3. Moving only the destination to slot 3 remains fast, with source bucket 0 copy
+   time still about 0.24 ms. The slow path is local source-read behavior from
+   the rocSHMEM coherent source slot, not remote destination placement.
+
+Next discriminator: determine whether the slow CPU read is tied to virtual
+address/slot offset, physical backing, NUMA/CCX locality, PAT/cacheability, or
+first-touch/migration behavior of the coherent rocSHMEM scratch allocation.
