@@ -95,6 +95,7 @@ static bool native_qp_tombstone_reack = true;
 static uint native_qp_tombstone_max = TBV_QP_TOMBSTONE_DEFAULT_MAX;
 static bool native_unsafe_retransmit_teardown_guard_disable;
 static uint native_ack_repeat = 1;
+static bool native_ack_probe;
 module_param(roce_netdev, charp, 0444);
 MODULE_PARM_DESC(roce_netdev,
 		 "Netdev used for RoCE GID metadata, for example br0.lan");
@@ -130,6 +131,11 @@ u32 tbv_ibdev_native_ack_repeat(void)
 	return min_t(uint, repeat, 16);
 }
 
+bool tbv_ibdev_native_ack_probe_enabled(void)
+{
+	return READ_ONCE(native_ack_probe);
+}
+
 static uint zcopy_min_bytes;
 module_param(zcopy_min_bytes, uint, 0644);
 MODULE_PARM_DESC(zcopy_min_bytes,
@@ -159,6 +165,10 @@ MODULE_PARM_DESC(native_ack_drop_every,
 module_param(native_ack_repeat, uint, 0644);
 MODULE_PARM_DESC(native_ack_repeat,
 		 "Number of times to send each native OK SEND_ACK fanout across live rails; 0 maps to 1, capped at 16");
+
+module_param(native_ack_probe, bool, 0644);
+MODULE_PARM_DESC(native_ack_probe,
+		 "Before the first native SEND/WRITE timeout retransmit, send one SEND_ACK_REQ control probe and wait one more timeout; 0 disables");
 
 module_param(native_qp_tombstone_reack, bool, 0644);
 MODULE_PARM_DESC(native_qp_tombstone_reack,
@@ -571,6 +581,7 @@ struct tbv_send_ctx {
 	bool retryable;
 	bool retrying;
 	bool rnr_waiting;
+	bool ack_probe_sent;
 	bool recv_credit_required;
 	bool solicited;
 	bool sq_counted;
@@ -732,6 +743,7 @@ static u32 tbv_collect_native_data_paths_for_qp_locked(struct tbv_qp *tqp,
 static void tbv_release_path_refs(struct tbv_path **paths, u32 path_count);
 static int tbv_send_ack(struct tbv_qp *tqp, u32 dest_qp, u32 src_qp,
 			u32 psn, int status);
+static int tbv_send_ack_req(struct tbv_send_ctx *send);
 static int tbv_send_ack_on_path(struct tbv_qp *tqp,
 				struct tbv_path *rx_path, u32 dest_qp,
 				u32 src_qp, u32 psn, int status);
@@ -1676,6 +1688,89 @@ tbv_qp_tombstone_lookup_ack_locked(struct tbv_state *state, u32 qpn,
 		return true;
 	}
 	return false;
+}
+
+static void tbv_count_no_qp_ack_tx_result(struct tbv_state *state, int status,
+					  int ret)
+{
+	if (ret) {
+		atomic64_inc(&state->data_tx_ack_send_error);
+	} else if (status == TBV_NATIVE_SEND_ACK_OK) {
+		atomic64_inc(&state->data_tx_ack_ok);
+	} else if (status == TBV_NATIVE_SEND_ACK_RNR) {
+		atomic64_inc(&state->data_tx_ack_rnr);
+	} else {
+		atomic64_inc(&state->data_tx_ack_error);
+	}
+}
+
+static bool tbv_native_ack_req_header_valid(const struct tbv_native_data_header *hdr)
+{
+	return hdr->flags == 0 && hdr->length == 0 && hdr->imm_data == 0;
+}
+
+static void tbv_rx_no_qp_send_ack_req(struct tbv_state *state,
+				      struct tbv_path *rx_path,
+				      const struct tbv_native_data_header *hdr)
+{
+	unsigned long flags;
+	bool found_tombstone = false;
+	bool found_ack = false;
+	u32 psn = hdr->psn & TBV_PSN_MASK;
+	int status = TBV_NATIVE_SEND_ACK_ERROR;
+	int ret;
+
+	atomic64_inc(&state->data_rx_ack_req);
+	if (!tbv_native_ack_req_header_valid(hdr)) {
+		atomic64_inc(&state->data_rx_bad_header);
+		return;
+	}
+	if (READ_ONCE(native_qp_tombstone_reack)) {
+		spin_lock_irqsave(&state->qp_tombstone_lock, flags);
+		tbv_qp_prune_tombstones_locked(state, jiffies);
+		found_ack = tbv_qp_tombstone_lookup_ack_locked(
+			state, hdr->dest_qp, hdr->src_qp, psn, &status,
+			&found_tombstone);
+		spin_unlock_irqrestore(&state->qp_tombstone_lock, flags);
+	}
+	if (!found_ack) {
+		if (found_tombstone)
+			atomic64_inc(&state->data_rx_ack_history_miss);
+		atomic64_inc(&state->data_rx_ack_req_miss);
+		return;
+	}
+
+	atomic64_inc(&state->data_rx_ack_req_reack);
+	ret = tbv_send_ack_on_path(NULL, rx_path, hdr->src_qp, hdr->dest_qp, psn,
+				   status);
+	tbv_count_no_qp_ack_tx_result(state, status, ret);
+}
+
+static void tbv_rx_send_ack_req(struct tbv_state *state, struct tbv_qp *tqp,
+				struct tbv_path *rx_path,
+				const struct tbv_native_data_header *hdr)
+{
+	u32 psn = hdr->psn & TBV_PSN_MASK;
+	int status = TBV_NATIVE_SEND_ACK_ERROR;
+	bool found;
+
+	atomic64_inc(&state->data_rx_ack_req);
+	if (!tbv_native_ack_req_header_valid(hdr)) {
+		atomic64_inc(&state->data_rx_bad_header);
+		return;
+	}
+
+	mutex_lock(&tqp->rx_lock);
+	found = tbv_qp_ack_history_lookup_locked(tqp, psn, &status);
+	mutex_unlock(&tqp->rx_lock);
+	if (!found) {
+		atomic64_inc(&state->data_rx_ack_req_miss);
+		return;
+	}
+
+	atomic64_inc(&state->data_rx_ack_req_reack);
+	tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp, hdr->dest_qp, psn,
+			     status);
 }
 
 static void tbv_rx_no_qp_ack_or_error(struct tbv_state *state,
@@ -3743,6 +3838,7 @@ static void tbv_apple_send_complete_work(struct work_struct *work)
 }
 
 static bool tbv_qp_timeout_reap_tx(struct tbv_qp *tqp,
+				   struct list_head *ack_probe_sends,
 				   struct list_head *retry_sends,
 				   struct list_head *completed_sends,
 				   struct list_head *timed_out_reads,
@@ -3827,6 +3923,17 @@ static bool tbv_qp_timeout_reap_tx(struct tbv_qp *tqp,
 		    !atomic_read(&send->tx_pending) &&
 		    send->retries < max_retries &&
 		    !tqp->closing && tqp->state != IB_QPS_ERR) {
+			if (tbv_ibdev_native_ack_probe_enabled() &&
+			    !send->ack_probe_sent) {
+				send->ack_probe_sent = true;
+				tbv_send_mark_queued(send, now);
+				atomic64_inc(&tqp->owner->data_wr_ack_probe);
+				tbv_send_ctx_get(send);
+				list_add_tail(&send->retry_node, ack_probe_sends);
+				continue;
+			}
+			if (send->ack_probe_sent && !send->retries)
+				atomic64_inc(&tqp->owner->data_wr_ack_probe_fallback);
 			send->retrying = true;
 			send->retry_reason = TBV_SEND_POST_RETRY_TIMEOUT;
 			tbv_send_ctx_get(send);
@@ -4049,6 +4156,7 @@ static void tbv_qp_timeout_work(struct work_struct *work)
 	struct tbv_qp *tqp =
 		container_of(to_delayed_work(work), struct tbv_qp,
 			     timeout_work);
+	LIST_HEAD(ack_probe_sends);
 	LIST_HEAD(retry_sends);
 	LIST_HEAD(completed_sends);
 	LIST_HEAD(timed_out_reads);
@@ -4073,7 +4181,8 @@ static void tbv_qp_timeout_work(struct work_struct *work)
 	if (!timeout)
 		return;
 
-	need_resched |= tbv_qp_timeout_reap_tx(tqp, &retry_sends,
+	need_resched |= tbv_qp_timeout_reap_tx(tqp, &ack_probe_sends,
+					       &retry_sends,
 					       &completed_sends,
 					       &timed_out_reads, now,
 					       timeout, &tx_timed_out);
@@ -4085,6 +4194,37 @@ static void tbv_qp_timeout_work(struct work_struct *work)
 			tbv_qp_timeout_reap_read_resps(tqp, &retry_read_resps,
 						       &drop_read_resps, now,
 						       read_resp_timeout);
+	}
+
+	while (!list_empty(&ack_probe_sends)) {
+		struct tbv_send_ctx *send =
+			list_first_entry(&ack_probe_sends, struct tbv_send_ctx,
+					 retry_node);
+		bool pending;
+		int ret;
+
+		list_del_init(&send->retry_node);
+		if (tbv_send_is_completed(send) ||
+		    !tbv_qp_send_retry_pending(tqp, send)) {
+			tbv_send_ctx_put(send);
+			continue;
+		}
+
+		ret = tbv_send_ack_req(send);
+
+		spin_lock_irqsave(&tqp->lock, flags);
+		pending = send->pending && !send->completed &&
+			  !tqp->closing && tqp->state != IB_QPS_ERR;
+		if (pending) {
+			tbv_send_mark_queued(send, jiffies);
+			tbv_qp_schedule_timeout_locked(tqp);
+			need_resched = true;
+		}
+		spin_unlock_irqrestore(&tqp->lock, flags);
+
+		if (ret)
+			need_resched = true;
+		tbv_send_ctx_put(send);
 	}
 
 	while (!list_empty(&retry_sends)) {
@@ -6530,6 +6670,42 @@ static int tbv_send_control_frame_on_all_native_paths(struct tbv_qp *tqp,
 
 	tbv_release_path_refs(paths, path_count);
 	return sent ? 0 : first_ret;
+}
+
+static int tbv_send_ack_req(struct tbv_send_ctx *send)
+{
+	struct tbv_qp *tqp = send->tqp;
+	struct tbv_state *state = tqp->owner;
+	struct tbv_native_data_header hdr = {};
+	u8 frame[TBV_NATIVE_DATA_HDR_SIZE];
+	unsigned long flags;
+	int len;
+	int ret;
+
+	spin_lock_irqsave(&tqp->lock, flags);
+	if (tqp->closing || tqp->state == IB_QPS_ERR || !tqp->dest_qp_known) {
+		spin_unlock_irqrestore(&tqp->lock, flags);
+		atomic64_inc(&state->data_tx_ack_req_send_error);
+		return -ENOTCONN;
+	}
+	hdr.opcode = TBV_NATIVE_DATA_OP_SEND_ACK_REQ;
+	hdr.dest_qp = tqp->attr.dest_qp_num;
+	hdr.src_qp = tqp->base.qp_num;
+	hdr.psn = send->psn;
+	spin_unlock_irqrestore(&tqp->lock, flags);
+
+	len = tbv_native_data_build_header(frame, sizeof(frame), &hdr);
+	if (len < 0) {
+		atomic64_inc(&state->data_tx_ack_req_send_error);
+		return len;
+	}
+
+	ret = tbv_send_control_frame_on_path(tqp, NULL, frame, len);
+	if (ret)
+		atomic64_inc(&state->data_tx_ack_req_send_error);
+	else
+		atomic64_inc(&state->data_tx_ack_req);
+	return ret;
 }
 
 static bool tbv_should_inject_native_ok_ack_drop(struct tbv_state *state)
@@ -10144,6 +10320,7 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 	case TBV_NATIVE_DATA_OP_MAD:
 	case TBV_NATIVE_DATA_OP_ATOMIC_REQ:
 	case TBV_NATIVE_DATA_OP_ATOMIC_RESP:
+	case TBV_NATIVE_DATA_OP_SEND_ACK_REQ:
 		break;
 	default:
 		atomic64_inc(&state->data_rx_bad_header);
@@ -10165,7 +10342,10 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 						     -EINVAL);
 		tbv_count_native_rx_no_qp_opcode(state, hdr->opcode);
 		tbv_count_native_rx_no_qp_send_ack(state, hdr);
-		if (tbv_native_data_op_has_send_ack(hdr->opcode))
+		if (hdr->opcode == TBV_NATIVE_DATA_OP_SEND_ACK_REQ)
+			tbv_rx_no_qp_send_ack_req(state, rx_path, hdr);
+		if (tbv_native_data_op_has_send_ack(hdr->opcode) ||
+		    hdr->opcode == TBV_NATIVE_DATA_OP_SEND_ACK_REQ)
 			atomic64_inc(&state->data_rx_no_qp_native_ackable);
 		else
 			atomic64_inc(&state->data_rx_no_qp_native_non_ack);
@@ -10206,6 +10386,12 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 			atomic64_inc(&state->data_rx_qp_error);
 		else
 			atomic64_inc(&state->data_rx_bad_peer);
+		tbv_qp_put(tqp);
+		return;
+	}
+
+	if (hdr->opcode == TBV_NATIVE_DATA_OP_SEND_ACK_REQ) {
+		tbv_rx_send_ack_req(state, tqp, rx_path, hdr);
 		tbv_qp_put(tqp);
 		return;
 	}

@@ -30,7 +30,8 @@ enum tbv_native_data_op {
 	TBV_NATIVE_DATA_OP_MAD = 11,
 	TBV_NATIVE_DATA_OP_ATOMIC_REQ = 12,
 	TBV_NATIVE_DATA_OP_ATOMIC_RESP = 13,
-	TBV_NATIVE_DATA_OP_MAX = TBV_NATIVE_DATA_OP_ATOMIC_RESP,
+	TBV_NATIVE_DATA_OP_SEND_ACK_REQ = 14,
+	TBV_NATIVE_DATA_OP_MAX = TBV_NATIVE_DATA_OP_SEND_ACK_REQ,
 };
 
 enum tbv_native_data_flag {
@@ -70,7 +71,9 @@ struct tbv_native_data_header {
 	 * immediate data for SEND_IMM. For RDMA_WRITE/RDMA_WRITE_IMM,
 	 * remote_addr is the base remote IOVA, rkey is the remote key, and
 	 * imm_data carries immediate data only for RDMA_WRITE_IMM. For
-	 * SEND_ACK, imm_data is enum tbv_native_send_ack_status.
+	 * SEND_ACK, imm_data is enum tbv_native_send_ack_status. SEND_ACK_REQ
+	 * asks the receiver to replay an ACK from history for dest_qp/src_qp/psn;
+	 * it carries no payload and imm_data is zero.
 	 *
 	 * For ATOMIC_REQ, length is the request payload length, imm_data is
 	 * enum tbv_native_atomic_op, remote_addr/rkey identify the target, and

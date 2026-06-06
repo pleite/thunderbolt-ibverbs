@@ -498,6 +498,8 @@ struct tbv_state {
 	atomic64_t data_wr_retransmit_closing_qp;
 	atomic64_t data_wr_retransmit_no_live_path;
 	atomic64_t data_wr_retransmit_teardown_path;
+	atomic64_t data_wr_ack_probe;
+	atomic64_t data_wr_ack_probe_fallback;
 	atomic64_t data_wr_retry_enqueue_error;
 	atomic64_t data_wr_retry_exhausted;
 	atomic64_t data_wr_rnr_retry_exhausted;
@@ -555,9 +557,14 @@ struct tbv_state {
 	atomic64_t data_tx_ack_send_error;
 	atomic64_t data_tx_ack_drop_checked;
 	atomic64_t data_tx_ack_drop_injected;
+	atomic64_t data_tx_ack_req;
+	atomic64_t data_tx_ack_req_send_error;
 	atomic64_t data_rx_ack_rnr;
 	atomic64_t data_rx_duplicate_ack;
 	atomic64_t data_rx_ack_history_miss;
+	atomic64_t data_rx_ack_req;
+	atomic64_t data_rx_ack_req_reack;
+	atomic64_t data_rx_ack_req_miss;
 	atomic64_t data_rx_no_qp_reack;
 	atomic64_t data_rx_no_qp_error_ack;
 	atomic64_t data_qp_tombstone_evicted;
@@ -880,6 +887,7 @@ bool tbv_ibdev_native_qp_tombstone_reack_enabled(void);
 u32 tbv_ibdev_native_qp_tombstone_max(void);
 bool tbv_ibdev_native_retransmit_teardown_guard_enabled(void);
 u32 tbv_ibdev_native_ack_repeat(void);
+bool tbv_ibdev_native_ack_probe_enabled(void);
 int tbv_configfs_start(struct tbv_state *state);
 void tbv_configfs_stop(struct tbv_state *state);
 

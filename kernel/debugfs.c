@@ -76,6 +76,8 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   tbv_ibdev_native_retransmit_teardown_guard_enabled());
 	seq_printf(s, "native_ack_repeat: %u\n",
 		   tbv_ibdev_native_ack_repeat());
+	seq_printf(s, "native_ack_probe: %u\n",
+		   tbv_ibdev_native_ack_probe_enabled());
 	seq_printf(s, "configured_links: %u\n", tbv_link_count(state));
 	seq_printf(s, "tbnet_identity: %s\n",
 		   tbv_tbnet_identity_name(state->cfg.tbnet_identity));
@@ -238,6 +240,10 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_wr_retransmit_no_live_path));
 	seq_printf(s, "data_wr_retransmit_teardown_path: %lld\n",
 		   atomic64_read(&state->data_wr_retransmit_teardown_path));
+	seq_printf(s, "data_wr_ack_probe: %lld\n",
+		   atomic64_read(&state->data_wr_ack_probe));
+	seq_printf(s, "data_wr_ack_probe_fallback: %lld\n",
+		   atomic64_read(&state->data_wr_ack_probe_fallback));
 	seq_printf(s, "data_wr_retry_enqueue_error: %lld\n",
 		   atomic64_read(&state->data_wr_retry_enqueue_error));
 	seq_printf(s, "data_wr_retry_exhausted: %lld\n",
@@ -352,12 +358,22 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_tx_ack_drop_checked));
 	seq_printf(s, "data_tx_ack_drop_injected: %lld\n",
 		   atomic64_read(&state->data_tx_ack_drop_injected));
+	seq_printf(s, "data_tx_ack_req: %lld\n",
+		   atomic64_read(&state->data_tx_ack_req));
+	seq_printf(s, "data_tx_ack_req_send_error: %lld\n",
+		   atomic64_read(&state->data_tx_ack_req_send_error));
 	seq_printf(s, "data_rx_ack_rnr: %lld\n",
 		   atomic64_read(&state->data_rx_ack_rnr));
 	seq_printf(s, "data_rx_duplicate_ack: %lld\n",
 		   atomic64_read(&state->data_rx_duplicate_ack));
 	seq_printf(s, "data_rx_ack_history_miss: %lld\n",
 		   atomic64_read(&state->data_rx_ack_history_miss));
+	seq_printf(s, "data_rx_ack_req: %lld\n",
+		   atomic64_read(&state->data_rx_ack_req));
+	seq_printf(s, "data_rx_ack_req_reack: %lld\n",
+		   atomic64_read(&state->data_rx_ack_req_reack));
+	seq_printf(s, "data_rx_ack_req_miss: %lld\n",
+		   atomic64_read(&state->data_rx_ack_req_miss));
 	seq_printf(s, "data_rx_no_qp_reack: %lld\n",
 		   atomic64_read(&state->data_rx_no_qp_reack));
 	seq_printf(s, "data_rx_no_qp_error_ack: %lld\n",
