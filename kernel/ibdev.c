@@ -3958,6 +3958,11 @@ static bool tbv_qp_timeout_reap_tx(struct tbv_qp *tqp,
 				need_resched = true;
 				continue;
 			}
+			if (send->retryable && atomic_read(&send->tx_pending)) {
+				atomic64_inc(&tqp->owner->data_wr_rnr_wait_tx_pending);
+				need_resched = true;
+				continue;
+			}
 			if (send->retryable && !send->retrying &&
 			    !atomic_read(&send->tx_pending) &&
 			    tbv_send_rnr_retry_allowed(send) &&

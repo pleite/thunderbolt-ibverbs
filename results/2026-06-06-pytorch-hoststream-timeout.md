@@ -684,3 +684,54 @@ cannot be retried.
 Next counter addition: classify that timeout-worker RNR-wait failure path by
 the exact predicate that blocked retry (`not_retryable`, `retrying`,
 `tx_pending`, `retry_exhausted`, `closing`, `QP error`, or `unknown`).
+
+## RNR-Wait Classifier
+
+Deployed the RNR-wait classifier and reran the same PyTorch hoststream baseline:
+
+```text
+thunderbolt-ibverbs: 1a9b4ce kernel: classify RNR wait completions
+deploy worktree:     f8892d0 kernel: classify RNR wait completions
+nixos-config:        2cf4999 strix: deploy RNR wait classifier
+log root: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-rnrwaitclass30-qptimeout14-20260606-154322
+status: fail, 26/30 app reps completed, failed reps 6,7,20,22
+loaded RCCL: /mnt/Home/tmp/rccl-hoststream-waitbudget-install/lib/librccl.so.1.0
+data_tx_posted/completed: balanced in every rep
+```
+
+Rep 6 was a harness-policy failure, not an application failure. Both ranks
+completed and printed 1 MiB and 2 MiB timings, but the counter gate rejected
+late no-QP tombstone traffic:
+
+```text
+data_rx_no_qp: 1038
+data_rx_no_qp_reack: 519
+```
+
+The existing `--allow-late-send-ack-no-qp` policy only allowed the OK SEND_ACK
+half of this traffic. It did not allow the matching tombstone re-ack half, so
+the harness produced a false hard failure.
+
+The real failures were reps 7, 20, and 22. Each had the same shape:
+
+```text
+rank1 strix-2: USB4 GDA CQE error status=255 opcode=3 byte_len=2097152
+rank0 strix-1: USB4 alltoall DATA wait timed out
+data_wr_timeout/data_wr_retry_exhausted: 0/0
+data_wr_rnr_retry_exhausted: 1
+data_wr_rnr_complete_retry_exhausted/closing_qp/qp_error: 0/0/0
+data_wr_rnr_wait_not_retryable/retrying/tx_pending/retry_exhausted/closing_qp/qp_error/unknown:
+  0/0/1/0/0/0/0
+```
+
+This is now localized. `status=255` is not an RNR retry-cap failure, not a
+closing-QP failure, and not a QP-error failure. It is the timeout worker seeing
+an RNR-waiting send whose previous TX frames are still pending and treating
+that temporary `tx_pending` state as terminal `-EAGAIN`.
+
+That is inconsistent with the normal timeout path, which already defers while
+`tx_pending` is nonzero. It is also inconsistent with the run result:
+TX posted/completed was balanced by the end of each failed rep, so the pending
+TX completions were not permanently lost. The next fix is therefore to make the
+RNR-wait branch defer and reschedule when `tx_pending > 0`, then retry/fail only
+after TX completions drain.

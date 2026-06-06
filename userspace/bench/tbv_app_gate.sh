@@ -273,6 +273,32 @@ print_counter_deltas() {
   done
 }
 
+late_no_qp_allowed() {
+  local before_label=$1
+  local after_label=$2
+  local dir=$3
+  local target_hosts=$4
+  local no_qp
+  local send_ack_ok
+  local send_ack_error
+  local send_ack_bad_status
+  local reack
+  local error_ack
+  local non_ack
+
+  no_qp=$(counter_delta_sum "$before_label" "$after_label" "$dir" "$target_hosts" data_rx_no_qp)
+  send_ack_ok=$(counter_delta_sum "$before_label" "$after_label" "$dir" "$target_hosts" data_rx_no_qp_send_ack_ok)
+  send_ack_error=$(counter_delta_sum "$before_label" "$after_label" "$dir" "$target_hosts" data_rx_no_qp_send_ack_error)
+  send_ack_bad_status=$(counter_delta_sum "$before_label" "$after_label" "$dir" "$target_hosts" data_rx_no_qp_send_ack_bad_status)
+  reack=$(counter_delta_sum "$before_label" "$after_label" "$dir" "$target_hosts" data_rx_no_qp_reack)
+  error_ack=$(counter_delta_sum "$before_label" "$after_label" "$dir" "$target_hosts" data_rx_no_qp_error_ack)
+  non_ack=$(counter_delta_sum "$before_label" "$after_label" "$dir" "$target_hosts" data_rx_no_qp_native_non_ack)
+
+  ((no_qp > 0)) || return 1
+  ((send_ack_error == 0 && send_ack_bad_status == 0 && error_ack == 0 && non_ack == 0)) || return 1
+  ((no_qp == send_ack_ok + reack))
+}
+
 assert_clean_counters() {
   local before_label=$1
   local after_label=$2
@@ -280,20 +306,18 @@ assert_clean_counters() {
   local target_hosts=$4
   local key
   local delta
-  local no_qp
-  local send_ack
-  local send_ack_ok
   local failed=0
 
   for key in $hard_error_keys; do
     delta=$(counter_delta_sum "$before_label" "$after_label" "$dir" "$target_hosts" "$key")
-    if [[ "$key" == data_rx_no_qp && "$allow_late_send_ack_no_qp" == 1 && "$delta" -gt 0 ]]; then
-      no_qp=$delta
-      send_ack=$(counter_delta_sum "$before_label" "$after_label" "$dir" "$target_hosts" data_rx_no_qp_send_ack)
-      send_ack_ok=$(counter_delta_sum "$before_label" "$after_label" "$dir" "$target_hosts" data_rx_no_qp_send_ack_ok)
-      if ((no_qp == send_ack && send_ack == send_ack_ok)); then
-        echo "INFO: allowing $no_qp late OK SEND_ACK no-QP frames" >&2
-        continue
+    if [[ "$allow_late_send_ack_no_qp" == 1 && "$delta" -gt 0 ]]; then
+      if [[ "$key" == data_rx_no_qp || "$key" == data_rx_no_qp_reack ]]; then
+        if late_no_qp_allowed "$before_label" "$after_label" "$dir" "$target_hosts"; then
+          if [[ "$key" == data_rx_no_qp ]]; then
+            echo "INFO: allowing late OK SEND_ACK/tombstone no-QP frames" >&2
+          fi
+          continue
+        fi
       fi
     fi
     if ((delta != 0)); then
