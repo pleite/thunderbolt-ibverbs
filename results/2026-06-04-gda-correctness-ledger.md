@@ -3200,3 +3200,153 @@ Interpretation:
    still a separate end-to-end sanity target, not the best next diagnostic,
    because the validated GDA collectives are all-to-all/all-to-allv rather than
    vLLM's dominant all-reduce/all-gather traffic.
+
+### PyTorch/RCCL All-To-All Smoke
+
+Staged the vLLM/PyTorch wrapper closure to `strix-2`:
+
+```text
+wrapper:
+  /nix/store/3mr3fgrn6znah88jrc42r2wh692x24km-vllm-env-therock-usb4-hostheap-gfx1151
+closure size:
+  37194634176 bytes, 451 paths
+copied missing paths to strix-2:
+  151
+```
+
+The wrapper explicitly preloads the USB4 RCCL package used in the PyTorch smoke:
+
+```text
+RCCL:
+  /nix/store/74kx31vim3ynwpivjlxq04wbdl62nrbg-rccl-usb4-hostheap-gfx1151-2.28.9-local/lib/librccl.so.1
+rocSHMEM:
+  /nix/store/78p5x7mgw4clcr567p99h9bz8r9783lc-rocshmem-usb4-hostheap-gfx1151-3.4.0-local
+```
+
+Ran three PyTorch distributed all-to-all smokes:
+
+```text
+collective: all_to_all
+sizes: 65536, 262144
+iters: 2
+validation: enabled
+MPI/control iface: eno1
+master: 192.168.23.136
+```
+
+Fallback PyTorch, GDA disabled:
+
+```text
+log root: /tmp/usb4-rccl-gda-20260606-89bcec0/pytorch-fallback-smoke
+Librccl path:
+  /nix/store/74kx31vim3ynwpivjlxq04wbdl62nrbg-rccl-usb4-hostheap-gfx1151-2.28.9-local/lib/librccl.so.1
+
+all_to_all_single bytes=65536:
+  1697.2 us/iter, gpu=1410.4 us/iter
+all_to_all_single bytes=262144:
+  349.5 us/iter, gpu=345.0 us/iter
+
+dv_poll_wqes sum              +0
+dv_hard_error sum             +0
+data_wr_copy_error sum        +0
+data_wr_timeout sum           +0
+data_tx_errors sum            +0
+```
+
+Host-stream GDA PyTorch:
+
+```text
+log root: /tmp/usb4-rccl-gda-20260606-89bcec0/pytorch-hoststream-smoke
+RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL=1
+RCCL_ROCSHMEM_SOURCE_HEAP=1
+RCCL_ROCSHMEM_DEST_HEAP=1
+
+all_to_all_single bytes=65536:
+  880.0 us/iter, gpu=871.0 us/iter
+all_to_all_single bytes=262144:
+  5894.5 us/iter, gpu=5890.1 us/iter
+
+dv_poll_wqes sum              +24
+dv_admission_attempts sum     +24
+dv_backpressure_retry sum     +0
+dv_fence_retry sum            +0
+dv_hard_error sum             +0
+data_wr_copy_error sum        +0
+data_wr_timeout sum           +0
+data_tx_errors sum            +0
+```
+
+Device/default GDA PyTorch:
+
+```text
+log root: /tmp/usb4-rccl-gda-20260606-89bcec0/pytorch-device-smoke
+RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL=0
+RCCL_ROCSHMEM_SOURCE_HEAP=1
+RCCL_ROCSHMEM_DEST_HEAP=1
+
+all_to_all_single bytes=65536:
+  71930.9 us/iter, gpu=71916.2 us/iter
+all_to_all_single bytes=262144:
+  139192.2 us/iter, gpu=139188.0 us/iter
+
+dv_poll_wqes sum              +24
+dv_admission_attempts sum     +24
+dv_backpressure_retry sum     +0
+dv_fence_retry sum            +0
+dv_hard_error sum             +0
+data_wr_copy_error sum        +0
+data_wr_timeout sum           +0
+data_tx_errors sum            +0
+```
+
+Final post-PyTorch driver health:
+
+```text
+strix-1:
+dv_poll_wqes=2844
+dv_hard_error=0
+data_wr_copy_error=0
+data_wr_retransmit=22
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_tx_posted=207751
+data_tx_completed=207751
+data_tx_errors=0
+data_rx_canceled=4096
+data_rx_no_qp=0
+data_qp_tombstone_evicted=0
+
+strix-2:
+dv_poll_wqes=2844
+dv_hard_error=0
+data_wr_copy_error=0
+data_wr_retransmit=27
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_tx_posted=207467
+data_tx_completed=207467
+data_tx_errors=0
+data_rx_canceled=0
+data_rx_no_qp=0
+data_qp_tombstone_evicted=0
+```
+
+No matching `BUG`, `Oops`, `panic`, watchdog, lockup, hard-error, timeout,
+GPU-fault, or tombstone-cap warning appeared in the last 500 dmesg lines on
+either host.
+
+Interpretation:
+
+1. This is now an actual PyTorch/RCCL application-level smoke, not just
+   `rccl-tests`: PyTorch distributed all-to-all loaded the USB4 RCCL wrapper,
+   validated successfully, and exercised the GDA path when enabled.
+2. Kernel correctness still holds through the PyTorch layer: no DV hard errors,
+   copy errors, WR timeouts, TX errors, no-QP events, or tombstone evictions.
+3. Performance remains the blocker. Host-stream GDA beats fallback at 64 KiB in
+   this tiny run but is much slower at 256 KiB; device/default GDA is unusably
+   slow here. That points back at RCCL/rocSHMEM integration and mode selection,
+   not a kernel correctness blocker.
+4. vLLM can now be staged/run as an end-to-end sanity check because the Python
+   closure is present on both Strix hosts, but it should not be treated as the
+   primary GDA benchmark until the all-to-all/all-to-allv RCCL path is faster and
+   less mode-sensitive.
