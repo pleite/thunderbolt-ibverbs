@@ -1693,3 +1693,56 @@ and the 192MiB slot slower still. The same rebuilt RCCL still reproduces the
 two-slot 128MiB penalty. This points below RCCL's sym-ID selection and below
 copy-in/copy-out: the next target is the rocSHMEM USB4 address/chunking path or
 the thunderbolt-ibverbs mapping/DV post path as heap offsets grow.
+
+### USB4 All-to-All Payload vs Signal/Wait Split
+
+Exposed rocSHMEM's existing USB4 all-to-all phase selector through the app gate:
+
+```text
+--usb4-alltoall-mode N    -> ROCSHMEM_GDA_USB4_ALLTOALL_MODE
+--usb4-alltoall-ack 0|1   -> ROCSHMEM_GDA_USB4_ALLTOALL_ACK
+```
+
+Then re-ran the corrected `numSymBuf=4` exchange-only discriminator with
+validation disabled, `RCCL_ROCSHMEM_THRESHOLD=4194304`, `iters=3`, `reps=3`,
+`--source-heap 0 --dest-heap 0`, and the same rebuilt RCCL/rocSHMEM installs.
+Mode 1 posts only the payload RDMA write; mode 2 performs only the signal/wait
+phase.
+
+```text
+mode sym slot_offset phase_count exchange_avg exchange_p50 exchange_p90 exchange_max total_avg torch_avg
+1    0   0           18          17.331ms     16.932ms     30.313ms     31.729ms     17.336ms  21.787ms
+1    1   67108864    18          46.686ms     43.850ms     86.815ms     102.689ms    46.691ms  48.708ms
+1    2   134217728   18          74.402ms     52.024ms     200.658ms    249.081ms    74.407ms  52.547ms
+1    3   201326592   18          83.095ms     68.271ms     157.248ms    228.393ms    83.101ms  74.744ms
+2    0   0           18          0.172ms      0.063ms      0.931ms      0.999ms      0.178ms   0.305ms
+2    1   67108864    18          0.175ms      0.073ms      0.821ms      0.843ms      0.181ms   0.323ms
+2    2   134217728   18          0.087ms      0.081ms      0.127ms      0.158ms      0.092ms   0.215ms
+2    3   201326592   18          0.069ms      0.062ms      0.096ms      0.101ms      0.075ms   0.190ms
+```
+
+Log roots:
+
+```text
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-usb4mode1-nsym4-fixedsym0-20260606-201348
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-usb4mode1-nsym4-fixedsym1-20260606-201417
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-usb4mode1-nsym4-fixedsym2-20260606-201442
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-usb4mode1-nsym4-fixedsym3-20260606-201506
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-usb4mode2-nsym4-fixedsym0-20260606-201530
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-usb4mode2-nsym4-fixedsym1-20260606-201554
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-usb4mode2-nsym4-fixedsym2-20260606-201618
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-usb4mode2-nsym4-fixedsym3-20260606-201642
+```
+
+All eight roots passed the app gate with `dv_hard_error=0`,
+`wr_timeout=0`, `wr_retry_exhausted=0`, `data_tx_errors=0`, and
+state-level TX posted/completed equal. Payload-only mode still has non-fatal
+RNR/write-gap/late-ACK movement, but signal/wait-only has no RNR or write-gap
+movement and posts only about 512 control/data frames per three-rep root.
+
+Interpretation: the slot-offset penalty is in the payload write leg. The
+pSync signal/wait phase is sub-millisecond and essentially flat across the
+same slots, so it cannot explain the tens-to-hundreds of milliseconds observed
+when the payload RDMA write is enabled. This narrows the next inspection to the
+payload `put_nbi_single`/`quiet_single` path and the thunderbolt-ibverbs DV
+RDMA WRITE handling for larger heap offsets.

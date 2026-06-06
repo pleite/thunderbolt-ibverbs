@@ -32,6 +32,8 @@ rccl_num_sym_buf=${TBV_RCCL_NUM_SYM_BUF:-${RCCL_ROCSHMEM_NUM_SYM_BUF:-}}
 hoststream_fixed_symid=${TBV_RCCL_HOSTSTREAM_FIXED_SYMID:-${RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID:-}}
 hoststream_addr_log=${TBV_RCCL_HOSTSTREAM_ADDR_LOG:-${RCCL_ROCSHMEM_HOST_STREAM_ADDR_LOG:-}}
 usb4_a2a_post_log=${TBV_ROCSHMEM_USB4_A2A_POST_LOG:-${ROCSHMEM_GDA_USB4_A2A_POST_LOG:-}}
+usb4_alltoall_mode=${TBV_ROCSHMEM_USB4_ALLTOALL_MODE:-${ROCSHMEM_GDA_USB4_ALLTOALL_MODE:-}}
+usb4_alltoall_ack=${TBV_ROCSHMEM_USB4_ALLTOALL_ACK:-${ROCSHMEM_GDA_USB4_ALLTOALL_ACK:-}}
 
 run_rccl=${TBV_RUN_RCCL:-1}
 run_pytorch=${TBV_RUN_PYTORCH:-0}
@@ -92,6 +94,8 @@ Options:
   --hoststream-addr-log 0|1
                             Set RCCL_ROCSHMEM_HOST_STREAM_ADDR_LOG
   --usb4-a2a-post-log N     Set ROCSHMEM_GDA_USB4_A2A_POST_LOG
+  --usb4-alltoall-mode N    Set ROCSHMEM_GDA_USB4_ALLTOALL_MODE
+  --usb4-alltoall-ack 0|1   Set ROCSHMEM_GDA_USB4_ALLTOALL_ACK
   --skip-rccl               Do not run rccl-tests gates
   --pytorch                 Run PyTorch distributed smoke
   --pytorch-wrapper DIR     vLLM/PyTorch wrapper prefix
@@ -139,6 +143,8 @@ while (($#)); do
     --hoststream-fixed-symid) hoststream_fixed_symid=$2; shift 2 ;;
     --hoststream-addr-log) hoststream_addr_log=$2; shift 2 ;;
     --usb4-a2a-post-log) usb4_a2a_post_log=$2; shift 2 ;;
+    --usb4-alltoall-mode) usb4_alltoall_mode=$2; shift 2 ;;
+    --usb4-alltoall-ack) usb4_alltoall_ack=$2; shift 2 ;;
     --skip-rccl) run_rccl=0; shift ;;
     --pytorch) run_pytorch=1; shift ;;
     --pytorch-wrapper) pytorch_wrapper=$2; shift 2 ;;
@@ -514,6 +520,8 @@ setup_app_env() {
   export ROCSHMEM_DEBUG_LEVEL=${ROCSHMEM_DEBUG_LEVEL:-ERROR}
   export ROCSHMEM_GDA_USB4_ROUTE_TRACE=${ROCSHMEM_GDA_USB4_ROUTE_TRACE:-0}
   export ROCSHMEM_GDA_USB4_A2A_POST_LOG=${ROCSHMEM_GDA_USB4_A2A_POST_LOG:-0}
+  export ROCSHMEM_GDA_USB4_ALLTOALL_MODE=${ROCSHMEM_GDA_USB4_ALLTOALL_MODE:-0}
+  export ROCSHMEM_GDA_USB4_ALLTOALL_ACK=${ROCSHMEM_GDA_USB4_ALLTOALL_ACK:-0}
   export IB_GID_INDEX=${IB_GID_INDEX:-1}
   export RCCL_FORCE_ENABLE_DMABUF=${RCCL_FORCE_ENABLE_DMABUF:-1}
   export RCCL_INIT_CHANNELS=${RCCL_INIT_CHANNELS:-1}
@@ -596,7 +604,7 @@ run_rccl_case() {
       -x HIP_VISIBLE_DEVICES -x ROCR_VISIBLE_DEVICES -x HSA_NO_SCRATCH_RECLAIM -x HSA_OVERRIDE_GFX_VERSION \
       -x ROCSHMEM_GDA_PROVIDER -x ROCSHMEM_GDA_ENABLE_DMABUF -x ROCSHMEM_HCA_LIST -x ROCSHMEM_HEAP_SIZE \
       -x ROCSHMEM_MAX_NUM_TEAMS -x ROCSHMEM_DEBUG_LEVEL -x ROCSHMEM_GDA_USB4_ROUTE_TRACE -x IB_GID_INDEX \
-      -x ROCSHMEM_GDA_USB4_A2A_POST_LOG \
+      -x ROCSHMEM_GDA_USB4_A2A_POST_LOG -x ROCSHMEM_GDA_USB4_ALLTOALL_MODE -x ROCSHMEM_GDA_USB4_ALLTOALL_ACK \
       -x ROCSHMEM_GDA_QP_TIMEOUT -x ROCSHMEM_GDA_QP_RETRY_CNT -x ROCSHMEM_GDA_QP_RNR_RETRY \
       -x RCCL_ROCSHMEM_ENABLE -x RCCL_ROCSHMEM_FORCE_ENABLE -x RCCL_ROCSHMEM_THRESHOLD \
       -x RCCL_ROCSHMEM_SOURCE_HEAP -x RCCL_ROCSHMEM_DEST_HEAP -x RCCL_ROCSHMEM_NUM_SYM_BUF \
@@ -702,6 +710,8 @@ build_torch_remote_command() {
     "ROCSHMEM_DEBUG_LEVEL=${ROCSHMEM_DEBUG_LEVEL:-ERROR}"
     "ROCSHMEM_GDA_USB4_ROUTE_TRACE=${ROCSHMEM_GDA_USB4_ROUTE_TRACE:-0}"
     "ROCSHMEM_GDA_USB4_A2A_POST_LOG=${ROCSHMEM_GDA_USB4_A2A_POST_LOG:-0}"
+    "ROCSHMEM_GDA_USB4_ALLTOALL_MODE=${ROCSHMEM_GDA_USB4_ALLTOALL_MODE:-0}"
+    "ROCSHMEM_GDA_USB4_ALLTOALL_ACK=${ROCSHMEM_GDA_USB4_ALLTOALL_ACK:-0}"
     "ROCSHMEM_GDA_QP_TIMEOUT=${ROCSHMEM_GDA_QP_TIMEOUT:-14}"
     "ROCSHMEM_GDA_QP_RETRY_CNT=${ROCSHMEM_GDA_QP_RETRY_CNT:-7}"
     "ROCSHMEM_GDA_QP_RNR_RETRY=${ROCSHMEM_GDA_QP_RNR_RETRY:-7}"
@@ -824,6 +834,12 @@ fi
 if [[ -n "$usb4_a2a_post_log" ]]; then
   export ROCSHMEM_GDA_USB4_A2A_POST_LOG=$usb4_a2a_post_log
 fi
+if [[ -n "$usb4_alltoall_mode" ]]; then
+  export ROCSHMEM_GDA_USB4_ALLTOALL_MODE=$usb4_alltoall_mode
+fi
+if [[ -n "$usb4_alltoall_ack" ]]; then
+  export ROCSHMEM_GDA_USB4_ALLTOALL_ACK=$usb4_alltoall_ack
+fi
 if [[ -n "$rccl_num_sym_buf" ]]; then
   export RCCL_ROCSHMEM_NUM_SYM_BUF=$rccl_num_sym_buf
 fi
@@ -842,6 +858,8 @@ echo "  rocshmem_num_sym_buf=${rccl_num_sym_buf:-2}"
 echo "  hoststream_fixed_symid=${hoststream_fixed_symid:-auto}"
 echo "  hoststream_addr_log=${hoststream_addr_log:-0}"
 echo "  usb4_a2a_post_log=${usb4_a2a_post_log:-0}"
+echo "  usb4_alltoall_mode=${usb4_alltoall_mode:-0}"
+echo "  usb4_alltoall_ack=${usb4_alltoall_ack:-0}"
 
 gate_status=0
 
