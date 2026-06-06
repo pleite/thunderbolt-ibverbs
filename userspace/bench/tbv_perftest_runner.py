@@ -191,6 +191,11 @@ FATAL_COUNTERS = [
     "data_cq_overflow",
 ]
 
+APPLE_RDMA_DEV_PREFIX = "rdma_en"
+APPLE_UC_GID_INDEX = 1
+APPLE_UC_MTU = 1024
+APPLE_UC_QUEUE_DEPTH = 32
+
 CSV_FIELDS = [
     "timestamp_utc",
     "plan",
@@ -210,6 +215,10 @@ CSV_FIELDS = [
     "iommu",
     "direction",
     "dev",
+    "server_dev",
+    "client_dev",
+    "server_data_addr",
+    "client_data_addr",
     "gid_index",
     "port",
     "status",
@@ -220,6 +229,7 @@ CSV_FIELDS = [
     "tx_depth",
     "rx_depth",
     "connection",
+    "mtu",
     "bidirectional",
     "bw_peak_gbps",
     "bw_avg_gbps",
@@ -535,6 +545,7 @@ def parse_case_options(case: dict[str, Any]) -> dict[str, str]:
         "--tx-depth": "tx_depth",
         "--rx-depth": "rx_depth",
         "--connection": "connection",
+        "--mtu": "mtu",
     }
     i = 0
     while i < len(argv):
@@ -548,6 +559,25 @@ def parse_case_options(case: dict[str, Any]) -> dict[str, str]:
         i += 1
     out.setdefault("bidirectional", "0")
     return out
+
+
+def cap_option_string(value: str | None, cap: int) -> str:
+    if value is None:
+        return str(cap)
+    try:
+        return str(min(int(value), cap))
+    except ValueError:
+        return value
+
+
+def effective_case_options(case: dict[str, Any], pair_has_apple_rdma: bool) -> dict[str, str]:
+    opts = parse_case_options(case)
+    if pair_has_apple_rdma and case_connection(case) == "UC":
+        opts.setdefault("mtu", str(APPLE_UC_MTU))
+        if perftest_verb(case) == "send":
+            opts["tx_depth"] = cap_option_string(opts.get("tx_depth"), APPLE_UC_QUEUE_DEPTH)
+            opts["rx_depth"] = cap_option_string(opts.get("rx_depth"), APPLE_UC_QUEUE_DEPTH)
+    return opts
 
 
 def strip_option(argv: list[str], flags: set[str]) -> list[str]:
@@ -569,12 +599,56 @@ def strip_option(argv: list[str], flags: set[str]) -> list[str]:
     return out
 
 
+def option_value(argv: list[str], flags: set[str]) -> str | None:
+    i = 0
+    while i < len(argv):
+        item = argv[i]
+        if item in flags and i + 1 < len(argv):
+            return argv[i + 1]
+        for flag in flags:
+            prefix = flag + "="
+            if item.startswith(prefix):
+                return item[len(prefix):]
+        i += 1
+    return None
+
+
+def append_default_option(argv: list[str], flags: set[str], flag: str, value: int) -> None:
+    if option_value(argv, flags) is None:
+        argv.extend([flag, str(value)])
+
+
+def cap_int_option(argv: list[str], flags: set[str], flag: str, value: int) -> list[str]:
+    current = option_value(argv, flags)
+    if current is None:
+        argv.extend([flag, str(value)])
+        return argv
+    try:
+        capped = min(int(current), value)
+    except ValueError:
+        return argv
+    argv = strip_option(argv, flags)
+    argv.extend([flag, str(capped)])
+    return argv
+
+
+def case_connection(case: dict[str, Any]) -> str:
+    argv = [str(x) for x in case.get("argv", [])]
+    return (option_value(argv, {"--connection", "-c"}) or "RC").upper()
+
+
+def is_apple_rdma_dev(dev: str) -> bool:
+    return dev.startswith(APPLE_RDMA_DEV_PREFIX)
+
+
 def build_perftest_command(
     case: dict[str, Any],
     *,
     perftest_path: str,
     rdma_lib: str,
     pair_has_darwin: bool,
+    pair_has_apple_rdma: bool,
+    host_is_darwin: bool,
     dev: str,
     gid_index: int,
     port: int,
@@ -586,6 +660,11 @@ def build_perftest_command(
         [str(x) for x in case.get("argv", [])],
         {"--ib-dev", "-d", "--gid-index", "-x", "--port", "-p", "--out_json_file"},
     )
+    if pair_has_apple_rdma and case_connection(case) == "UC":
+        append_default_option(argv, {"--mtu", "-m"}, "--mtu", APPLE_UC_MTU)
+        if perftest_verb(case) == "send":
+            argv = cap_int_option(argv, {"--tx-depth", "-t"}, "--tx-depth", APPLE_UC_QUEUE_DEPTH)
+            argv = cap_int_option(argv, {"--rx-depth", "-r"}, "--rx-depth", APPLE_UC_QUEUE_DEPTH)
     argv.extend(["--ib-dev", dev, "--gid-index", str(gid_index), "--port", str(port), "-F"])
     if pair_has_darwin and "--use_old_post_send" not in argv:
         # Apple perftest is built with --disable-ibv_wr_api; force both sides
@@ -602,12 +681,13 @@ def build_perftest_command(
     bin_path = f"{perftest_path}/bin/{case['bin']}"
     quoted = " ".join(shlex.quote(str(arg)) for arg in argv)
     lib_prefix = f"LD_LIBRARY_PATH={shlex.quote(rdma_lib + '/lib')} " if rdma_lib else ""
+    timeout_prefix = "" if host_is_darwin else f"timeout {shlex.quote(str(timeout))} "
     return (
         "set -euo pipefail; "
         f"mkdir -p {shlex.quote(str(Path(remote_json).parent))}; "
         f"cd {shlex.quote(str(Path(remote_json).parent))}; "
         f"{lib_prefix}"
-        f"timeout {shlex.quote(str(timeout))} {shlex.quote(bin_path)} {quoted}"
+        f"{timeout_prefix}{shlex.quote(bin_path)} {quoted}"
     )
 
 
@@ -702,6 +782,7 @@ def run_pair(
     client_rdma_lib: str,
     server_dev: str,
     client_dev: str,
+    peer_addr: str,
     gid_index: int,
     port: int,
     timeout: int,
@@ -710,12 +791,17 @@ def run_pair(
     remote_dir = f"/tmp/tbv-perftest/{run_id}"
     server_json = f"{remote_dir}/server.json"
     client_json = f"{remote_dir}/client.json"
-    pair_has_darwin = "Darwin" in (HOST_SYSTEM.get(server), HOST_SYSTEM.get(client))
+    server_is_darwin = HOST_SYSTEM.get(server) == "Darwin"
+    client_is_darwin = HOST_SYSTEM.get(client) == "Darwin"
+    pair_has_darwin = server_is_darwin or client_is_darwin
+    pair_has_apple_rdma = is_apple_rdma_dev(server_dev) or is_apple_rdma_dev(client_dev)
     server_cmd = build_perftest_command(
         case,
         perftest_path=server_perftest,
         rdma_lib=server_rdma_lib,
         pair_has_darwin=pair_has_darwin,
+        pair_has_apple_rdma=pair_has_apple_rdma,
+        host_is_darwin=server_is_darwin,
         dev=server_dev,
         gid_index=gid_index,
         port=port,
@@ -728,12 +814,14 @@ def run_pair(
         perftest_path=client_perftest,
         rdma_lib=client_rdma_lib,
         pair_has_darwin=pair_has_darwin,
+        pair_has_apple_rdma=pair_has_apple_rdma,
+        host_is_darwin=client_is_darwin,
         dev=client_dev,
         gid_index=gid_index,
         port=port,
         timeout=timeout,
         remote_json=client_json,
-        peer=server,
+        peer=peer_addr,
     )
 
     server_proc = subprocess.Popen(
@@ -743,11 +831,33 @@ def run_pair(
         text=True,
     )
     time.sleep(server_start_delay)
-    client_proc = run_ssh(client, client_cmd, check=False, timeout=timeout + 20)
+    try:
+        client_proc = run_ssh(client, client_cmd, check=False, timeout=timeout + 20)
+    except subprocess.TimeoutExpired as exc:
+        cleanup_remote_run(server, remote_dir)
+        cleanup_remote_run(client, remote_dir)
+        server_proc.terminate()
+        try:
+            server_stdout, _ = server_proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            server_proc.kill()
+            server_stdout, _ = server_proc.communicate()
+        stdout = exc.stdout or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(errors="replace")
+        return "fail", {}, f"client ssh timeout: {str(stdout).strip()[-800:]}", {
+            "server_stdout": server_stdout,
+            "client_stdout": stdout,
+            "server_returncode": server_proc.returncode,
+            "client_returncode": None,
+            "server_json": load_remote_json(server, server_json),
+            "client_json": load_remote_json(client, client_json),
+        }
     server_reap_error = ""
     try:
         server_stdout, _ = server_proc.communicate(timeout=15)
     except subprocess.TimeoutExpired:
+        cleanup_remote_run(server, remote_dir)
         server_proc.terminate()
         try:
             server_stdout, _ = server_proc.communicate(timeout=5)
@@ -850,12 +960,29 @@ def parse_hosts(value: str) -> tuple[str, str]:
     return parts[0], parts[1]
 
 
+def parse_host_map(value: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not value:
+        return out
+    for part in re.split(r"[, ]+", value):
+        if not part:
+            continue
+        host, sep, addr = part.partition("=")
+        if not sep or not host or not addr:
+            die("--data-addrs entries must look like host=addr")
+        out[host] = addr
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a Nix-generated perftest benchmark plan.")
     parser.add_argument("--plan", required=True)
     parser.add_argument("--server")
     parser.add_argument("--client")
     parser.add_argument("--hosts", help="Shortcut for --server A --client B")
+    parser.add_argument("--server-data-addr", help="address clients should use to connect to the server host")
+    parser.add_argument("--client-data-addr", help="address clients should use to connect to the client host when directions reverse")
+    parser.add_argument("--data-addrs", help="comma-separated host=addr map for perftest's data connection target")
     parser.add_argument("--dev")
     parser.add_argument("--server-dev", help="override --dev on the server side (asymmetric pairs)")
     parser.add_argument("--client-dev", help="override --dev on the client side (asymmetric pairs)")
@@ -900,7 +1027,18 @@ def main() -> int:
         server: args.server_dev or dev,
         client: args.client_dev or dev,
     }
-    gid_index = args.gid_index if args.gid_index is not None else int(defaults["gidIndex"])
+    host_data_addr = {
+        server: args.server_data_addr or server,
+        client: args.client_data_addr or client,
+    }
+    host_data_addr.update(parse_host_map(args.data_addrs or ""))
+    pair_has_apple_rdma = is_apple_rdma_dev(host_dev[server]) or is_apple_rdma_dev(host_dev[client])
+    if args.gid_index is not None:
+        gid_index = args.gid_index
+    elif pair_has_apple_rdma:
+        gid_index = APPLE_UC_GID_INDEX
+    else:
+        gid_index = int(defaults["gidIndex"])
     backend = args.backend if args.backend is not None else defaults.get("backend")
     netdev = args.netdev or defaults.get("netdev")
     if args.no_rail_check:
@@ -1002,7 +1140,7 @@ def main() -> int:
                         assert_topology(run_server, before_server, expect_rails, expect_speed)
                         assert_topology(run_client, before_client, expect_rails, expect_speed)
 
-                        opts = parse_case_options(case)
+                        opts = effective_case_options(case, pair_has_apple_rdma)
                         row: dict[str, Any] = {
                             "timestamp_utc": now_utc(),
                             "plan": plan["name"],
@@ -1021,7 +1159,15 @@ def main() -> int:
                             "module_ko_path": identity_server.get("ko_path", ""),
                             "iommu": identity_server.get("iommu", ""),
                             "direction": direction_name,
-                            "dev": dev,
+                            "dev": (
+                                host_dev[run_server]
+                                if host_dev[run_server] == host_dev[run_client]
+                                else f"{host_dev[run_server]}->{host_dev[run_client]}"
+                            ),
+                            "server_dev": host_dev[run_server],
+                            "client_dev": host_dev[run_client],
+                            "server_data_addr": host_data_addr.get(run_server, run_server),
+                            "client_data_addr": host_data_addr.get(run_client, run_client),
                             "gid_index": str(gid_index),
                             "port": str(port),
                             "status": "",
@@ -1043,6 +1189,7 @@ def main() -> int:
                             client_rdma_lib=rdma_core_for(run_client),
                             server_dev=host_dev[run_server],
                             client_dev=host_dev[run_client],
+                            peer_addr=host_data_addr.get(run_server, run_server),
                             gid_index=gid_index,
                             port=port,
                             timeout=timeout,
