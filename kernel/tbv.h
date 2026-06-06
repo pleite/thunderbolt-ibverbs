@@ -631,10 +631,12 @@ struct tbv_state {
 	atomic64_t data_rx_send_sequence_error;
 	atomic64_t data_rx_active_timeout;
 	atomic64_t data_rx_active_retry;
+	atomic64_t data_rx_active_duplicate_refresh;
 	atomic64_t data_rx_active_write_flush;
 	atomic64_t data_rx_active_write_imm_flush;
 	atomic64_t data_rx_reorder_buffered;
 	atomic64_t data_rx_reorder_delivered;
+	atomic64_t data_rx_reorder_duplicate_refresh;
 	atomic64_t data_rx_reorder_dropped;
 	atomic64_t data_rx_reorder_timeout;
 	atomic64_t data_rx_reorder_retry;

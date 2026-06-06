@@ -8357,6 +8357,20 @@ static bool tbv_rx_reorder_fragment_matches_locked(
 	return false;
 }
 
+static void tbv_rx_refresh_reorder_duplicate_locked(struct tbv_state *state,
+						    struct tbv_rx_reorder_msg *msg)
+{
+	msg->first_jiffies = jiffies;
+	atomic64_inc(&state->data_rx_reorder_duplicate_refresh);
+}
+
+static void tbv_rx_refresh_active_duplicate(struct tbv_state *state,
+					    unsigned long *started_jiffies)
+{
+	*started_jiffies = jiffies;
+	atomic64_inc(&state->data_rx_active_duplicate_refresh);
+}
+
 static void tbv_rx_record_send_error(struct tbv_state *state,
 				     const char *source, struct tbv_qp *tqp,
 				     u32 src_qp, u32 psn, int status,
@@ -9024,6 +9038,7 @@ static void tbv_rx_buffer_fragment_locked(struct tbv_state *state,
 					      "reorder collision", true);
 			return;
 		}
+		tbv_rx_refresh_reorder_duplicate_locked(state, msg);
 		if (msg->complete)
 			tbv_rx_drain_reorder_locked(state, tqp, rx_path);
 		return;
@@ -9138,6 +9153,7 @@ static void tbv_rx_buffer_write_fragment_locked(
 					     TBV_NATIVE_SEND_ACK_ERROR);
 			return;
 		}
+		tbv_rx_refresh_reorder_duplicate_locked(state, msg);
 		if (msg->complete)
 			tbv_rx_drain_reorder_locked(state, tqp, rx_path);
 		return;
@@ -9272,6 +9288,7 @@ static void tbv_rx_buffer_write_imm_fragment_locked(
 						     TBV_NATIVE_SEND_ACK_ERROR);
 				return;
 			}
+			tbv_rx_refresh_reorder_duplicate_locked(state, msg);
 			if (msg->complete)
 				tbv_rx_drain_reorder_locked(state, tqp, rx_path);
 			return;
@@ -9433,6 +9450,11 @@ static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 			msg->frags_received++;
 			msg->received += hdr->length;
 			msg->started_jiffies = jiffies;
+		} else {
+			tbv_rx_note_active_path(msg, rx_path, offset,
+						hdr->length);
+			tbv_rx_refresh_active_duplicate(
+				state, &msg->started_jiffies);
 		}
 
 		if (msg->frags_received == msg->frag_count) {
@@ -9477,9 +9499,17 @@ static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 				u32 duplicate = msg->received - offset;
 
 				if (duplicate >= hdr->length) {
+					tbv_rx_note_active_path(msg, rx_path,
+								offset,
+								hdr->length);
+					tbv_rx_refresh_active_duplicate(
+						state,
+						&msg->started_jiffies);
 					mutex_unlock(&tqp->rx_lock);
 					return;
 				}
+				tbv_rx_refresh_active_duplicate(
+					state, &msg->started_jiffies);
 				copy_payload = (const u8 *)payload + duplicate;
 				copy_offset = msg->received;
 				copy_len = hdr->length - duplicate;
@@ -9727,9 +9757,15 @@ static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
 			u32 duplicate = wrx->received - offset;
 
 			if (duplicate >= hdr->length) {
+				wrx->last_offset = offset;
+				wrx->last_len = hdr->length;
+				tbv_rx_refresh_active_duplicate(
+					state, &wrx->started_jiffies);
 				mutex_unlock(&tqp->rx_lock);
 				return;
 			}
+			tbv_rx_refresh_active_duplicate(
+				state, &wrx->started_jiffies);
 			copy_payload = (const u8 *)payload + duplicate;
 			copy_offset = wrx->received;
 			copy_len = hdr->length - duplicate;

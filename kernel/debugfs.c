@@ -507,6 +507,8 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_active_timeout));
 	seq_printf(s, "data_rx_active_retry: %lld\n",
 		   atomic64_read(&state->data_rx_active_retry));
+	seq_printf(s, "data_rx_active_duplicate_refresh: %lld\n",
+		   atomic64_read(&state->data_rx_active_duplicate_refresh));
 	seq_printf(s, "data_rx_active_write_flush: %lld\n",
 		   atomic64_read(&state->data_rx_active_write_flush));
 	seq_printf(s, "data_rx_active_write_imm_flush: %lld\n",
@@ -515,6 +517,8 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_reorder_buffered));
 	seq_printf(s, "data_rx_reorder_delivered: %lld\n",
 		   atomic64_read(&state->data_rx_reorder_delivered));
+	seq_printf(s, "data_rx_reorder_duplicate_refresh: %lld\n",
+		   atomic64_read(&state->data_rx_reorder_duplicate_refresh));
 	seq_printf(s, "data_rx_reorder_dropped: %lld\n",
 		   atomic64_read(&state->data_rx_reorder_dropped));
 	seq_printf(s, "data_rx_reorder_timeout: %lld\n",
