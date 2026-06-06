@@ -16,6 +16,7 @@
 #include <linux/ip.h>
 #include <linux/jiffies.h>
 #include <linux/kthread.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/mmzone.h>
 #include <linux/netdevice.h>
@@ -593,6 +594,9 @@ struct tbv_send_ctx {
 	u32 dv_opcode;
 	u32 dv_byte_len;
 	u32 dv_imm_data;
+	u64 dv_tx_start_ns;
+	u32 dv_local_mr_bucket;
+	u32 dv_local_addr_bucket;
 	atomic_t apple_pending;
 	atomic_t tx_pending;
 	u8 retries;
@@ -604,6 +608,8 @@ struct tbv_send_ctx {
 	bool signaled;
 	bool dv_origin;
 	bool dv_cqe_needed;
+	bool dv_write_timing_valid;
+	bool dv_write_timing_counted;
 	bool completed;
 	bool ready;
 	bool pending;
@@ -3869,6 +3875,7 @@ static void tbv_send_tx_done(void *ctx, int status)
 {
 	struct tbv_send_ctx *send = ctx;
 	struct tbv_qp *tqp = send->tqp;
+	bool note_dv_write_timing = false;
 
 	if (send->retryable) {
 		unsigned long flags;
@@ -3882,8 +3889,30 @@ static void tbv_send_tx_done(void *ctx, int status)
 				tbv_send_mark_queued(send, jiffies);
 				tbv_qp_schedule_timeout_locked(tqp);
 			}
+			if (!status && send->dv_write_timing_valid &&
+			    !send->dv_write_timing_counted) {
+				send->dv_write_timing_counted = true;
+				note_dv_write_timing = true;
+			}
 		}
 		spin_unlock_irqrestore(&tqp->lock, flags);
+	}
+
+	if (note_dv_write_timing) {
+		struct tbv_state *state = tqp->owner;
+		u64 elapsed = ktime_get_ns() - send->dv_tx_start_ns;
+		u32 mr_bucket = send->dv_local_mr_bucket;
+		u32 addr_bucket = send->dv_local_addr_bucket;
+
+		atomic64_inc(&state->dv_write_tx_mr_bucket_count[mr_bucket]);
+		atomic64_add(elapsed, &state->dv_write_tx_mr_bucket_ns[mr_bucket]);
+		atomic64_add(send->total_len,
+			     &state->dv_write_tx_mr_bucket_bytes[mr_bucket]);
+		atomic64_inc(&state->dv_write_tx_addr_bucket_count[addr_bucket]);
+		atomic64_add(elapsed,
+			     &state->dv_write_tx_addr_bucket_ns[addr_bucket]);
+		atomic64_add(send->total_len,
+			     &state->dv_write_tx_addr_bucket_bytes[addr_bucket]);
 	}
 
 	if (!status) {
@@ -6027,6 +6056,7 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr,
 	bool is_write = wr->opcode == IB_WR_RDMA_WRITE ||
 			wr->opcode == IB_WR_RDMA_WRITE_WITH_IMM;
 	bool write_with_imm = wr->opcode == IB_WR_RDMA_WRITE_WITH_IMM;
+	u64 dv_tx_start_ns = dv_post && is_write ? ktime_get_ns() : 0;
 	int ret;
 
 	ret = tbv_qp_post_status(tqp, !!dv_post);
@@ -6141,6 +6171,20 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr,
 	memcpy(ctx->segs, segs, sizeof(ctx->segs));
 	memset(segs, 0, sizeof(segs));
 	nsegs = 0;
+	if (dv_post && is_write && ctx->nsegs > 0 && ctx->segs[0].mr) {
+		u64 mr_offset = ctx->segs[0].addr - ctx->segs[0].mr->start;
+		u32 mr_bucket = mr_offset >> TBV_DV_WRITE_LOCAL_BUCKET_SHIFT;
+		u32 addr_bucket =
+			ctx->segs[0].addr >> TBV_DV_WRITE_LOCAL_BUCKET_SHIFT;
+
+		if (mr_bucket >= TBV_DV_WRITE_LOCAL_BUCKETS)
+			mr_bucket = TBV_DV_WRITE_LOCAL_BUCKETS - 1;
+		addr_bucket &= TBV_DV_WRITE_LOCAL_BUCKETS - 1;
+		ctx->dv_tx_start_ns = dv_tx_start_ns;
+		ctx->dv_local_mr_bucket = mr_bucket;
+		ctx->dv_local_addr_bucket = addr_bucket;
+		ctx->dv_write_timing_valid = !!dv_tx_start_ns;
+	}
 	ctx->opcode = send_with_imm ? TBV_NATIVE_DATA_OP_SEND_IMM :
 		      is_send ? TBV_NATIVE_DATA_OP_SEND :
 		      write_with_imm ? TBV_NATIVE_DATA_OP_RDMA_WRITE_IMM :

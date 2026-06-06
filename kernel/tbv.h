@@ -38,6 +38,8 @@
 #define TBV_APPLE_FRAME_SIZE SZ_4K
 #define TBV_APPLE_MAX_MSG_SIZE SZ_16M
 #define TBV_RX_NO_QP_OPCODE_SLOTS 16
+#define TBV_DV_WRITE_LOCAL_BUCKETS 8
+#define TBV_DV_WRITE_LOCAL_BUCKET_SHIFT 26
 
 static inline bool tbv_dma_device_ready(const struct device *dev)
 {
@@ -667,6 +669,12 @@ struct tbv_state {
 	atomic64_t dv_backpressure_retry;
 	atomic64_t dv_fence_retry;
 	atomic64_t dv_hard_error;
+	atomic64_t dv_write_tx_mr_bucket_count[TBV_DV_WRITE_LOCAL_BUCKETS];
+	atomic64_t dv_write_tx_mr_bucket_ns[TBV_DV_WRITE_LOCAL_BUCKETS];
+	atomic64_t dv_write_tx_mr_bucket_bytes[TBV_DV_WRITE_LOCAL_BUCKETS];
+	atomic64_t dv_write_tx_addr_bucket_count[TBV_DV_WRITE_LOCAL_BUCKETS];
+	atomic64_t dv_write_tx_addr_bucket_ns[TBV_DV_WRITE_LOCAL_BUCKETS];
+	atomic64_t dv_write_tx_addr_bucket_bytes[TBV_DV_WRITE_LOCAL_BUCKETS];
 	atomic64_t native_legacy_ambiguous_limited;
 	struct xarray verbs_mrs_xa;
 	struct xarray verbs_qps_xa;

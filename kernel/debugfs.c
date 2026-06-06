@@ -184,6 +184,25 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->dv_fence_retry));
 	seq_printf(s, "dv_hard_error: %lld\n",
 		   atomic64_read(&state->dv_hard_error));
+	for (i = 0; i < TBV_DV_WRITE_LOCAL_BUCKETS; i++) {
+		seq_printf(s, "dv_write_tx_mr_bucket_%u_count: %lld\n", i,
+			   atomic64_read(
+				   &state->dv_write_tx_mr_bucket_count[i]));
+		seq_printf(s, "dv_write_tx_mr_bucket_%u_ns: %lld\n", i,
+			   atomic64_read(&state->dv_write_tx_mr_bucket_ns[i]));
+		seq_printf(s, "dv_write_tx_mr_bucket_%u_bytes: %lld\n", i,
+			   atomic64_read(
+				   &state->dv_write_tx_mr_bucket_bytes[i]));
+		seq_printf(s, "dv_write_tx_addr_bucket_%u_count: %lld\n", i,
+			   atomic64_read(
+				   &state->dv_write_tx_addr_bucket_count[i]));
+		seq_printf(s, "dv_write_tx_addr_bucket_%u_ns: %lld\n", i,
+			   atomic64_read(
+				   &state->dv_write_tx_addr_bucket_ns[i]));
+		seq_printf(s, "dv_write_tx_addr_bucket_%u_bytes: %lld\n", i,
+			   atomic64_read(
+				   &state->dv_write_tx_addr_bucket_bytes[i]));
+	}
 	seq_printf(s, "data_wr_send: %lld\n",
 		   atomic64_read(&state->data_wr_send));
 	seq_printf(s, "data_wr_op_send: %lld\n",
