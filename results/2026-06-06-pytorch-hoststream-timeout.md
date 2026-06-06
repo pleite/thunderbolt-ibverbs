@@ -1029,3 +1029,40 @@ remaining engineering question is policy, not localization: whether to enable
 this in the Strix test profile now and then reduce/control the RNR pressure, or
 keep it as an explicit benchmark knob until a same-boot disabled control gives
 a cleaner probability comparison.
+
+The Strix Nix profile was then updated to persist the knob:
+
+```text
+nixos-config: 8f56404 strix: enable WRITE gap RNR repair
+```
+
+After `colmena apply boot --on strix-1,strix-2 --reboot`, both hosts came back
+with `native_write_gap_rnr=Y`, four verbs QPs, and clean counters:
+
+```text
+strix-1 current system: /nix/store/zwjp3rwrddl129cpv5myik1mrzixzhz2-nixos-system-strix-1-26.11pre-git
+strix-2 current system: /nix/store/swsgxzfg6bxw3nlfwss7kkysd333n67i-nixos-system-strix-2-26.11pre-git
+```
+
+Post-persistence smoke:
+
+```text
+log root: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-writegaprnr-persisted10-qptimeout14-20260606-173551
+status: pass, 10/10
+2MiB timing count/max: 10 / 114010.6 us
+data_wr_retransmit: 0
+data_wr_rnr_retransmit: 46
+data_rx_ack_match_retried/data_rx_ack_match_over_64ms: 935/125
+data_rx_write_gap_rnr: 1824
+data_tx_ack_rnr/data_rx_ack_rnr: 1824/1824
+data_rx_active_timeout/data_rx_reorder_timeout: 0/0
+data_wr_timeout/data_wr_retry_exhausted: 0/0
+data_wr_rnr_retry_exhausted: 0
+dv_hard_error: 0
+data_tx_errors: 0
+data_tx_posted/data_tx_completed: 111025/111025
+```
+
+This makes the current Strix application-test baseline: native E2E disabled on
+AMD, duplicate replay refresh present, RNR tx-pending defer present, and
+targeted WRITE gap RNR enabled in the host profile.
