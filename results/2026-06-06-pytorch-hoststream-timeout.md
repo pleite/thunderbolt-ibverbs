@@ -1122,3 +1122,94 @@ This is the first broad application-level pass after the correctness fixes. It
 does not replace longer workload benchmarking, but it moves the branch from
 "focused PyTorch all_to_all still fails" to "RCCL alltoall/alltoallv and
 PyTorch all_reduce/all_gather/all_to_all all pass a small multi-mode gate."
+
+## Focused Host-Stream Exchange Tail
+
+The app-gate summarizer was extended so broad runs are reproducible without
+one-off parsing:
+
+```text
+8b8a00b bench: summarize broad app gate logs
+8555c1a bench: summarize hoststream phase timing
+```
+
+`tbv_app_gate_summarize.sh` now emits PyTorch timing aggregates, RCCL
+rccl-tests timing/validation aggregates, compact counter aggregates, and
+host-stream phase aggregates from
+`RCCL_ROCSHMEM_HOST_STREAM_TIMING` lines. The phase table is keyed by app mode,
+RCCL bench mode, `msgSize`, `rankOffset`, and `symId`, and reports exchange
+p50/p90/p95/p99/max.
+
+Fresh focused run on the persisted Strix profile:
+
+```text
+log root: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-exchange-tail-writegaprnr20-qptimeout14-20260606-175409
+status: pass, 20/20
+collective: torch.distributed all_to_all_single
+mode: hoststream, validated payloads
+sizes: 1048576,2097152 bytes/rank
+iters: 8
+RCCL_ROCSHMEM_THRESHOLD=4194304
+RCCL_ROCSHMEM_GDA_BENCH_MODE=0
+RCCL_ROCSHMEM_HOST_STREAM_TIMING=1
+ROCSHMEM_GDA_QP_TIMEOUT=14
+loaded RCCL: /mnt/Home/tmp/rccl-hoststream-waitbudget-install/lib/librccl.so.1.0
+```
+
+Application timing aggregate:
+
+```text
+1MiB/rank: n=20 min=9652.0us avg=17350.5us max=86441.5us
+2MiB/rank: n=20 min=21358.5us avg=35562.9us max=138420.2us
+```
+
+Host-stream phase aggregate:
+
+```text
+msgSize  rankOffset symId n   copyIn_avg exchange_avg exchange_p50 exchange_p90 exchange_p95 exchange_p99 exchange_max copyOut_avg total_avg total_p90 total_max
+2097152  1048576    0     200 0.031      4.972        2.039        7.261        22.257       38.388       75.578       0.035       5.038     7.326     75.642
+2097152  1048576    1     160 0.032      29.133       20.554       32.182       57.876       204.695      204.697      0.035       29.200    32.245    204.771
+4194304  2097152    0     160 0.055      10.300       4.276        22.583       26.456       93.549       93.572       0.064       10.420    22.706    93.687
+4194304  2097152    1     200 0.056      68.516       41.613       124.037      141.672      258.423      752.788      0.064       68.635    124.149   752.905
+```
+
+Counter aggregate:
+
+```text
+wr_retx=0
+rnr_retx=183
+ack_retry/ack64=2380/376
+late_ack/dup_ack=4814/87
+write_gap_rnr=6603
+tx_rnr/rx_rnr=6603/6603
+reorder_timeout/active_timeout=0/0
+rnr_retry_exhausted=0
+dv_hard_error=0
+wr_timeout/wr_retry_exhausted=0/0
+data_tx_errors=0
+data_tx_posted/data_tx_completed=394854/394854
+```
+
+Post-run host health stayed clean:
+
+```text
+strix-1: native_write_gap_rnr=Y verbs_qps=4 dv_poll_wqes=1040
+         data_tx=656928/656928 data_tx_errors=0
+         data_wr_timeout=0 data_wr_retry_exhausted=0
+         data_rx_no_qp=0 data_rx_canceled=0
+         data_rx_active_timeout=0 data_rx_reorder_timeout=0
+
+strix-2: native_write_gap_rnr=Y verbs_qps=4 dv_poll_wqes=1040
+         data_tx=665336/665336 data_tx_errors=0
+         data_wr_timeout=0 data_wr_retry_exhausted=0
+         data_rx_no_qp=0 data_rx_canceled=0
+         data_rx_active_timeout=0 data_rx_reorder_timeout=0
+```
+
+Interpretation: the focused app-level GDA window is correctness-clean on this
+profile, but still performance-unstable. Copy-in/copy-out are negligible; the
+dominant cost is the rocSHMEM exchange phase. The slow path is consistently
+`symId=1`, and the 4 MiB RCCL message-size row has an especially large tail
+(`exchange_p99=258ms`, `exchange_max=753ms`). The next bottleneck investigation
+should target why the host-stream exchange alternates between fast `symId=0`
+and much slower/tailier `symId=1` rather than changing kernel correctness policy.
