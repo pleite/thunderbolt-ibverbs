@@ -20,6 +20,8 @@
 #include <linux/workqueue.h>
 #include <linux/xarray.h>
 
+#include "proto/config.h"
+
 #define TBV_DRV_NAME "thunderbolt_ibverbs"
 #define TBV_ETH_ALEN 6
 #define TBV_NATIVE_PROTOCOL_KEY "tbverbs"
@@ -186,16 +188,27 @@ struct tbv_path {
 	struct list_head tx_control_queue;
 	struct list_head tx_data_queue;
 	struct list_head tx_zcopy_inflight;
+	struct delayed_work tx_poll_work;
+	struct delayed_work rx_supp_poll_work;
 	atomic_t tx_inflight;
 	atomic64_t data_tx_enqueued;
 	atomic64_t data_tx_posted;
 	atomic64_t data_tx_completed;
+	atomic64_t control_tx_enqueued;
+	atomic64_t control_tx_posted;
+	atomic64_t control_tx_completed;
+	atomic64_t control_tx_queue_max_ms;
 	atomic64_t data_tx_credit_stalls;
 	atomic64_t data_tx_credit_received;
 	atomic64_t data_rx_completed;
 	atomic64_t data_rx_credit_sent;
 	atomic64_t data_rx_credit_send_error;
 	atomic64_t data_rx_repost_failed;
+	atomic64_t tx_poll_calls;
+	atomic64_t tx_poll_completed;
+	atomic64_t rx_supp_poll_calls;
+	atomic64_t rx_supp_poll_completed;
+	unsigned long rx_supp_poll_until;
 	u8 rx_raw_opcode;
 	u8 rx_raw_flags;
 	u32 rx_raw_dest_qp;
@@ -207,8 +220,12 @@ struct tbv_path {
 	u32 rx_raw_remaining;
 	u64 rx_raw_base;
 	bool rx_raw_pending;
+	bool tx_poll_enabled;
+	bool rx_supp_poll_enabled;
 	bool tx_scheduling;
 	bool tx_raw_stream_active;
+	bool tx_raw_stream_end_seen;
+	u32 tx_raw_stream_inflight;
 	void *tx_raw_stream_owner;
 	int local_transmit_path;
 	int local_tx_hop;
@@ -231,6 +248,7 @@ struct tbv_rail {
 	 * has not yet reached the data-ready edge (or has been torn down).
 	 */
 	struct tbv_ibdev *ibdev;
+	atomic_t native_qp_bind_count;
 	u32 rail_id;
 	u32 link_speed;
 	u32 link_width;
@@ -262,6 +280,12 @@ struct tbv_rail {
 	 * otherwise cause.
 	 */
 	bool ibdev_register_failed;
+	/*
+	 * Retryable registration blocker. A ready rail can reach verbs
+	 * registration before the configured RoCE netdev exists; keep it out of
+	 * the catchup loop until a matching netdev notifier event retries it.
+	 */
+	bool ibdev_register_deferred;
 	bool native_negotiated;
 	bool native_ready_sent;
 	bool native_remote_ready;
@@ -279,6 +303,7 @@ struct tbv_peer {
 	struct ida rail_ids;
 	/* Serializes XDomain control and tunnel setup transactions per link. */
 	struct mutex control_lock;
+	u32 native_qp_rr_rail_id;
 	u32 nr_rails;
 };
 
@@ -390,11 +415,23 @@ struct tbv_tbnet_identity_config {
 	bool minimal_apple_only;
 };
 
+#define TBV_CONFIGURED_LINK_NAME_LEN (TBV_CFG_LINK_NAME_MAX + 1u)
+
+struct tbv_configured_link {
+	struct list_head node;
+	u32 link_id;
+	enum tbv_backend_type backend;
+	struct tbv_id_selection app_selection;
+	char name[TBV_CONFIGURED_LINK_NAME_LEN];
+};
+
 struct tbv_state {
 	struct tbv_resolved_config cfg;
 	struct mutex lock;
 	struct list_head peers;
+	struct list_head configured_links;
 	u32 next_peer_id;
+	u32 configured_link_count;
 	struct tbv_tbnet_identity tbnet_identity;
 	struct tb_property_dir *native_dirs[TBV_NATIVE_MAX_LANES];
 	u32 native_dir_count;
@@ -417,6 +454,7 @@ struct tbv_state {
 	bool apple_tunnels_pending;
 	struct work_struct apple_tunnel_work;
 	struct workqueue_struct *workqueue;
+	struct notifier_block ibdev_netdev_nb;
 	atomic_t verbs_ucontexts;
 	atomic_t verbs_pds;
 	atomic_t verbs_cqs;
@@ -440,6 +478,11 @@ struct tbv_state {
 	atomic64_t data_wr_copy_error;
 	atomic64_t data_wr_path_send;
 	atomic64_t data_wr_path_send_error;
+	atomic64_t data_wr_retransmit;
+	atomic64_t data_wr_rnr_retransmit;
+	atomic64_t data_wr_retry_enqueue_error;
+	atomic64_t data_wr_retry_exhausted;
+	atomic64_t data_wr_rnr_retry_exhausted;
 	atomic64_t data_wr_timeout;
 	atomic64_t apple_sq_queued;
 	atomic64_t apple_sq_dequeued;
@@ -464,6 +507,22 @@ struct tbv_state {
 	atomic64_t data_rx_op_write;
 	atomic64_t data_rx_op_write_imm;
 	atomic64_t data_rx_ack;
+	atomic64_t data_rx_ack_matched;
+	atomic64_t data_rx_ack_match_retried;
+	atomic64_t data_rx_ack_match_max_ms;
+	atomic64_t data_rx_ack_match_current_max_ms;
+	atomic64_t data_rx_ack_match_over_10ms;
+	atomic64_t data_rx_ack_match_over_64ms;
+	atomic64_t data_rx_ack_miss;
+	atomic64_t data_rx_late_ack;
+	atomic64_t data_rx_ack_cumulative;
+	atomic64_t data_tx_ack_ok;
+	atomic64_t data_tx_ack_rnr;
+	atomic64_t data_tx_ack_error;
+	atomic64_t data_tx_ack_send_error;
+	atomic64_t data_rx_ack_rnr;
+	atomic64_t data_rx_duplicate_ack;
+	atomic64_t data_rx_ack_history_miss;
 	atomic64_t data_tx_read_ack_ok;
 	atomic64_t data_tx_read_ack_retry;
 	atomic64_t data_tx_read_ack_error;
@@ -491,7 +550,14 @@ struct tbv_state {
 	atomic64_t data_rx_unconnected_qp;
 	atomic64_t data_rx_qp_error;
 	atomic64_t data_rx_no_recv;
+	atomic64_t data_rx_rnr;
+	atomic64_t data_rx_rnr_suppressed;
 	atomic64_t data_rx_copy_error;
+	atomic64_t data_rx_send_len_error;
+	atomic64_t data_rx_send_prot_error;
+	atomic64_t data_rx_send_cq_error;
+	atomic64_t data_rx_send_bad_fragment;
+	atomic64_t data_rx_send_sequence_error;
 	atomic64_t data_rx_active_timeout;
 	atomic64_t data_rx_reorder_buffered;
 	atomic64_t data_rx_reorder_delivered;
@@ -519,6 +585,7 @@ struct tbv_state {
 	 * take state->lock.
 	 */
 	struct mutex rail_register_lock;
+	struct work_struct ibdev_netdev_retry_work;
 	/*
 	 * Up-event gate, owned by rail_register_lock. Set to true by
 	 * tbv_ibdev_start() before any rising-edge events may publish; cleared
@@ -527,6 +594,7 @@ struct tbv_state {
 	 * flag so existing devices can always be torn down.
 	 */
 	bool register_enabled;
+	bool ibdev_netdev_nb_registered;
 };
 
 struct dentry;
@@ -698,6 +766,19 @@ int tbv_path_send_owned_list_reserved(struct tbv_path *path,
 				      unsigned int flags,
 				      tbv_path_tx_done_fn done,
 				      void *done_ctx);
+int tbv_path_prepare_owned_list(struct tbv_path *path,
+				struct list_head *frames,
+				struct list_head *packets,
+				u32 *packet_count,
+				unsigned int flags,
+				tbv_path_tx_done_fn done,
+				void *done_ctx);
+int tbv_path_enqueue_prepared_reserved(struct tbv_path *path,
+				       struct list_head *packets,
+				       u32 packet_count,
+				       unsigned int flags);
+void tbv_path_release_prepared_list_silent(struct list_head *packets,
+					   int status);
 int tbv_path_send_marked_fill(struct tbv_path *path, u32 len,
 			      u8 sof, u8 eof, unsigned int flags,
 			      tbv_path_tx_fill_fn fill, void *fill_ctx,
@@ -715,8 +796,16 @@ void tbv_path_cancel_data_owner_ctx(struct tbv_path *path, void *owner_ctx);
 void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd);
 
 const struct tbv_backend_ops *tbv_backend_get(enum tbv_backend_type type);
+int tbv_link_activate_config(struct tbv_state *state, const char *name,
+			     enum tbv_backend_type backend,
+			     const struct tbv_cfg_link *cfg);
+void tbv_link_deactivate_config(struct tbv_state *state, u32 link_id);
+u32 tbv_link_count(struct tbv_state *state);
+void tbv_link_debugfs_show(struct seq_file *s, struct tbv_state *state);
 int tbv_debugfs_init(struct tbv_state *state);
 void tbv_debugfs_exit(struct tbv_state *state);
+int tbv_configfs_start(struct tbv_state *state);
+void tbv_configfs_stop(struct tbv_state *state);
 
 int tbv_core_init(struct tbv_state *state,
 		  const struct tbv_resolved_config *cfg,

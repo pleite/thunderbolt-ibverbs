@@ -35,11 +35,14 @@ int tbv_core_init(struct tbv_state *state,
 	mutex_init(&state->lock);
 	mutex_init(&state->rail_register_lock);
 	INIT_LIST_HEAD(&state->peers);
+	INIT_LIST_HEAD(&state->configured_links);
 	xa_init(&state->verbs_mrs_xa);
 	xa_init(&state->verbs_qps_xa);
 	state->next_peer_id = 1;
 	state->workqueue = alloc_workqueue("tbv_ibdev",
-					   WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+					   WQ_UNBOUND | WQ_MEM_RECLAIM |
+						   WQ_HIGHPRI,
+					   0);
 	if (!state->workqueue) {
 		mutex_destroy(&state->rail_register_lock);
 		mutex_destroy(&state->lock);
@@ -58,6 +61,13 @@ int tbv_core_init(struct tbv_state *state,
 
 	ret = tbv_debugfs_init(state);
 	if (ret) {
+		tbv_tbnet_identity_stop(&state->tbnet_identity);
+		goto err_destroy_wq;
+	}
+
+	ret = tbv_configfs_start(state);
+	if (ret) {
+		tbv_debugfs_exit(state);
 		tbv_tbnet_identity_stop(&state->tbnet_identity);
 		goto err_destroy_wq;
 	}
@@ -83,8 +93,16 @@ err_destroy_wq:
 
 void tbv_core_exit(struct tbv_state *state)
 {
+	u32 configured_link_count;
+
 	if (!list_empty(&state->peers))
 		pr_warn("unloading with live peers after service teardown\n");
+
+	tbv_configfs_stop(state);
+	configured_link_count = tbv_link_count(state);
+	if (configured_link_count)
+		pr_warn("unloading with %u configured links after configfs teardown\n",
+			configured_link_count);
 
 	if (state->workqueue) {
 		flush_workqueue(state->workqueue);
