@@ -4731,3 +4731,95 @@ fresh reboot. The recovered-loss path is active under application pressure
 without retry exhaustion, WR timeout, RX reorder timeout, canceled RX frames, or
 DV hard errors in this gate. Keep those recovery counters in every app benchmark
 summary; they are evidence of real transport loss being handled, not noise.
+
+### 2026-06-06 DV WRITE source-bucket TX timing
+
+Added kernel-side DV WRITE timing instrumentation:
+
+```text
+thunderbolt-ibverbs:
+  d4a217f kernel: bucket DV write TX timing by source offset
+
+debugfs counters:
+  dv_write_tx_mr_bucket_<0..7>_{count,ns,bytes}
+  dv_write_tx_addr_bucket_<0..7>_{count,ns,bytes}
+bucket size:
+  64 MiB
+timing span:
+  tbv_post_send_one() accepts a DV-origin RDMA WRITE
+  -> all native TX fragments for that send context drain successfully
+```
+
+NixOS deployment was repaired to use the active GDA worktree rather than an
+older thunderbolt-ibverbs checkout:
+
+```text
+nixos-config thunderbolt-ibverbs-kernel:
+  path:/mnt/Home/src/thunderbolt-ibverbs-gda-iommu-revive
+
+deploy:
+  nix run .#colmena -- --impure apply boot --reboot --on strix-1,strix-2
+
+strix-1 system:
+  /nix/store/7lhnxzhy00i4zwg2fsgxz6l2b57096dr-nixos-system-strix-1-26.11pre-git
+strix-2 system:
+  /nix/store/cfsjm8lgscvbkkqzyhr66a12l59wx9pf-nixos-system-strix-2-26.11pre-git
+module:
+  /nix/store/21gc4a0jvalpclcgakvanzza3acsrihn-thunderbolt-ibverbs-0.1.0
+```
+
+Post-reboot baseline:
+
+```text
+both hosts:
+  kernel: 7.0.10
+  verbs_qps: 4
+  dv_hard_error: 0
+  data_wr_timeout/data_wr_retry_exhausted: 0/0
+  data_tx_posted == data_tx_completed
+  data_tx_errors: 0
+  data_rx_canceled: 0
+  dv_write_tx_* counters present and initially zero
+```
+
+Payload-only PyTorch host-stream all-to-all, 1 MiB, two reps, four iterations
+per rep, `RCCL_ROCSHMEM_GDA_BENCH_MODE=2`, `usb4_alltoall_mode=1`,
+`usb4_alltoall_ack=0`, `RCCL_ROCSHMEM_THRESHOLD=4194304`,
+`num_sym_buf=4`, coherent source/destination backing:
+
+```text
+roots:
+  /mnt/Home/tmp/tbv-app-gate-logs/pytorch-kernelbucket-src0-dst0-20260606-212220
+  /mnt/Home/tmp/tbv-app-gate-logs/pytorch-kernelbucket-src0-dst3-20260606-212220
+  /mnt/Home/tmp/tbv-app-gate-logs/pytorch-kernelbucket-src3-dst0-20260606-212220
+
+case       pytorch_avg_us  exchange_avg_ms  kernel_mr_bucket  writes  bytes     kernel_avg_ms
+src0/dst0        2428.3            4.044       0                 16  16777216        1.513
+src0/dst3        3260.0            2.351       0                 16  16777216        1.235
+src3/dst0       28499.2           28.570       3                 16  16777216       27.680
+```
+
+All three roots passed with clean hard counters: no DV hard error, no WR
+timeout, no retry exhaustion, no TX error, and TX posted/completed balanced.
+Small RNR/write-gap recovery moved in the source-0 controls, but recovered
+without failed WRs.
+
+Interpretation:
+
+1. The source-slot penalty is visible inside the kernel on the DV WRITE native
+   TX-drain span. Source slot 3 maps to MR bucket 3 and costs about 27.7 ms per
+   1 MiB WRITE, while source slot 0 maps to MR bucket 0 and costs about
+   1.2-1.5 ms.
+2. Holding the source at slot 0 while moving the destination to slot 3 remains
+   fast in the kernel bucket timing. That separates the dominant effect from
+   remote destination offset.
+3. This rules out RCCL host-stream address selection, rocSHMEM pSync
+   signal/wait, and userspace WQE post as the primary source of the large
+   slot-3 latency. The remaining span is source-MR copy plus native frame
+   enqueue/TX completion in the module.
+
+Next discriminator: split the new `dv_write_tx_mr_bucket_*_ns` into source
+copy time and enqueue/TX-complete time. If bucket 3 is already slow during
+`tbv_copy_send_range()`, the issue is CPU/coherent-memory read behavior from
+that rocSHMEM source slot. If copy time is flat and the post-copy TX drain is
+slow, the issue is in native frame queueing/TX/DMA completion.

@@ -581,6 +581,91 @@ print_counter_aggregates() {
   ' "${logs[@]}" | sort -V
 }
 
+print_dv_write_tx_mr_bucket_aggregates() {
+  local root=$1
+  local -a before_files=()
+  local before after rel suite collective mode
+
+  mapfile -d '' -t before_files < <(
+    find "$root" -path '*/counters/*.before.*.summary' -type f -print0 | sort -z
+  )
+  ((${#before_files[@]} > 0)) || return 0
+
+  {
+    for before in "${before_files[@]}"; do
+      after=${before/.before./.after.}
+      [[ -f "$after" ]] || continue
+
+      rel=${before#"$root"/}
+      suite=unknown
+      collective=-
+      mode=-
+      IFS=/ read -r -a parts <<<"$rel"
+      if [[ ${parts[0]:-} == "pytorch" && -n ${parts[1]:-} ]]; then
+        suite=pytorch
+        mode=${parts[1]}
+      elif [[ ${parts[0]:-} == "rccl" && -n ${parts[1]:-} && -n ${parts[2]:-} ]]; then
+        suite=rccl
+        collective=${parts[1]}
+        mode=${parts[2]}
+      fi
+
+      awk -v suite="$suite" -v collective="$collective" -v mode="$mode" '
+        FNR == NR {
+          gsub(":", "", $1)
+          before[$1] = $2
+          next
+        }
+        {
+          gsub(":", "", $1)
+          after[$1] = $2
+        }
+        END {
+          for (i = 0; i < 8; i++) {
+            count_key = "dv_write_tx_mr_bucket_" i "_count"
+            ns_key = "dv_write_tx_mr_bucket_" i "_ns"
+            bytes_key = "dv_write_tx_mr_bucket_" i "_bytes"
+            count = (after[count_key] + 0) - (before[count_key] + 0)
+            ns = (after[ns_key] + 0) - (before[ns_key] + 0)
+            bytes = (after[bytes_key] + 0) - (before[bytes_key] + 0)
+            if (count || ns || bytes)
+              print suite, collective, mode, i, count, ns, bytes
+          }
+        }
+      ' "$before" "$after"
+    done
+  } | awk '
+    {
+      key = $1 SUBSEP $2 SUBSEP $3 SUBSEP $4
+      count[key] += $5
+      ns[key] += $6
+      bytes[key] += $7
+    }
+    END {
+      if (!length(count))
+        exit
+      for (key in count) {
+        split(key, p, SUBSEP)
+        avg_ms = count[key] ? ns[key] / count[key] / 1000000 : 0
+        printf "%s %s %s %s %d %d %.3f\n",
+          p[1], p[2], p[3], p[4], count[key], bytes[key], avg_ms
+      }
+    }
+  ' | sort -V | awk '
+    BEGIN {
+      printed = 0
+    }
+    {
+      if (!printed) {
+        printf "\ndv_write_tx_mr_bucket aggregates:\n"
+        printf "suite collective mode bucket count bytes avg_ms\n"
+        printed = 1
+      }
+      print
+    }
+  '
+}
+
 printed=0
 while IFS= read -r rep_dir; do
   counters=$rep_dir/counters.log
@@ -673,6 +758,7 @@ print_usb4_a2a_timing_aggregates "${pytorch_rank_logs[@]}"
 print_loaded_collective_lib_counts "${pytorch_rank_logs[@]}"
 print_rccl_timing_aggregates "${rccl_logs[@]}"
 print_counter_aggregates "${counter_logs[@]}"
+print_dv_write_tx_mr_bucket_aggregates "$root"
 
 if [[ $printed -eq 0 && ${#pytorch_rank0_logs[@]} -eq 0 && ${#rccl_logs[@]} -eq 0 ]]; then
   echo "no tbv_app_gate logs found under: $root" >&2
