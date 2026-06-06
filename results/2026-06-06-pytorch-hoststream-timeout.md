@@ -1213,3 +1213,78 @@ dominant cost is the rocSHMEM exchange phase. The slow path is consistently
 (`exchange_p99=258ms`, `exchange_max=753ms`). The next bottleneck investigation
 should target why the host-stream exchange alternates between fast `symId=0`
 and much slower/tailier `symId=1` rather than changing kernel correctness policy.
+
+### Fixed Scratch Slot A/B
+
+The RCCL host-stream path uses two scratch slots:
+
+```text
+NUM_SYM_BUF=2
+symId = fixedSymId >= 0 ? fixedSymId % comm->numSymBuf : comm->symId
+src = sourceRshmem + symId * bufThreshold
+dst = destRshmem + symId * bufThreshold
+bufThreshold = rocshmemBufferSize / numSymBuf
+```
+
+With the current app-gate hoststream defaults, `ROCSHMEM_HEAP_SIZE=1GiB`,
+`rocshmemBufferSize=256MiB`, and `bufThreshold=128MiB`; source and dest scratch
+buffers are heap-backed (`RCCL_ROCSHMEM_SOURCE_HEAP=1`,
+`RCCL_ROCSHMEM_DEST_HEAP=1`).
+
+Ran matching fixed-slot probes with validated PyTorch all-to-all, 1MiB/2MiB per
+rank, eight iterations, ten reps, and QP timeout exponent 14:
+
+```text
+symId=0 log: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-fixedsym0-writegaprnr10-qptimeout14-20260606-175933
+symId=1 log: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-fixedsym1-writegaprnr10-qptimeout14-20260606-180115
+status: both pass, 10/10
+```
+
+Application timing:
+
+```text
+fixed symId=0:
+  1MiB/rank n=10 min=1607.6us  avg=8413.0us   max=34798.5us
+  2MiB/rank n=10 min=3520.0us  avg=22963.0us  max=60189.8us
+
+fixed symId=1:
+  1MiB/rank n=10 min=21522.5us avg=65082.8us  max=169010.7us
+  2MiB/rank n=10 min=70631.9us avg=227875.1us max=683096.4us
+```
+
+Host-stream exchange timing:
+
+```text
+fixed symId=0:
+  msgSize=2097152  n=180 exchange_avg=8.657ms   p50=4.983ms   p90=21.097ms  p99=94.538ms  max=94.574ms
+  msgSize=4194304  n=180 exchange_avg=22.270ms  p50=14.539ms  p90=58.883ms  p99=86.265ms  max=86.267ms
+
+fixed symId=1:
+  msgSize=2097152  n=180 exchange_avg=65.519ms  p50=29.318ms  p90=186.882ms p99=228.492ms max=228.496ms
+  msgSize=4194304  n=180 exchange_avg=227.653ms p50=103.092ms p90=750.115ms p99=884.348ms max=884.425ms
+```
+
+Counters stayed correctness-clean in both legs:
+
+```text
+fixed symId=0:
+  wr_retx=0 rnr_retx=331 write_gap_rnr=11867
+  dv_hard=0 wr_timeout=0 wr_retry_exhausted=0
+  reorder_timeout=0 active_timeout=0 tx=314120/314120
+
+fixed symId=1:
+  wr_retx=0 rnr_retx=458 write_gap_rnr=12824
+  dv_hard=0 wr_timeout=0 wr_retry_exhausted=0
+  reorder_timeout=0 active_timeout=0 tx=378643/378643
+```
+
+Post-run host counters remained healthy on both Strix hosts: no no-QP frames,
+no RX cancels, no active/reorder timeouts, no DV hard errors, and balanced TX.
+
+Interpretation: the slow/taily path is intrinsic to using scratch slot 1 in the
+current heap-backed allocation, not merely an artifact of alternating slots.
+Forcing slot 1 alone is much slower than alternation; forcing slot 0 alone is
+faster than alternation. The next performance discriminator should compare
+heap-backed scratch against host-coherent scratch, and/or log the actual local
+and remote scratch addresses/keys per slot, because slot 1 is a fixed
+`+128MiB` offset into the same symmetric allocations.
