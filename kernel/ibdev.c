@@ -300,7 +300,10 @@ struct tbv_rx_write {
 	u32 psn;
 	u32 rkey;
 	u32 imm_data;
+	u32 total_len;
 	u32 received;
+	u32 last_offset;
+	u32 last_len;
 	bool active;
 	bool with_imm;
 	bool solicited;
@@ -3884,11 +3887,14 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 	if (tqp->rx_write.active &&
 	    tbv_qp_entry_expired(tqp->rx_write.started_jiffies, now, timeout)) {
 		atomic64_inc(&state->data_rx_active_timeout);
-		pr_warn_ratelimited("native RDMA_WRITE active timeout qpn=0x%x src_qp=0x%x psn=%u base=0x%llx received=%u with_imm=%u\n",
+		pr_warn_ratelimited("native RDMA_WRITE active timeout qpn=0x%x src_qp=0x%x psn=%u base=0x%llx received=%u total=%u last_offset=%u last_len=%u with_imm=%u\n",
 				    tqp->base.qp_num, tqp->rx_write.src_qp,
 				    tqp->rx_write.psn,
 				    tqp->rx_write.remote_addr,
 				    tqp->rx_write.received,
+				    tqp->rx_write.total_len,
+				    tqp->rx_write.last_offset,
+				    tqp->rx_write.last_len,
 				    tqp->rx_write.with_imm);
 		tbv_rx_fail_active_write_locked(state, tqp, NULL,
 						    IB_WC_GENERAL_ERR);
@@ -7802,10 +7808,13 @@ static void tbv_qp_flush_active_rx(struct tbv_qp *tqp)
 		discarded++;
 	}
 	if (tqp->rx_write.active) {
-		pr_warn_ratelimited("native RX active WRITE discarded qpn=0x%x expected_psn=%u psn=%u src_qp=0x%x received=%u base=0x%llx with_imm=%u\n",
+		pr_warn_ratelimited("native RX active WRITE discarded qpn=0x%x expected_psn=%u psn=%u src_qp=0x%x received=%u total=%u last_offset=%u last_len=%u base=0x%llx with_imm=%u\n",
 				    tqp->base.qp_num, tqp->rx_expected_psn,
 				    tqp->rx_write.psn, tqp->rx_write.src_qp,
 				    tqp->rx_write.received,
+				    tqp->rx_write.total_len,
+				    tqp->rx_write.last_offset,
+				    tqp->rx_write.last_len,
 				    tqp->rx_write.remote_addr,
 				    tqp->rx_write.with_imm);
 		memset(&tqp->rx_write, 0, sizeof(tqp->rx_write));
@@ -8849,6 +8858,7 @@ static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 			set_bit(frag_idx, msg->frag_seen);
 			msg->frags_received++;
 			msg->received += hdr->length;
+			msg->started_jiffies = jiffies;
 		}
 
 		if (msg->frags_received == msg->frag_count) {
@@ -8963,6 +8973,8 @@ static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 		msg->status = IB_WC_LOC_PROT_ERR;
 
 	msg->received += copy_len;
+	if (copy_len)
+		msg->started_jiffies = jiffies;
 	if (last) {
 		tbv_rx_finish_send(state, tqp, rx_path);
 		tbv_rx_drain_reorder_locked(state, tqp, rx_path);
@@ -9198,6 +9210,7 @@ static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
 		wrx->remote_addr = hdr->remote_addr;
 		wrx->rkey = hdr->rkey;
 		wrx->imm_data = hdr->imm_data;
+		wrx->total_len = total_len;
 		wrx->with_imm = with_imm;
 		wrx->solicited = hdr->flags & TBV_NATIVE_DATA_F_SOLICITED;
 		tbv_qp_schedule_timeout(tqp);
@@ -9242,6 +9255,9 @@ static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
 		}
 
 		wrx->received = copy_offset + copy_len;
+		wrx->started_jiffies = jiffies;
+		wrx->last_offset = copy_offset;
+		wrx->last_len = copy_len;
 	}
 	if (last) {
 		tbv_rx_finish_write_locked(state, tqp, rx_path,
