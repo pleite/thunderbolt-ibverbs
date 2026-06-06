@@ -5756,8 +5756,10 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr,
 	int ret;
 
 	ret = tbv_qp_post_status(tqp, !!dv_post);
-	if (ret)
+	if (ret) {
+		atomic64_inc(&tqp->owner->data_wr_post_reject_status);
 		return ret;
+	}
 
 	if (tqp->type == IB_QPT_GSI) {
 		if (dv_post)
@@ -5778,8 +5780,10 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr,
 		atomic64_inc(&tqp->owner->data_wr_op_unsupported);
 		return -EOPNOTSUPP;
 	}
-	if ((is_send || is_write) && !tbv_qp_has_dest_qp(tqp))
+	if ((is_send || is_write) && !tbv_qp_has_dest_qp(tqp)) {
+		atomic64_inc(&tqp->owner->data_wr_post_reject_no_dest);
 		return -EINVAL;
+	}
 	atomic64_inc(&tqp->owner->data_wr_send);
 	if (send_with_imm)
 		atomic64_inc(&tqp->owner->data_wr_op_send_imm);
@@ -5789,8 +5793,10 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr,
 		atomic64_inc(&tqp->owner->data_wr_op_write_imm);
 	else
 		atomic64_inc(&tqp->owner->data_wr_op_write);
-	if (!tbv_qp_get_live(tqp))
+	if (!tbv_qp_get_live(tqp)) {
+		atomic64_inc(&tqp->owner->data_wr_post_reject_dead_qp);
 		return -EINVAL;
+	}
 	atomic64_inc(&tqp->owner->data_wr_live);
 
 	ret = tbv_prepare_send_segments(tqp, wr, segs, &nsegs, &total_len);
@@ -5804,6 +5810,7 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr,
 
 		if (check_add_overflow(rwr->remote_addr, (u64)total_len,
 				       &remote_end)) {
+			atomic64_inc(&tqp->owner->data_wr_post_reject_bad_range);
 			ret = -EINVAL;
 			goto err_release_segs;
 		}
@@ -5879,8 +5886,10 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr,
 	}
 
 	ret = tbv_qp_reserve_sendq(tqp);
-	if (ret)
+	if (ret) {
+		atomic64_inc(&tqp->owner->data_wr_post_reject_sendq);
 		goto err_put_ctx;
+	}
 	ctx->sq_counted = true;
 
 	spin_lock_irqsave(&tqp->lock, flags);
@@ -5893,6 +5902,7 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr,
 	tbv_send_ctx_get(ctx);
 	ret = tbv_native_send_ctx_post_frames(ctx, TBV_SEND_POST_INITIAL);
 	if (ret) {
+		atomic64_inc(&tqp->owner->data_wr_post_reject_initial_post);
 		if (tbv_qp_unqueue_send(tqp, ctx)) {
 			if (credit_consumed)
 				tbv_qp_return_remote_recv_credit(tqp);
@@ -7869,6 +7879,11 @@ static void tbv_qp_flush_active_rx(struct tbv_qp *tqp)
 				    tqp->rx_write.last_len,
 				    tqp->rx_write.remote_addr,
 				    tqp->rx_write.with_imm);
+		if (tqp->owner) {
+			atomic64_inc(&tqp->owner->data_rx_active_write_flush);
+			if (tqp->rx_write.with_imm)
+				atomic64_inc(&tqp->owner->data_rx_active_write_imm_flush);
+		}
 		memset(&tqp->rx_write, 0, sizeof(tqp->rx_write));
 		discarded++;
 	}
@@ -9187,6 +9202,7 @@ static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
 					mutex_unlock(&tqp->rx_lock);
 					return;
 				}
+				atomic64_inc(&state->data_rx_write_imm_future_psn);
 				mutex_unlock(&tqp->rx_lock);
 				return;
 			}
@@ -9213,6 +9229,8 @@ static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
 					state, tqp, rx_path, hdr, psn,
 					total_len, offset, last, with_imm,
 					payload);
+			else
+				atomic64_inc(&state->data_rx_write_imm_gap);
 			mutex_unlock(&tqp->rx_lock);
 			return;
 		}
@@ -9225,6 +9243,7 @@ static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
 				mutex_unlock(&tqp->rx_lock);
 				return;
 			}
+			atomic64_inc(&state->data_rx_write_imm_future_psn);
 			mutex_unlock(&tqp->rx_lock);
 			return;
 		}
@@ -9243,6 +9262,7 @@ static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
 				mutex_unlock(&tqp->rx_lock);
 				return;
 			}
+			atomic64_inc(&state->data_rx_write_imm_nonzero_first);
 			mutex_unlock(&tqp->rx_lock);
 			tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
 					     hdr->dest_qp, hdr->psn,

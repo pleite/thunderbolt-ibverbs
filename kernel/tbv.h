@@ -476,6 +476,12 @@ struct tbv_state {
 	atomic64_t data_wr_op_write;
 	atomic64_t data_wr_op_write_imm;
 	atomic64_t data_wr_op_unsupported;
+	atomic64_t data_wr_post_reject_status;
+	atomic64_t data_wr_post_reject_no_dest;
+	atomic64_t data_wr_post_reject_dead_qp;
+	atomic64_t data_wr_post_reject_bad_range;
+	atomic64_t data_wr_post_reject_sendq;
+	atomic64_t data_wr_post_reject_initial_post;
 	atomic64_t data_wr_live;
 	atomic64_t data_wr_no_path;
 	atomic64_t data_wr_no_recv_credit;
@@ -602,6 +608,8 @@ struct tbv_state {
 	atomic64_t data_rx_send_sequence_error;
 	atomic64_t data_rx_active_timeout;
 	atomic64_t data_rx_active_retry;
+	atomic64_t data_rx_active_write_flush;
+	atomic64_t data_rx_active_write_imm_flush;
 	atomic64_t data_rx_reorder_buffered;
 	atomic64_t data_rx_reorder_delivered;
 	atomic64_t data_rx_reorder_dropped;
@@ -609,6 +617,9 @@ struct tbv_state {
 	atomic64_t data_rx_reorder_retry;
 	atomic64_t data_rx_reorder_window;
 	atomic64_t data_rx_pending_discarded;
+	atomic64_t data_rx_write_imm_future_psn;
+	atomic64_t data_rx_write_imm_gap;
+	atomic64_t data_rx_write_imm_nonzero_first;
 	atomic64_t apple_rx_sof;
 	atomic64_t apple_rx_eof3;
 	atomic64_t apple_rx_eof_other;

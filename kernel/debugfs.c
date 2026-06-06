@@ -194,6 +194,18 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_wr_op_write_imm));
 	seq_printf(s, "data_wr_op_unsupported: %lld\n",
 		   atomic64_read(&state->data_wr_op_unsupported));
+	seq_printf(s, "data_wr_post_reject_status: %lld\n",
+		   atomic64_read(&state->data_wr_post_reject_status));
+	seq_printf(s, "data_wr_post_reject_no_dest: %lld\n",
+		   atomic64_read(&state->data_wr_post_reject_no_dest));
+	seq_printf(s, "data_wr_post_reject_dead_qp: %lld\n",
+		   atomic64_read(&state->data_wr_post_reject_dead_qp));
+	seq_printf(s, "data_wr_post_reject_bad_range: %lld\n",
+		   atomic64_read(&state->data_wr_post_reject_bad_range));
+	seq_printf(s, "data_wr_post_reject_sendq: %lld\n",
+		   atomic64_read(&state->data_wr_post_reject_sendq));
+	seq_printf(s, "data_wr_post_reject_initial_post: %lld\n",
+		   atomic64_read(&state->data_wr_post_reject_initial_post));
 	seq_printf(s, "data_wr_live: %lld\n",
 		   atomic64_read(&state->data_wr_live));
 	seq_printf(s, "data_wr_no_path: %lld\n",
@@ -447,6 +459,10 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_active_timeout));
 	seq_printf(s, "data_rx_active_retry: %lld\n",
 		   atomic64_read(&state->data_rx_active_retry));
+	seq_printf(s, "data_rx_active_write_flush: %lld\n",
+		   atomic64_read(&state->data_rx_active_write_flush));
+	seq_printf(s, "data_rx_active_write_imm_flush: %lld\n",
+		   atomic64_read(&state->data_rx_active_write_imm_flush));
 	seq_printf(s, "data_rx_reorder_buffered: %lld\n",
 		   atomic64_read(&state->data_rx_reorder_buffered));
 	seq_printf(s, "data_rx_reorder_delivered: %lld\n",
@@ -461,6 +477,12 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_reorder_window));
 	seq_printf(s, "data_rx_pending_discarded: %lld\n",
 		   atomic64_read(&state->data_rx_pending_discarded));
+	seq_printf(s, "data_rx_write_imm_future_psn: %lld\n",
+		   atomic64_read(&state->data_rx_write_imm_future_psn));
+	seq_printf(s, "data_rx_write_imm_gap: %lld\n",
+		   atomic64_read(&state->data_rx_write_imm_gap));
+	seq_printf(s, "data_rx_write_imm_nonzero_first: %lld\n",
+		   atomic64_read(&state->data_rx_write_imm_nonzero_first));
 	seq_printf(s, "apple_rx_sof: %lld\n",
 		   atomic64_read(&state->apple_rx_sof));
 	seq_printf(s, "apple_rx_eof3: %lld\n",
