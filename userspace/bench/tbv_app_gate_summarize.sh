@@ -79,7 +79,7 @@ while IFS= read -r rep_dir; do
   t2=$(timing_us "$rank0_log" 2097152)
 
   if [[ $printed -eq 0 ]]; then
-    printf 'mode rep t1_us t2_us wr_retx rnr_retx ack_retry ack64 reord_to reord_retry reord_drop active_to active_retry tx_rnr rx_rnr rnr_exh dv_hard wr_to wr_exh tx_err tx_post tx_comp\n'
+    printf 'mode rep t1_us t2_us wr_retx rnr_retx ack_retry ack64 late_ack dup_ack ack_miss reord_to reord_retry reord_drop active_to active_retry tx_rnr rx_rnr rnr_exh dv_hard wr_to wr_exh tx_err tx_post tx_comp\n'
     printed=1
   fi
 
@@ -89,6 +89,9 @@ while IFS= read -r rep_dir; do
     data_wr_rnr_retransmit \
     data_rx_ack_match_retried \
     data_rx_ack_match_over_64ms \
+    data_rx_late_ack \
+    data_rx_duplicate_ack \
+    data_rx_ack_miss \
     data_rx_reorder_timeout \
     data_rx_reorder_retry \
     data_rx_reorder_dropped \
