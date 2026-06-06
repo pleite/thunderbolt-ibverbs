@@ -30,6 +30,7 @@ modes=${TBV_MODES:-fallback,hoststream,device}
 run_rccl=${TBV_RUN_RCCL:-1}
 run_pytorch=${TBV_RUN_PYTORCH:-0}
 pytorch_wrapper=${VLLM_USB4_ENV:-${TBV_PYTORCH_WRAPPER:-}}
+pytorch_python=${TBV_TORCH_PYTHON:-}
 pytorch_sizes=${TBV_TORCH_SIZES:-65536,262144}
 pytorch_iters=${TBV_TORCH_ITERS:-2}
 pytorch_collectives=${TBV_TORCH_COLLECTIVES:-all_to_all}
@@ -80,6 +81,7 @@ Options:
   --skip-rccl               Do not run rccl-tests gates
   --pytorch                 Run PyTorch distributed smoke
   --pytorch-wrapper DIR     vLLM/PyTorch wrapper prefix
+  --pytorch-python PATH     Python executable override. Default: wrapper/bin/python
   --pytorch-sizes CSV       Default: $pytorch_sizes
   --pytorch-iters N         Default: $pytorch_iters
   --torch-validate 0|1      Default: $pytorch_validate
@@ -120,6 +122,7 @@ while (($#)); do
     --skip-rccl) run_rccl=0; shift ;;
     --pytorch) run_pytorch=1; shift ;;
     --pytorch-wrapper) pytorch_wrapper=$2; shift 2 ;;
+    --pytorch-python) pytorch_python=$2; shift 2 ;;
     --pytorch-sizes) pytorch_sizes=$2; shift 2 ;;
     --pytorch-iters) pytorch_iters=$2; shift 2 ;;
     --torch-validate) pytorch_validate=$2; shift 2 ;;
@@ -348,6 +351,15 @@ require_dir() {
   fi
 }
 
+require_exe() {
+  local label=$1
+  local path=$2
+  if [[ -z "$path" || ! -x "$path" ]]; then
+    echo "ERROR: $label is not set or not executable: ${path:-<unset>}" >&2
+    exit 2
+  fi
+}
+
 prepend_path() {
   local var=$1
   local path=$2
@@ -423,6 +435,9 @@ setup_app_env() {
   if [[ "$run_pytorch" == 1 ]]; then
     require_dir "TBV_PYTORCH_WRAPPER/VLLM_USB4_ENV" "$pytorch_wrapper"
     require_dir "ROCM_PATH" "$rocm_path"
+    if [[ -n "$pytorch_python" ]]; then
+      require_exe "TBV_TORCH_PYTHON" "$pytorch_python"
+    fi
   fi
   if [[ -n "$rdma_core_lib" && ! -d "$rdma_core_lib" ]]; then
     echo "WARN: rdma lib not found: $rdma_core_lib" >&2
@@ -606,7 +621,7 @@ pytorch_rccl_lib_value() {
 
 build_torch_remote_command() {
   local rank=$1
-  local python_bin="$pytorch_wrapper/bin/python"
+  local python_bin="${pytorch_python:-$pytorch_wrapper/bin/python}"
   local torch_ld_path
   local torch_ld_preload
   local torch_rccl_lib
