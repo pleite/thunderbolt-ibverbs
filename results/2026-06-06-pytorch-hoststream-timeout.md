@@ -978,3 +978,54 @@ reorder timeout fires. The cost is more RNR/control traffic and more
 matched-after-retry ACK accounting, so the next validation should be a longer
 run with the knob enabled plus a same-boot disabled control if we want a clean
 A/B probability estimate.
+
+A longer confidence sweep was then run with the knob enabled:
+
+```text
+log root: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-writegaprnr100-qptimeout14-20260606-171729
+status: pass, 100/100
+loaded RCCL: /mnt/Home/tmp/rccl-hoststream-waitbudget-install/lib/librccl.so.1.0
+```
+
+Aggregate summary:
+
+```text
+2MiB timing count/max: 100 / 385475.6 us
+data_wr_retransmit: 0
+data_wr_rnr_retransmit: 1391
+data_rx_ack_match_retried/data_rx_ack_match_over_64ms: 30095/10201
+data_rx_write_gap_rnr: 60058
+data_tx_ack_rnr/data_rx_ack_rnr: 60058/60058
+data_rx_active_timeout/data_rx_reorder_timeout: 0/0
+data_rx_reorder_duplicate_refresh: 5626
+data_rx_active_duplicate_refresh: 83485
+data_rx_active_write_reorder_merge: 0
+data_wr_timeout/data_wr_retry_exhausted: 0/0
+data_wr_rnr_retry_exhausted: 0
+data_wr_rnr_wait_tx_pending/data_wr_rnr_wait_retry_exhausted: 10/0
+dv_hard_error: 0
+data_tx_errors: 0
+data_tx_posted/data_tx_completed: 1571970/1571970
+```
+
+Post-run host counters stayed healthy after restoring the runtime knob to `N`:
+
+```text
+strix-1: verbs_qps=4 data_tx=951293/951293 data_tx_errors=0
+         data_wr_timeout=0 data_wr_retry_exhausted=0
+         data_rx_active_timeout=0 data_rx_reorder_timeout=0
+         data_rx_canceled=0
+
+strix-2: verbs_qps=4 data_tx=1014033/1014033 data_tx_errors=0
+         data_wr_timeout=0 data_wr_retry_exhausted=0
+         data_rx_active_timeout=0 data_rx_reorder_timeout=0
+         data_rx_canceled=0
+```
+
+This materially strengthens the result. With targeted gap RNR enabled, the
+large-WR failure class did not appear across 130 consecutive reps on the same
+deployed build, while the repair path fired tens of thousands of times. The
+remaining engineering question is policy, not localization: whether to enable
+this in the Strix test profile now and then reduce/control the RNR pressure, or
+keep it as an explicit benchmark knob until a same-boot disabled control gives
+a cleaner probability comparison.
