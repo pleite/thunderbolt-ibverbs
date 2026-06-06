@@ -99,7 +99,7 @@
           version = "0.1.0";
           src = ./.;
 
-          nativeBuildInputs = [ pkgs.bash ];
+          nativeBuildInputs = [ pkgs.bash pkgs.python3 ];
 
           dontConfigure = true;
 
@@ -114,8 +114,13 @@
               tools/ci/distro-install.sh \
               tools/ci/distro-package-rdma.sh \
               tools/ci/distro-package.sh \
+              userspace/bench/tbv_app_gate.sh \
               tools/ci/vm-guest-smoke.sh \
               tools/ci/vm-smoke.sh
+            python3 -m py_compile \
+              userspace/bench/tbv_perftest_runner.py \
+              userspace/bench/tbv_pytorch_smoke.py \
+              userspace/bench/tbv_rdma_sweep.py
             runHook postBuild
           '';
 
@@ -387,6 +392,14 @@
           };
         in
         {
+          tbv-app-gate = {
+            type = "app";
+            program = "${pkgsAt.bench-tools}/bin/tbv_app_gate.sh";
+            meta = {
+              description = "Run RCCL/PyTorch USB4 GDA app gates with driver counter checks";
+              maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
+            };
+          };
           tbv-perftest = {
             type = "app";
             program = lib.getExe pkgsAt.tbv-perftest;

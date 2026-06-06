@@ -3350,3 +3350,165 @@ Interpretation:
    closure is present on both Strix hosts, but it should not be treated as the
    primary GDA benchmark until the all-to-all/all-to-allv RCCL path is faster and
    less mode-sensitive.
+
+### Reusable app gate runner
+
+Added `tbv_app_gate.sh` and `tbv_pytorch_smoke.py` to `bench-tools`, exposed the
+runner as the `tbv-app-gate` flake app, and extended the script syntax check to
+cover the new shell/Python entrypoints.
+
+Local/package checks:
+
+```text
+bash -n userspace/bench/tbv_app_gate.sh
+nix build .#bench-tools --no-link --print-out-paths
+  /nix/store/6nxyw5pd3gk4d87c03k6abid7b66m5rj-thunderbolt-ibverbs-bench-tools-0.1.0
+nix build .#checks.x86_64-linux.script-syntax --no-link --print-out-paths
+  /nix/store/xsly36cyf7hm6yl2pj0r5am8fm0gvwpg-thunderbolt-ibverbs-script-syntax-0.1.0
+nix run .#tbv-app-gate -- --help
+```
+
+RCCL live gate, all-to-all:
+
+```text
+log root: /tmp/tbv-app-gate-smoke-20260606-053328
+collective: alltoall
+modes: fallback, hoststream
+sizes: 65536, 262144
+iters/warmup/reps: 1/1/1
+status: pass
+
+fallback:
+  65536: 137.97 us
+  262144: 186.14 us
+  dv_poll_wqes sum +0
+  data_tx_posted/completed sum +2151/+2151
+
+hoststream:
+  65536: 155.40 us
+  262144: 241.18 us
+  dv_poll_wqes sum +84
+  data_tx_posted/completed sum +1062/+1062
+```
+
+RCCL live gate, all-to-allv:
+
+```text
+log root: /tmp/tbv-app-gate-smoke-alltoallv-20260606-053408
+collective: alltoallv
+modes: fallback, hoststream, device
+sizes: 65536, 131072
+iters/warmup/reps: 1/1/1
+status: pass
+
+fallback:
+  65536: 145.69 us
+  131072: 160.95 us
+  dv_poll_wqes sum +0
+  data_tx_posted/completed sum +1150/+1150
+
+hoststream:
+  65536: 1166.24 us
+  131072: 1242.55 us
+  dv_poll_wqes sum +56
+  data_tx_posted/completed sum +517/+517
+
+device:
+  65536: 1092.73 us
+  131072: 1653.52 us
+  dv_poll_wqes sum +56
+  data_tx_posted/completed sum +517/+517
+```
+
+PyTorch live gate:
+
+```text
+log root: /tmp/tbv-app-gate-pytorch-smoke-20260606-053500
+collective: all_to_all
+sizes: 65536
+iters/reps: 1/3
+expected RCCL:
+  /nix/store/74kx31vim3ynwpivjlxq04wbdl62nrbg-rccl-usb4-hostheap-gfx1151-2.28.9-local/lib/librccl.so.1
+status: pass
+
+fallback:
+  rep1: 291.5 us, dv_poll_wqes sum +0, retransmit sum +0, tx +525/+525
+  rep2: 224.0 us, dv_poll_wqes sum +0, retransmit sum +0, tx +526/+526
+  rep3: 230.9 us, dv_poll_wqes sum +0, retransmit sum +0, tx +526/+526
+
+hoststream:
+  rep1: 1795.5 us, dv_poll_wqes sum +8, retransmit sum +0, tx +397/+397
+  rep2: 1933.6 us, dv_poll_wqes sum +8, retransmit sum +0, tx +397/+397
+  rep3: 73734.1 us, dv_poll_wqes sum +8, retransmit sum +1, tx +416/+416
+```
+
+For all three gates:
+
+```text
+dv_hard_error sum                    +0
+data_wr_copy_error sum               +0
+data_wr_timeout sum                  +0
+data_wr_retry_exhausted sum          +0
+data_wr_retransmit_closing_qp sum    +0
+data_wr_retransmit_no_live_path sum  +0
+data_wr_retransmit_teardown_path sum +0
+data_tx_errors sum                   +0
+data_rx_canceled sum                 +0
+data_rx_no_qp sum                    +0
+data_rx_no_qp_reack sum              +0
+data_qp_tombstone_evicted sum        +0
+```
+
+Final health after the app-gate smokes:
+
+```text
+strix-1:
+dv_poll_wqes=2954
+dv_hard_error=0
+data_wr_copy_error=0
+data_wr_retransmit_closing_qp=0
+data_wr_retransmit_no_live_path=0
+data_wr_retransmit_teardown_path=0
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_tx_posted=211850
+data_tx_completed=211850
+data_tx_errors=0
+data_rx_canceled=4096
+data_rx_no_qp=0
+data_qp_tombstone_evicted=0
+
+strix-2:
+dv_poll_wqes=2954
+dv_hard_error=0
+data_wr_copy_error=0
+data_wr_retransmit_closing_qp=0
+data_wr_retransmit_no_live_path=0
+data_wr_retransmit_teardown_path=0
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_tx_posted=211552
+data_tx_completed=211552
+data_tx_errors=0
+data_rx_canceled=0
+data_rx_no_qp=0
+data_qp_tombstone_evicted=0
+```
+
+No matching `BUG`, `Oops`, `panic`, watchdog, lockup, hard-error, timeout,
+GPU-fault, or AMDGPU reset/timeout appeared in the recent dmesg tail on either
+host after the gates.
+
+Interpretation:
+
+1. The app-level gate is now reusable and Nix-packaged; it captures before/after
+   debugfs summaries and fails the gate if the fallback path uses DV, the GDA
+   path does not use DV, or any hard correctness counter increments.
+2. The gate exercises the current correctness stack successfully through
+   `rccl-tests` and PyTorch distributed all-to-all, with clean hard counters and
+   balanced TX posted/completed deltas.
+3. The performance signal remains poor/unstable above the kernel: host-stream
+   PyTorch GDA can validate cleanly while taking 1.8-1.9 ms at 64 KiB, and one
+   rep hit 73 ms with a single successful retransmit. That is not a kernel
+   correctness failure, but it is the next application-level bottleneck to
+   instrument in RCCL/rocSHMEM.
