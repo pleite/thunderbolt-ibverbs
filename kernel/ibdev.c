@@ -3917,6 +3917,7 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 		u16 frag_count;
 		bool complete;
 		bool with_imm;
+		bool retryable_write;
 		bool expected;
 		bool found = false;
 
@@ -3942,6 +3943,7 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 		frag_count = msg->frag_count;
 		complete = msg->complete;
 		with_imm = msg->with_imm;
+		retryable_write = kind == TBV_RX_REORDER_WRITE;
 		expected = psn == tqp->rx_expected_psn;
 		pr_warn_ratelimited("native RX reorder timeout qpn=0x%x expected_psn=%u psn=%u src_qp=0x%x kind=%u complete=%u expected=%u received=%u total=%u frags=%u/%u bytes=%u last_offset=%u last_len=%u with_imm=%u\n",
 				    tqp->base.qp_num, tqp->rx_expected_psn,
@@ -3951,6 +3953,13 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 				    last_len, with_imm);
 		tbv_rx_drop_reorder_msg_locked(state, tqp, msg);
 		atomic64_inc(&state->data_rx_reorder_timeout);
+		if (retryable_write) {
+			atomic64_inc(&state->data_rx_reorder_retry);
+			tbv_send_ack(tqp, src_qp, tqp->base.qp_num, psn,
+				     TBV_NATIVE_SEND_ACK_RNR);
+			timed_out = true;
+			continue;
+		}
 		if (expected)
 			tqp->rx_expected_psn = tbv_psn_next(psn);
 		if (kind == TBV_RX_REORDER_READ_REQ)
