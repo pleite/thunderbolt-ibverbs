@@ -703,6 +703,8 @@ static int tbv_rx_copy_to_wqe(struct tbv_state *state,
 			      const void *payload, u32 len, u32 *delivered);
 static void tbv_qp_flush_reorder(struct tbv_qp *tqp);
 static void tbv_qp_flush_active_rx(struct tbv_qp *tqp);
+static void tbv_rx_mark_rnr_locked(struct tbv_qp *tqp, u32 src_qp, u32 psn,
+				   u64 remote_addr, u32 frag_offset);
 static void tbv_rx_fail_active_send(struct tbv_state *state, struct tbv_qp *tqp,
 				    struct tbv_path *rx_path,
 				    enum ib_wc_status status);
@@ -3865,7 +3867,7 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 {
 	struct tbv_state *state = tqp->owner;
 	bool need_resched;
-	bool timed_out = false;
+	bool fatal_timeout = false;
 
 	mutex_lock(&tqp->rx_lock);
 	if (tqp->rx_msg.active &&
@@ -3884,7 +3886,7 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 				    tqp->rx_msg.last_route,
 				    tqp->rx_msg.last_path_id);
 		tbv_rx_fail_active_send(state, tqp, NULL, IB_WC_GENERAL_ERR);
-		timed_out = true;
+		fatal_timeout = true;
 	}
 	if (tqp->rx_write.active &&
 	    tbv_qp_entry_expired(tqp->rx_write.started_jiffies, now, timeout)) {
@@ -3900,7 +3902,7 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 				    tqp->rx_write.with_imm);
 		tbv_rx_fail_active_write_locked(state, tqp, NULL,
 						    IB_WC_GENERAL_ERR);
-		timed_out = true;
+		fatal_timeout = true;
 	}
 
 	for (;;) {
@@ -3912,6 +3914,7 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 		u32 buffered_bytes;
 		u32 last_offset;
 		u32 last_len;
+		u64 remote_addr;
 		enum tbv_rx_reorder_kind kind;
 		u16 frags_received;
 		u16 frag_count;
@@ -3938,6 +3941,7 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 		buffered_bytes = msg->buffered_bytes;
 		last_offset = msg->last_offset;
 		last_len = msg->last_len;
+		remote_addr = msg->remote_addr;
 		kind = msg->kind;
 		frags_received = msg->frags_received;
 		frag_count = msg->frag_count;
@@ -3955,9 +3959,9 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 		atomic64_inc(&state->data_rx_reorder_timeout);
 		if (retryable_write) {
 			atomic64_inc(&state->data_rx_reorder_retry);
+			tbv_rx_mark_rnr_locked(tqp, src_qp, psn, remote_addr, 0);
 			tbv_send_ack(tqp, src_qp, tqp->base.qp_num, psn,
 				     TBV_NATIVE_SEND_ACK_RNR);
-			timed_out = true;
 			continue;
 		}
 		if (expected)
@@ -3969,7 +3973,7 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 		else
 			tbv_send_ack(tqp, src_qp, tqp->base.qp_num, psn,
 				     TBV_NATIVE_SEND_ACK_ERROR);
-		timed_out = true;
+		fatal_timeout = true;
 		if (expected)
 			tbv_rx_drain_reorder_locked(state, tqp, NULL);
 	}
@@ -3978,7 +3982,7 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 		       !list_empty(&tqp->rx_reorder);
 	mutex_unlock(&tqp->rx_lock);
 
-	if (timed_out)
+	if (fatal_timeout)
 		tbv_qp_mark_error(tqp);
 
 	return need_resched;
