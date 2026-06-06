@@ -4276,3 +4276,94 @@ Conclusions:
    matching long control, so do not attribute it to the kernel baseline alone.
    It needs a sharper local ROCm/RCCL/rocSHMEM comparison before changing
    kernel behavior or relaxing the hard gate.
+
+### 2026-06-06 Late SEND_ACK no-QP classification
+
+Deployed the SEND_ACK-specific no-QP counters through the NixOS recipe:
+
+```text
+nixos-config: 6c937da thunderbolt: pin no-QP SEND_ACK diagnostics
+deployed thunderbolt-ibverbs source: 93f61fa kernel: classify no-QP SEND_ACKs
+active GDA branch at classification test: 20f714a kernel: classify no-QP SEND_ACKs
+```
+
+Both Strix hosts rebooted into kernel `7.0.10`, the module reload helper passed
+`thunderbolt-ibverbs-check: ok` on both hosts, and the new debugfs counters were
+present on both hosts before testing:
+
+```text
+data_rx_no_qp_send_ack
+data_rx_no_qp_send_ack_ok
+data_rx_no_qp_send_ack_rnr
+data_rx_no_qp_send_ack_error
+data_rx_no_qp_send_ack_bad_status
+```
+
+Re-ran the local QP-env PyTorch host-stream mode-0 validation at QP timeout
+exponent 14:
+
+```text
+log root:
+  /tmp/tbv-app-gate-pytorch-hoststream-mode0-qptimeout14-sendack-split-20260606-084213
+status: fail 31/32
+failure: strict counter gate only, rep 29
+data_rx_no_qp: +2
+data_rx_no_qp_native_non_ack: +2
+data_rx_no_qp_opcode_2: +2
+data_rx_no_qp_send_ack: +2
+data_rx_no_qp_send_ack_ok: +2
+data_rx_no_qp_send_ack_rnr/error/bad_status: +0
+data_wr_retransmit: +38 total, +0 in the failing rep
+data_wr_timeout/retry_exhausted/canceled: +0
+data_rx_canceled: +0
+dv_hard_error: +0
+data_tx_posted == data_tx_completed == +58374
+exchangeMs n=384 avg=20.225 p50=2.754 p90=77.613 p95=94.640 p99=293.369 max=353.356
+```
+
+This cleanly classifies the intermittent timeout-14 strict-gate failure: the
+two no-QP frames were both late `SEND_ACK_OK` frames, not retransmitted data,
+not tombstone re-ACK traffic, not RNR/error ACKs, and not a hard application
+failure. The failing rep had no retransmits, no WR timeout, no retry exhaustion,
+no RX cancel, no DV hard error, and balanced TX accounting. The most precise
+statement is therefore: path-diverse duplicate OK ACK fanout can arrive after
+the sender-side QP is destroyed; this is a teardown/accounting artifact, not a
+payload-correctness failure.
+
+Added an app-gate opt-in:
+
+```text
+active GDA branch: e070fb8 bench: allow late OK SEND_ACK no-QP opt-in
+flag: --allow-late-send-ack-no-qp
+env:  TBV_ALLOW_LATE_SEND_ACK_NO_QP=1
+```
+
+The opt-in is intentionally narrow. It skips the hard failure for
+`data_rx_no_qp` only when the no-QP delta is positive and exactly equals both
+`data_rx_no_qp_send_ack` and `data_rx_no_qp_send_ack_ok`. Non-ACK no-QP frames,
+RNR/error/bad-status ACKs, tombstone errors, RX cancels, DV hard errors, WR
+timeouts, retry exhaustion, and TX errors remain hard failures.
+
+Validation with the opt-in enabled:
+
+```text
+log root:
+  /tmp/tbv-app-gate-pytorch-hoststream-mode0-qptimeout14-allow-late-sendack-20260606-084834
+status: pass 32/32
+data_wr_retransmit: +48
+data_rx_no_qp: +0
+data_rx_no_qp_send_ack/ok/rnr/error/bad_status: +0
+data_rx_canceled: +0
+dv_hard_error: +0
+data_wr_timeout/retry_exhausted: +0
+data_wr_retransmit_closing_qp/no_live_path/teardown_path: +0
+data_tx_posted == data_tx_completed == +59729
+exchangeMs n=384 avg=23.048 p50=3.289 p90=81.047 p95=96.945 p99=293.016 max=356.449
+```
+
+The allowance did not need to fire in this clean run, which is useful: the flag
+does not hide any observed failure class by default, and the strict gate remains
+available for lifecycle work. For application-level benchmark runs, use mode 0
+with payload validation and QP timeout exponent 14; include
+`--allow-late-send-ack-no-qp` only when the benchmark harness should tolerate
+classified late duplicate OK ACK teardown noise.
