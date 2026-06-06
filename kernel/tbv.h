@@ -691,6 +691,8 @@ int tbv_tbnet_arp_reply_for_request(void *reply, size_t reply_size,
 int tbv_tbnet_minimal_start(struct tbv_tbnet_identity *identity);
 void tbv_tbnet_minimal_stop(struct tbv_tbnet_identity *identity);
 void tbv_tbnet_minimal_recompute_state_locked(struct tbv_tbnet_identity *identity);
+bool tbv_tbnet_minimal_packet_path_ready(struct tbv_tbnet_identity *identity,
+					 const uuid_t *remote_uuid);
 bool tbv_tbnet_minimal_neighbor_ready(struct tbv_tbnet_identity *identity,
 				      const uuid_t *remote_uuid);
 void tbv_tbnet_minimal_clear_neighbors_locked(struct tbv_tbnet_identity *identity);

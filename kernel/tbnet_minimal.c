@@ -485,6 +485,29 @@ out:
 	return ready;
 }
 
+bool tbv_tbnet_minimal_packet_path_ready(struct tbv_tbnet_identity *identity,
+					 const uuid_t *remote_uuid)
+{
+	struct tbv_tbnet_minimal_session *session;
+	bool ready = false;
+
+	if (identity->mode != TBV_TBNET_ID_MINIMAL_PACKET)
+		return false;
+
+	mutex_lock(&identity->lock);
+	list_for_each_entry(session, &identity->minimal_sessions, node) {
+		if (!READ_ONCE(session->path_enabled))
+			continue;
+		if (remote_uuid &&
+		    !uuid_equal(session->xd->remote_uuid, remote_uuid))
+			continue;
+		ready = true;
+		break;
+	}
+	mutex_unlock(&identity->lock);
+	return ready;
+}
+
 void tbv_tbnet_minimal_clear_neighbors_locked(struct tbv_tbnet_identity *identity)
 {
 	struct tbv_tbnet_minimal_session *session;
@@ -499,14 +522,14 @@ void tbv_tbnet_minimal_clear_neighbors_locked(struct tbv_tbnet_identity *identit
 
 static void tbv_tbnet_minimal_recompute_state(struct tbv_tbnet_identity *identity)
 {
-	bool ready;
+	bool path_ready;
 
 	mutex_lock(&identity->lock);
 	tbv_tbnet_minimal_recompute_state_locked(identity);
-	ready = identity->state & TBV_TBNET_ID_STATE_NEIGHBOR_READY;
+	path_ready = identity->state & TBV_TBNET_ID_STATE_PACKET_PATH_ACTIVE;
 	mutex_unlock(&identity->lock);
 
-	if (ready)
+	if (path_ready)
 		tbv_services_tbnet_identity_ready(identity);
 }
 
