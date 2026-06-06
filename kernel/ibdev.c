@@ -3894,6 +3894,27 @@ static void tbv_apple_send_complete_work(struct work_struct *work)
 	tbv_send_ctx_put(send);
 }
 
+static void tbv_count_rnr_wait_retry_blocker(struct tbv_qp *tqp,
+					     const struct tbv_send_ctx *send)
+{
+	struct tbv_state *state = tqp->owner;
+
+	if (!send->retryable)
+		atomic64_inc(&state->data_wr_rnr_wait_not_retryable);
+	else if (send->retrying)
+		atomic64_inc(&state->data_wr_rnr_wait_retrying);
+	else if (atomic_read(&send->tx_pending))
+		atomic64_inc(&state->data_wr_rnr_wait_tx_pending);
+	else if (!tbv_send_rnr_retry_allowed(send))
+		atomic64_inc(&state->data_wr_rnr_wait_retry_exhausted);
+	else if (tqp->closing)
+		atomic64_inc(&state->data_wr_rnr_wait_closing_qp);
+	else if (tqp->state == IB_QPS_ERR)
+		atomic64_inc(&state->data_wr_rnr_wait_qp_error);
+	else
+		atomic64_inc(&state->data_wr_rnr_wait_unknown);
+}
+
 static bool tbv_qp_timeout_reap_tx(struct tbv_qp *tqp,
 				   struct list_head *ack_probe_sends,
 				   struct list_head *retry_sends,
@@ -3950,6 +3971,7 @@ static bool tbv_qp_timeout_reap_tx(struct tbv_qp *tqp,
 				list_add_tail(&send->retry_node, retry_sends);
 				continue;
 			}
+			tbv_count_rnr_wait_retry_blocker(tqp, send);
 			if (!send->ready) {
 				send->ready = true;
 				send->completion_status = -EAGAIN;

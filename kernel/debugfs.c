@@ -256,6 +256,20 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_wr_rnr_complete_closing_qp));
 	seq_printf(s, "data_wr_rnr_complete_qp_error: %lld\n",
 		   atomic64_read(&state->data_wr_rnr_complete_qp_error));
+	seq_printf(s, "data_wr_rnr_wait_not_retryable: %lld\n",
+		   atomic64_read(&state->data_wr_rnr_wait_not_retryable));
+	seq_printf(s, "data_wr_rnr_wait_retrying: %lld\n",
+		   atomic64_read(&state->data_wr_rnr_wait_retrying));
+	seq_printf(s, "data_wr_rnr_wait_tx_pending: %lld\n",
+		   atomic64_read(&state->data_wr_rnr_wait_tx_pending));
+	seq_printf(s, "data_wr_rnr_wait_retry_exhausted: %lld\n",
+		   atomic64_read(&state->data_wr_rnr_wait_retry_exhausted));
+	seq_printf(s, "data_wr_rnr_wait_closing_qp: %lld\n",
+		   atomic64_read(&state->data_wr_rnr_wait_closing_qp));
+	seq_printf(s, "data_wr_rnr_wait_qp_error: %lld\n",
+		   atomic64_read(&state->data_wr_rnr_wait_qp_error));
+	seq_printf(s, "data_wr_rnr_wait_unknown: %lld\n",
+		   atomic64_read(&state->data_wr_rnr_wait_unknown));
 	seq_printf(s, "data_wr_timeout: %lld\n",
 		   atomic64_read(&state->data_wr_timeout));
 	seq_printf(s, "data_wr_send_timeout: %lld\n",

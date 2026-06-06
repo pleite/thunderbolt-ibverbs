@@ -506,6 +506,13 @@ struct tbv_state {
 	atomic64_t data_wr_rnr_complete_retry_exhausted;
 	atomic64_t data_wr_rnr_complete_closing_qp;
 	atomic64_t data_wr_rnr_complete_qp_error;
+	atomic64_t data_wr_rnr_wait_not_retryable;
+	atomic64_t data_wr_rnr_wait_retrying;
+	atomic64_t data_wr_rnr_wait_tx_pending;
+	atomic64_t data_wr_rnr_wait_retry_exhausted;
+	atomic64_t data_wr_rnr_wait_closing_qp;
+	atomic64_t data_wr_rnr_wait_qp_error;
+	atomic64_t data_wr_rnr_wait_unknown;
 	atomic64_t data_wr_timeout;
 	atomic64_t data_wr_send_timeout;
 	atomic64_t data_wr_timeout_last_psn;

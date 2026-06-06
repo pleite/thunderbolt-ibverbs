@@ -623,3 +623,64 @@ The next failing app-gate run should report these. If
 RNR retry accounting is wrong. If `closing_qp` or `qp_error` fires, the
 existing `data_wr_rnr_retry_exhausted` total is a downstream symptom after the
 first hard error, not the original cause.
+
+## RNR Completion Classifier
+
+The RNR ACK-time classifier was deployed on both Strix hosts and tested with the
+same PyTorch hoststream baseline (`ROCSHMEM_GDA_QP_TIMEOUT=14`,
+`native_ack_probe=N`, `qp_rx_timeout_multiplier=1`).
+
+Initial 10-rep run:
+
+```text
+log root: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-rnrclass-qptimeout14-20260606-151637
+status: pass, 10/10
+wr_retx/rnr_retx: 112/1
+data_rx_reorder_timeout/retry/drop: 1/1/1
+data_tx_ack_rnr/data_rx_ack_rnr: 1/1
+data_wr_timeout/data_wr_retry_exhausted: 0/0
+data_wr_rnr_retry_exhausted: 0
+data_wr_rnr_complete_retry_exhausted/closing_qp/qp_error: 0/0/0
+data_tx_posted/completed: balanced
+```
+
+The single RNR event recovered cleanly.
+
+Longer 30-rep run:
+
+```text
+log root: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-rnrclass30-qptimeout14-20260606-151943
+status: fail, 21/30 passed
+failed reps: 1,5,10,11,20,22,24,25,27
+data_tx_posted/completed: balanced in every failed rep
+```
+
+The failures split into two signatures:
+
+```text
+status=5 failures: reps 1,5,10,20
+  rank1: USB4 GDA CQE error status=5 opcode=3 byte_len=2097152
+  rank0: USB4 alltoall DATA wait timed out
+  data_wr_timeout/data_wr_retry_exhausted: 1/1
+  data_wr_rnr_retry_exhausted: 0
+  data_wr_rnr_complete_retry_exhausted/closing_qp/qp_error: 0/0/0
+
+status=255 failures: reps 11,22,24,25,27
+  rank1: USB4 GDA CQE error status=255 opcode=3 byte_len=2097152
+  rank0: USB4 alltoall DATA wait timed out
+  data_wr_timeout/data_wr_retry_exhausted: 0/0
+  data_wr_rnr_retry_exhausted: 1
+  data_wr_rnr_complete_retry_exhausted/closing_qp/qp_error: 0/0/0
+```
+
+The new split counters staying zero is the useful falsifier. The
+`data_wr_rnr_retry_exhausted` status is not being produced by the RNR ACK
+handler's retry-cap/closing-QP/QP-error branch. It must be coming from another
+`-EAGAIN` send completion path. The most direct remaining candidate is the
+`send->rnr_waiting` branch in `tbv_qp_timeout_reap_tx()`, which can mark an RNR
+waiting send ready with `completion_status = -EAGAIN` when it decides the send
+cannot be retried.
+
+Next counter addition: classify that timeout-worker RNR-wait failure path by
+the exact predicate that blocked retry (`not_retryable`, `retrying`,
+`tx_pending`, `retry_exhausted`, `closing`, `QP error`, or `unknown`).
