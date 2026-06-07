@@ -2,10 +2,15 @@
 set -euo pipefail
 
 hosts=${TBV_VLLM_HOSTS:-192.168.23.136,192.168.23.192}
+counter_hosts=${TBV_VLLM_COUNTER_HOSTS:-$hosts}
 iface=${TBV_VLLM_IFACE:-eno1}
 log_parent=${TBV_VLLM_LOG_PARENT:-/mnt/Home/tmp/tbv-vllm-smoke}
 log_root=${TBV_VLLM_LOG_ROOT:-$log_parent/$(date +%Y%m%d-%H%M%S)}
 ssh_cmd=${TBV_SSH:-ssh}
+capture_counters_enabled=${TBV_VLLM_COUNTERS:-1}
+counter_summary=${TBV_DEBUGFS_SUMMARY:-/sys/kernel/debug/thunderbolt_ibverbs/summary}
+counter_keys=${TBV_VLLM_COUNTER_KEYS:-"dv_poll_wqes dv_admission_attempts dv_hard_error data_wr_retransmit data_wr_retry_exhausted data_wr_timeout data_wr_retransmit_closing_qp data_wr_retransmit_no_live_path data_wr_retransmit_teardown_path data_tx_posted data_tx_completed data_tx_errors data_tx_canceled data_rx_canceled data_rx_ack data_rx_ack_matched data_rx_ack_match_retried data_rx_ack_miss data_rx_late_ack data_rx_no_qp data_rx_no_qp_reack data_rx_no_qp_error_ack data_qp_tombstone_evicted"}
+hard_error_keys=${TBV_VLLM_HARD_ERROR_KEYS:-"dv_hard_error data_wr_retry_exhausted data_wr_timeout data_wr_retransmit_closing_qp data_wr_retransmit_no_live_path data_wr_retransmit_teardown_path data_tx_errors data_tx_canceled data_rx_canceled data_rx_ack_miss data_rx_no_qp data_rx_no_qp_reack data_rx_no_qp_error_ack data_qp_tombstone_evicted"}
 
 wrapper=${VLLM_USB4_ENV:-${TBV_VLLM_WRAPPER:-}}
 model=${TBV_VLLM_MODEL:-/mnt/Home/tmp/tbv-vllm-tiny-qwen3-gda}
@@ -35,9 +40,11 @@ Runs a tiny vLLM throughput smoke on the Strix pair using Ray TP=2.
 
 Options:
   --hosts H1,H2              Default: $hosts
+  --counter-hosts H1,H2      Default: hosts
   --iface IFACE              Default: $iface
   --log-root DIR             Default: $log_root
   --ssh CMD                  Default: $ssh_cmd
+  --no-counters              Skip thunderbolt-ibverbs debugfs counter deltas
   --wrapper DIR              vLLM/PyTorch wrapper prefix
   --model DIR                Tiny model directory. Default: $model
   --hf-source MODEL          Cached HF tokenizer/config source. Default: $hf_source
@@ -59,9 +66,11 @@ EOF
 while (($#)); do
   case "$1" in
     --hosts) hosts=$2; shift 2 ;;
+    --counter-hosts) counter_hosts=$2; shift 2 ;;
     --iface) iface=$2; shift 2 ;;
     --log-root) log_root=$2; shift 2 ;;
     --ssh) ssh_cmd=$2; shift 2 ;;
+    --no-counters) capture_counters_enabled=0; shift ;;
     --wrapper) wrapper=$2; shift 2 ;;
     --model) model=$2; shift 2 ;;
     --hf-source) hf_source=$2; shift 2 ;;
@@ -89,6 +98,132 @@ if ((${#host_list[@]} != 2)); then
 fi
 head_host=${host_list[0]}
 worker_host=${host_list[1]}
+
+host_list_from_csv() {
+  local raw=${1//,/ }
+  local host
+
+  for host in $raw; do
+    [[ -n "$host" ]] && printf '%s\n' "$host"
+  done
+}
+
+safe_name() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_'
+}
+
+counter_file() {
+  printf '%s/counters/%s.%s.summary' "$log_root" "$(safe_name "$1")" "$(safe_name "$2")"
+}
+
+capture_counters() {
+  local label=$1
+  local quoted_summary
+  local host
+  local out
+  local err
+  local cmd
+
+  [[ "$capture_counters_enabled" == 1 ]] || return 0
+  mkdir -p "$log_root/counters"
+  printf -v quoted_summary '%q' "$counter_summary"
+  cmd="if command -v sudo >/dev/null 2>&1; then sudo -n cat $quoted_summary 2>/dev/null || cat $quoted_summary; else cat $quoted_summary; fi"
+
+  for host in $(host_list_from_csv "$counter_hosts"); do
+    out=$(counter_file "$label" "$host")
+    err="$out.err"
+    if "$ssh_cmd" -o BatchMode=yes "$host" "$cmd" >"$out.tmp" 2>"$err"; then
+      mv "$out.tmp" "$out"
+      rm -f "$err"
+    else
+      mv "$out.tmp" "$out" 2>/dev/null || :
+      echo "WARN: could not capture counters from $host; see $err" >&2
+    fi
+  done
+}
+
+counter_value() {
+  local file=$1
+  local key=$2
+
+  awk -F':[[:space:]]*' -v key="$key" '
+    $1 == key {
+      value = $2
+      sub(/[[:space:]].*/, "", value)
+      print value ~ /^-?[0-9]+$/ ? value : 0
+      found = 1
+      exit
+    }
+    END { if (!found) print 0 }
+  ' "$file" 2>/dev/null || printf '0\n'
+}
+
+counter_delta_one() {
+  local before_label=$1
+  local after_label=$2
+  local host=$3
+  local key=$4
+  local before_value
+  local after_value
+
+  before_value=$(counter_value "$(counter_file "$before_label" "$host")" "$key")
+  after_value=$(counter_value "$(counter_file "$after_label" "$host")" "$key")
+  printf '%d\n' "$((after_value - before_value))"
+}
+
+counter_delta_sum() {
+  local before_label=$1
+  local after_label=$2
+  local key=$3
+  local host
+  local total=0
+
+  for host in $(host_list_from_csv "$counter_hosts"); do
+    total=$((total + $(counter_delta_one "$before_label" "$after_label" "$host" "$key")))
+  done
+  printf '%d\n' "$total"
+}
+
+print_counter_deltas() {
+  local before_label=$1
+  local after_label=$2
+  local key
+  local host
+  local delta
+  local total
+
+  [[ "$capture_counters_enabled" == 1 ]] || return 0
+  {
+    printf 'TBV counter deltas (%s -> %s):\n' "$before_label" "$after_label"
+    for key in $counter_keys; do
+      total=0
+      for host in $(host_list_from_csv "$counter_hosts"); do
+        delta=$(counter_delta_one "$before_label" "$after_label" "$host" "$key")
+        total=$((total + delta))
+        printf '  %-34s %-16s %+d\n' "$key" "$host" "$delta"
+      done
+      printf '  %-34s %-16s %+d\n' "$key" "sum" "$total"
+    done
+  } | tee "$log_root/counters/deltas.log"
+}
+
+assert_clean_counters() {
+  local before_label=$1
+  local after_label=$2
+  local key
+  local delta
+  local failed=0
+
+  [[ "$capture_counters_enabled" == 1 ]] || return 0
+  for key in $hard_error_keys; do
+    delta=$(counter_delta_sum "$before_label" "$after_label" "$key")
+    if ((delta != 0)); then
+      echo "ERROR: expected $key delta == 0, got $delta" | tee -a "$log_root/counters/deltas.log" >&2
+      failed=1
+    fi
+  done
+  return "$failed"
+}
 
 require_dir() {
   local name=$1
@@ -140,6 +275,9 @@ mkdir -p "$log_root"
   echo "rccl_install=$rccl_install"
   echo "rocshmem_install=$rocshmem_install"
   echo "model=$model"
+  echo "hosts=$hosts"
+  echo "counter_hosts=$counter_hosts"
+  echo "capture_counters=$capture_counters_enabled"
 } > "$log_root/config.txt"
 
 if [[ "$prepare_tiny_model" == 1 ]]; then
@@ -187,6 +325,8 @@ for host in "${host_list[@]}"; do
 done
 
 remote_env() {
+  # Expand LD_LIBRARY_PATH on the remote host, not while building this command.
+  # shellcheck disable=SC2016
   printf 'export LD_LIBRARY_PATH=%q:%q:${LD_LIBRARY_PATH:-}; ' \
     "$rccl_install/lib" "$rocshmem_install/lib"
   printf 'export GLOO_SOCKET_IFNAME=%q NCCL_SOCKET_IFNAME=%q RCCL_SOCKET_IFNAME=%q; ' \
@@ -211,10 +351,25 @@ cleanup() {
   stop_ray "$worker_host" "$log_root/ray-stop-worker.log"
   stop_ray "$head_host" "$log_root/ray-stop-head.log"
 }
-trap cleanup EXIT
+
+finish() {
+  local status=$?
+
+  set +e
+  capture_counters after
+  print_counter_deltas before after
+  if ((status == 0)); then
+    assert_clean_counters before after || status=1
+  fi
+  cleanup
+  exit "$status"
+}
+trap finish EXIT
 
 stop_ray "$worker_host" "$log_root/ray-stop-worker-before.log"
 stop_ray "$head_host" "$log_root/ray-stop-head-before.log"
+
+capture_counters before
 
 run_vllm_cmd() {
   local out=$1

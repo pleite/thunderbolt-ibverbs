@@ -109,3 +109,16 @@ TBV counter deltas were still zero on both hosts (`dv_poll_wqes`,
 WR retransmits/timeouts, TX posted/completed, TX errors, RX cancels, and atomic
 request/response counters). Lowering the threshold does not make this tiny vLLM
 path exercise ROCSHMEM/GDA.
+
+Harness update after this run:
+
+- `userspace/bench/tbv_vllm_smoke.sh` now captures
+  `/sys/kernel/debug/thunderbolt_ibverbs/summary` before and after the smoke on
+  both hosts, writes raw snapshots under `$log_root/counters/`, and emits
+  `$log_root/counters/deltas.log`.
+- The smoke fails if hard correctness counters move: DV hard errors, WR timeout
+  or retry exhaustion, retransmit teardown guards, TX errors/cancels, RX
+  cancels, no-QP/error-ACK tombstone paths, or tombstone evictions.
+- `dv_poll_wqes`, retransmit, ACK, TX, and no-QP deltas are therefore captured
+  by default on future vLLM runs, which makes "does this vLLM shape actually
+  exercise GDA?" a harness-level answer rather than a manual side capture.
