@@ -176,8 +176,12 @@ tbv_tbnet_minimal_response_matches(
 	const struct tbv_tbip_control *request,
 	const struct tbv_tbip_control *response)
 {
+	/*
+	 * macOS echoes command_id in TBIP responses but advances the sequence
+	 * number from its own control stream. command_id is the request identity;
+	 * sequence is only useful for that sender's XDomain control flow.
+	 */
 	return tbv_tbnet_minimal_ctrl_matches(session, response) &&
-	       response->sequence == request->sequence &&
 	       response->command_id == request->command_id;
 }
 
@@ -1061,7 +1065,7 @@ static void tbv_tbnet_minimal_login_work(struct work_struct *work)
 						    &response);
 	if (!ret &&
 	    (!tbv_tbnet_minimal_response_matches(session, &params.ctrl,
-						&response.ctrl) ||
+						 &response.ctrl) ||
 	     response.status)) {
 		ret = -EPROTO;
 	}
