@@ -170,6 +170,17 @@ tbv_tbnet_minimal_ctrl_matches(const struct tbv_tbnet_minimal_session *session,
 	       uuid_equal(&ctrl->target_uuid, session->xd->local_uuid);
 }
 
+static bool
+tbv_tbnet_minimal_response_matches(
+	const struct tbv_tbnet_minimal_session *session,
+	const struct tbv_tbip_control *request,
+	const struct tbv_tbip_control *response)
+{
+	return tbv_tbnet_minimal_ctrl_matches(session, response) &&
+	       response->sequence == request->sequence &&
+	       response->command_id == request->command_id;
+}
+
 static u32 tbv_tbnet_minimal_frame_len(const struct ring_frame *frame)
 {
 	return frame->size ? frame->size : (u32)TBV_TBNET_MIN_FRAME_SIZE;
@@ -1043,7 +1054,8 @@ static void tbv_tbnet_minimal_login_work(struct work_struct *work)
 		ret = tbv_tbip_parse_login_response(reply, sizeof(reply),
 						    &response);
 	if (!ret &&
-	    (!tbv_tbnet_minimal_ctrl_matches(session, &response.ctrl) ||
+	    (!tbv_tbnet_minimal_response_matches(session, &params.ctrl,
+						&response.ctrl) ||
 	     response.status)) {
 		ret = -EPROTO;
 	}
@@ -1109,7 +1121,6 @@ static int tbv_tbnet_minimal_send_status(
 
 	memset(&params, 0, sizeof(params));
 	tbv_tbnet_minimal_fill_reply_ctrl(session, request, &params.ctrl);
-	params.ctrl.command_id = atomic_inc_return(&session->command_id);
 	len = tbv_tbip_build_status(reply, sizeof(reply), &params);
 	if (len < 0)
 		return len;
@@ -1150,7 +1161,7 @@ tbv_tbnet_minimal_send_logout_request(struct tbv_tbnet_minimal_session *session,
 	if (!ret)
 		ret = tbv_tbip_parse_status(reply, sizeof(reply), &status);
 	if (!ret &&
-	    (!tbv_tbnet_minimal_ctrl_matches(session, &status.ctrl) ||
+	    (!tbv_tbnet_minimal_response_matches(session, &ctrl, &status.ctrl) ||
 	     status.status)) {
 		ret = -EPROTO;
 	}
