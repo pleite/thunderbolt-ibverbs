@@ -37,6 +37,7 @@ let
     "tbv_app_gate_summarize.sh"
     "tbv_perftest_runner.py"
     "tbv_pytorch_smoke.py"
+    "tbv_pytorch_chunk_sweep.sh"
     "tbv_rdma_sweep.py"
     "tbv_uc_stress.py"
     "tbv_rocshmem_example.sh"
