@@ -652,12 +652,17 @@ print_dv_write_tx_mr_bucket_aggregates() {
         exit
       for (key in count) {
         split(key, p, SUBSEP)
+        avg_bytes = count[key] ? bytes[key] / count[key] : 0
         avg_ms = count[key] ? ns[key] / count[key] / 1000000 : 0
         copy_avg_ms = count[key] ? copy_ns[key] / count[key] / 1000000 : 0
         postcopy_avg_ms = count[key] ? postcopy_ns[key] / count[key] / 1000000 : 0
-        printf "%s %s %s %s %d %d %.3f %.3f %.3f\n",
-          p[1], p[2], p[3], p[4], count[key], bytes[key], avg_ms,
-          copy_avg_ms, postcopy_avg_ms
+        total_gbps = ns[key] ? bytes[key] * 8 / ns[key] : 0
+        copy_gbps = copy_ns[key] ? bytes[key] * 8 / copy_ns[key] : 0
+        postcopy_gbps = postcopy_ns[key] ? bytes[key] * 8 / postcopy_ns[key] : 0
+        printf "%s %s %s %s %d %d %.0f %.3f %.3f %.3f %.2f %.2f %.2f\n",
+          p[1], p[2], p[3], p[4], count[key], bytes[key], avg_bytes,
+          avg_ms, copy_avg_ms, postcopy_avg_ms,
+          total_gbps, copy_gbps, postcopy_gbps
       }
     }
   ' | sort -V | awk '
@@ -667,7 +672,7 @@ print_dv_write_tx_mr_bucket_aggregates() {
     {
       if (!printed) {
         printf "\ndv_write_tx_mr_bucket aggregates:\n"
-        printf "suite collective mode bucket count bytes avg_ms copy_avg_ms postcopy_avg_ms\n"
+        printf "suite collective mode bucket count bytes avg_bytes avg_ms copy_avg_ms postcopy_avg_ms total_gbps copy_gbps postcopy_gbps\n"
         printed = 1
       }
       print
