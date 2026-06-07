@@ -68,7 +68,7 @@ void tbv_path_exit_optional_symbols(void)
 static bool apple_tx_raw_mode;
 module_param(apple_tx_raw_mode, bool, 0644);
 MODULE_PARM_DESC(apple_tx_raw_mode,
-		 "Use RAW descriptors for Apple-compatible TX rings; default keeps FRAME descriptors");
+		 "Use RAW descriptors for Apple-compatible TX rings; experimental and only valid for 4 KiB-multiple SEND payloads");
 
 static bool apple_tx_e2e;
 module_param(apple_tx_e2e, bool, 0644);

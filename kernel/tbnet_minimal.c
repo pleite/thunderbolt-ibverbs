@@ -359,7 +359,8 @@ static int tbv_tbnet_minimal_prime_rx(struct tbv_tbnet_minimal_session *session)
 static int
 tbv_tbnet_minimal_alloc_rings(struct tbv_tbnet_minimal_session *session)
 {
-	unsigned int flags = RING_FLAG_FRAME;
+	unsigned int rx_flags = RING_FLAG_FRAME;
+	unsigned int tx_flags = RING_FLAG_FRAME;
 	u16 sof_mask = BIT(TBV_TBNET_PDF_FRAME_START);
 	u16 eof_mask = BIT(TBV_TBNET_PDF_FRAME_END);
 	int hopid;
@@ -367,10 +368,11 @@ tbv_tbnet_minimal_alloc_rings(struct tbv_tbnet_minimal_session *session)
 
 	if (session->identity->minimal_e2e &&
 	    session->svc->prtcstns & TBV_TBNET_E2E)
-		flags |= RING_FLAG_E2E;
+		rx_flags |= RING_FLAG_E2E;
 
 	session->tx_ring = tb_ring_alloc_tx(session->xd->tb->nhi, -1,
-					    TBV_TBNET_MIN_RING_SIZE, flags);
+					    TBV_TBNET_MIN_RING_SIZE,
+					    tx_flags);
 	if (!session->tx_ring)
 		return -ENOMEM;
 
@@ -382,7 +384,8 @@ tbv_tbnet_minimal_alloc_rings(struct tbv_tbnet_minimal_session *session)
 	session->local_transmit_path = hopid;
 
 	session->rx_ring = tb_ring_alloc_rx(session->xd->tb->nhi, -1,
-					    TBV_TBNET_MIN_RING_SIZE, flags,
+					    TBV_TBNET_MIN_RING_SIZE,
+					    rx_flags,
 					    session->tx_ring->hop,
 					    sof_mask, eof_mask,
 					    tbv_tbnet_minimal_rx_ready,
