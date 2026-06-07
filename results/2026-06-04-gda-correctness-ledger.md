@@ -5107,3 +5107,23 @@ Interpretation:
    `native_qp_destroy_trace=N`,
    `native_unsafe_retransmit_teardown_guard_disable=N`,
    `native_tx_max_inflight=0`, and `qp_timeout_ms=5000`.
+
+### Interpreting `data_rx_canceled=4096`
+
+The repeated post-reboot/post-peer-reset `data_rx_canceled=4096` observations
+should not be treated the same way as an in-run counter delta. The RX canceled
+counter increments in `tbv_path_rx_complete(..., canceled=true)` and returns
+before frame decode. `tbv_path_destroy()` stops the RX ring with `tb_ring_stop()`
+before freeing it, so a peer/path teardown can legitimately complete all posted
+RX buffers as canceled callbacks.
+
+On the native backend, `TBV_NATIVE_RING_SIZE` is 1024. A counter value of 4096 is
+therefore exactly four full native RX rings being stopped and drained. That
+matches the absolute baseline seen after peer reboot/re-enumeration, and it also
+matches the later application-level rows where the absolute baseline stayed at
+4096 but the measured run delta was `+0`.
+
+Operational rule: `data_rx_canceled` is useful as a before/after delta inside a
+controlled run. As an absolute post-reboot or post-topology-reset value, 4096 is
+consistent with normal ring teardown accounting and is not by itself evidence of
+data loss, a timeout-work stall, or the old hard-reset race.
