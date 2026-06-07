@@ -28,6 +28,7 @@ channels_per_peer=${TBV_VLLM_CHANNELS_PER_PEER:-1}
 min_channels=${TBV_VLLM_MIN_CHANNELS:-1}
 max_channels=${TBV_VLLM_MAX_CHANNELS:-1}
 nccl_debug=${TBV_VLLM_NCCL_DEBUG:-WARN}
+rdma_lib_dirs=${TBV_VLLM_RDMA_LIB_DIRS:-/run/current-system/sw/lib}
 
 rccl_install=${RCCL_INSTALL_DIR:-}
 rocshmem_install=${ROCSHMEM_INSTALL_DIR:-}
@@ -75,6 +76,7 @@ Options:
   --min-channels N           Default: $min_channels
   --max-channels N           Default: $max_channels
   --nccl-debug LEVEL         Default: $nccl_debug
+  --rdma-lib-dirs DIRS       Colon-separated libibverbs/librdmacm dirs. Default: $rdma_lib_dirs
   --rccl-install DIR         Required only for --transport gda
   --rocshmem-install DIR     Required only for --transport gda
   --chunk-bytes N            GDA chunk bytes. Default: $chunk_bytes
@@ -113,6 +115,7 @@ while (($#)); do
     --min-channels) min_channels=$2; shift 2 ;;
     --max-channels) max_channels=$2; shift 2 ;;
     --nccl-debug) nccl_debug=$2; shift 2 ;;
+    --rdma-lib-dirs) rdma_lib_dirs=$2; shift 2 ;;
     --rccl-install) rccl_install=$2; shift 2 ;;
     --rocshmem-install) rocshmem_install=$2; shift 2 ;;
     --chunk-bytes) chunk_bytes=$2; shift 2 ;;
@@ -362,6 +365,7 @@ mkdir -p "$log_root"
   echo "qps_per_connection=$qps_per_connection"
   echo "split_data_on_qps=$split_data_on_qps"
   echo "channels_per_peer=$channels_per_peer"
+  echo "rdma_lib_dirs=$rdma_lib_dirs"
   echo "capture_counters=$capture_counters_enabled"
 } > "$log_root/config.txt"
 
@@ -431,6 +435,12 @@ base_remote_env() {
     "$min_channels" "$min_channels" "$max_channels" "$max_channels"
   printf 'export VLLM_NO_USAGE_STATS=1 VLLM_DO_NOT_TRACK=1 RAY_USAGE_STATS_ENABLED=0 RAY_DEDUP_LOGS=0 NCCL_DEBUG=%q RCCL_DEBUG=%q; ' \
     "$nccl_debug" "$nccl_debug"
+  if [[ -n "$rdma_lib_dirs" ]]; then
+    # RCCL dlopens libibverbs/librdmacm by soname; Nix wrappers do not expose
+    # system RDMA libraries to Ray workers unless we pass the library path here.
+    # shellcheck disable=SC2016
+    printf 'export LD_LIBRARY_PATH=%q:${LD_LIBRARY_PATH:-}; ' "$rdma_lib_dirs"
+  fi
 }
 
 gda_remote_env() {
