@@ -116,7 +116,8 @@
               tools/ci/distro-package-rdma.sh \
               tools/ci/distro-package.sh \
               tools/ci/vm-guest-smoke.sh \
-              tools/ci/vm-smoke.sh
+              tools/ci/vm-smoke.sh \
+              userspace/bench/tbv_vllm_smoke.sh
             runHook postBuild
           '';
 
