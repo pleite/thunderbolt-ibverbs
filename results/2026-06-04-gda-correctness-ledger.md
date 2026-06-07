@@ -4973,3 +4973,137 @@ Interpretation:
 3. The remaining per-WR span is post-copy/native TX completion, about 1.0-1.1
    ms for 1 MiB. That is now the next performance target for application-level
    benchmarking, not the rocSHMEM scratch slot selection.
+
+### 2026-06-07 timeout-work list-walk fix after rebase cleanup
+
+The post-rebase tombstone-off stress rows isolated a watchdog stall in the
+sender timeout worker. The captured stack was in
+`tbv_qp_timeout_work [thunderbolt_ibverbs]`, with the CPU spinning while IRQs
+were disabled. Code inspection found the concrete list-walk hazard:
+
+```text
+tbv_qp_timeout_reap_tx()
+  holds tqp->lock with IRQs disabled
+  walks tqp->pending_sends with list_for_each_entry_safe()
+  calls tbv_qp_drain_ready_sends_locked() from inside that walk
+  drain moves ready sends from pending_sends to completed_sends
+```
+
+Moving the current entry, or the `send_tmp` entry saved by the "safe" iterator,
+invalidates the pending-list traversal. The resulting walk can continue on the
+wrong list or cycle while holding the spinlock, matching the RCU stall and hard
+reset behavior.
+
+Fix:
+
+```text
+kernel/ibdev.c:
+  tbv_qp_timeout_reap_tx() now restarts the pending_sends traversal after each
+  tbv_qp_drain_ready_sends_locked() call made from that traversal.
+```
+
+Diagnostic counters added in the same cycle:
+
+```text
+data_qp_destroy_enter
+data_qp_destroy_timeout
+data_qp_destroy_completed
+data_wr_retry_post_attempt
+data_wr_retry_post_ok
+data_wr_retry_post_enomem
+data_wr_retry_post_enotconn
+data_wr_retry_post_error
+```
+
+`native_qp_destroy_trace` remains a disabled-by-default emergency print knob for
+future teardown/watchdog diagnosis. The speculative `data_wr_send_timeout`
+counter was removed before the final deploy; both hosts confirmed it absent from
+debugfs after reboot.
+
+Final tightened deployment:
+
+```text
+source HEAD while testing:
+  da7634e results: record post-rebase app gates
+
+strix-1 system:
+  /nix/store/kpbl0mrjdxd410kvpbwzymvjgd6m02lg-nixos-system-strix-1-26.11pre-git
+strix-2 system:
+  /nix/store/6cb5m4liwwlzri29rfbmp4v2zfsvlfbx-nixos-system-strix-2-26.11pre-git
+
+thunderbolt-ibverbs module derivation copied by Colmena:
+  /nix/store/h8z91j5lwc3mw8i3apjjkfxvg990jssi-thunderbolt-ibverbs-0.1.0
+```
+
+Final Strix Thunderbolt validation before reserving the machines for other work:
+
+```text
+run:
+  /mnt/Home/tmp/tbv-probe/restart-drain-tight-tombstone-off-20260607-042959
+
+mode:
+  receiver=strix-1 usb4_rdma0
+  sender=strix-2 usb4_rdma0
+  count=256 size=65536 unsafe-no-final-fence
+  native_tx_max_inflight=6
+  qp_timeout_ms=200
+  receiver native_ack_drop_every=2
+  native_qp_tombstone_reack=0 on both hosts
+  native_unsafe_retransmit_teardown_guard_disable=0
+
+process result:
+  receiver rc=0, status=OK
+  sender rc=0, status=OK
+  boot IDs unchanged on both hosts
+```
+
+Key deltas:
+
+```text
+sender:
+  data_wr_retransmit                 +262
+  data_wr_retry_post_attempt         +262
+  data_wr_retry_post_ok              +262
+  data_wr_retry_post_enomem          +0
+  data_wr_retry_post_enotconn        +0
+  data_wr_retry_post_error           +0
+  data_wr_retry_exhausted            +1
+  data_wr_timeout                    +1
+  data_tx_posted/data_tx_completed   +7046/+7046
+  data_tx_errors/data_tx_canceled    +0/+0
+  data_rx_canceled                   +0
+  data_wr_retransmit_closing_qp      +0
+  data_wr_retransmit_no_live_path    +0
+  data_wr_retransmit_teardown_path   +0
+  data_wr_live                       +0
+
+receiver:
+  data_rx_no_qp                      +119
+  data_rx_no_qp_reack                +0
+  data_rx_duplicate_ack              +2319
+  data_tx_posted/data_tx_completed   +3052/+3052
+  data_tx_errors/data_tx_canceled    +0/+0
+  data_rx_canceled                   +0
+  data_wr_live                       +0
+```
+
+Interpretation:
+
+1. The timeout-work hard-reset/stall mechanism is fixed by the list-walk
+   restart. The high-loss tombstone-off teardown workload completed without a
+   reboot, without a TX completion gap, without retry-post errors, and without
+   any RX-canceled delta.
+2. Tombstone-off is still intentionally not application-correct under lost ACKs:
+   the sender recorded one retry exhaustion and one WR timeout. This is the
+   expected A/B contrast proving why `native_qp_tombstone_reack=1` remains the
+   operational default.
+3. The probe's `status=OK` in this unfenced mode is not enough to override the
+   kernel timeout counter. The probe polls one signaled CQE per sequence and can
+   finish after the visibility condition even though teardown/retry cleanup later
+   records the lost-ACK timeout. Treat this row as a teardown/watchdog stress
+   validation, not as an application-level correctness pass for tombstone-off.
+4. After the run, both hosts were restored to safe params:
+   `native_ack_drop_every=0`, `native_qp_tombstone_reack=Y`,
+   `native_qp_destroy_trace=N`,
+   `native_unsafe_retransmit_teardown_guard_disable=N`,
+   `native_tx_max_inflight=0`, and `qp_timeout_ms=5000`.

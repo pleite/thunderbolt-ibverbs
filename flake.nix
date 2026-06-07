@@ -198,6 +198,10 @@
               -o tbv-proto-smoke
             ./tbv-proto-smoke
             $CC -std=c11 -Wall -Wextra -Werror -I. \
+              tools/ci/apple-smoke.c \
+              -o tbv-apple-smoke
+            ./tbv-apple-smoke
+            $CC -std=c11 -Wall -Wextra -Werror -I. \
               tools/ci/reliability-smoke.c \
               proto/reliability.c \
               -o tbv-reliability-smoke

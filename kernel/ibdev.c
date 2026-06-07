@@ -95,6 +95,7 @@ static char *roce_netdev;
 static bool native_qp_tombstone_reack = true;
 static uint native_qp_tombstone_max = TBV_QP_TOMBSTONE_DEFAULT_MAX;
 static bool native_unsafe_retransmit_teardown_guard_disable;
+static bool native_qp_destroy_trace;
 static uint native_ack_repeat = 1;
 static bool native_ack_probe;
 static bool native_write_gap_rnr;
@@ -197,6 +198,10 @@ MODULE_PARM_DESC(native_qp_tombstone_max,
 module_param(native_unsafe_retransmit_teardown_guard_disable, bool, 0644);
 MODULE_PARM_DESC(native_unsafe_retransmit_teardown_guard_disable,
 		 "Unsafe fault injection: allow retry retransmits to continue after selecting a tearing-down native path; 0 keeps the guard enabled");
+
+module_param(native_qp_destroy_trace, bool, 0644);
+MODULE_PARM_DESC(native_qp_destroy_trace,
+		 "Emergency-print native QP destroy stages for watchdog-wedge diagnosis; 0 disables");
 
 static uint apple_tx_max_inflight_wr = 16;
 module_param(apple_tx_max_inflight_wr, uint, 0644);
@@ -525,7 +530,6 @@ struct tbv_qp {
 	u32 apple_pending_ready_count;
 	u32 apple_pending_bytes;
 	int apple_pending_active;
-	u32 apple_sq_outstanding;
 	bool dv_queue_active;
 	bool dv_cq_overflow;
 	bool dv_poll_listed;
@@ -637,7 +641,6 @@ struct tbv_send_ctx {
 	bool sq_counted;
 	bool apple_window_acquired;
 	bool apple_window_wr_acquired;
-	bool apple_sq_counted;
 	u32 apple_window_frames;
 	struct delayed_work apple_complete_work;
 	int apple_complete_status;
@@ -1237,11 +1240,81 @@ static void tbv_qp_schedule_timeout(struct tbv_qp *tqp)
 	spin_unlock_irqrestore(&tqp->lock, flags);
 }
 
+static void tbv_qp_destroy_trace(struct tbv_qp *tqp, const char *stage)
+{
+	struct tbv_send_ctx *send;
+	unsigned long flags;
+	u32 pending_sends = 0;
+	u32 ready_sends = 0;
+	u32 retrying_sends = 0;
+	int tx_pending = 0;
+	bool timeout_armed;
+	bool closing;
+	enum ib_qp_state qp_state;
+
+	if (!READ_ONCE(native_qp_destroy_trace) || !tqp)
+		return;
+
+	spin_lock_irqsave(&tqp->lock, flags);
+	list_for_each_entry(send, &tqp->pending_sends, node) {
+		pending_sends++;
+		if (send->ready)
+			ready_sends++;
+		if (send->retrying)
+			retrying_sends++;
+		tx_pending += atomic_read(&send->tx_pending);
+	}
+	timeout_armed = tqp->timeout_work_armed;
+	closing = tqp->closing;
+	qp_state = tqp->state;
+	spin_unlock_irqrestore(&tqp->lock, flags);
+
+	pr_emerg("thunderbolt_ibverbs: native QP destroy trace stage=%s qpn=0x%x dest_qp=0x%x refs=%u closing=%u qp_state=%u pending_sends=%u ready_sends=%u retrying_sends=%u tx_pending=%d timeout_armed=%u data_wr_live=%lld\n",
+		 stage, tqp->base.qp_num, tqp->attr.dest_qp_num,
+		 refcount_read(&tqp->refs), closing, qp_state,
+		 pending_sends, ready_sends, retrying_sends, tx_pending,
+		 timeout_armed,
+		 tqp->owner ? atomic64_read(&tqp->owner->data_wr_live) : 0);
+}
+
+static void tbv_send_retry_trace(struct tbv_send_ctx *send,
+				 const char *stage, int ret)
+{
+	struct tbv_qp *tqp;
+	unsigned long now = jiffies;
+	unsigned long queued_age_ms = 0;
+	unsigned long first_age_ms = 0;
+
+	if (!READ_ONCE(native_qp_destroy_trace) || !send)
+		return;
+
+	tqp = send->tqp;
+	if (!tqp)
+		return;
+
+	if (send->queued_jiffies)
+		queued_age_ms = jiffies_to_msecs(now - send->queued_jiffies);
+	if (send->first_queued_jiffies)
+		first_age_ms =
+			jiffies_to_msecs(now - send->first_queued_jiffies);
+
+	pr_emerg("thunderbolt_ibverbs: native send retry trace stage=%s qpn=0x%x dest_qp=0x%x psn=%u opcode=%u total=%u ret=%d reason=%u pending=%u ready=%u completed=%u retrying=%u rnr_waiting=%u retries=%u max_retries=%u rnr_retries=%u max_rnr_retries=%u tx_pending=%d queued_age_ms=%lu first_age_ms=%lu data_wr_live=%lld\n",
+		 stage, tqp->base.qp_num, tqp->attr.dest_qp_num,
+		 send->psn, send->opcode, send->total_len, ret,
+		 send->retry_reason, send->pending, send->ready,
+		 send->completed, send->retrying, send->rnr_waiting,
+		 send->retries, send->max_retries, send->rnr_retries,
+		 send->max_rnr_retries, atomic_read(&send->tx_pending),
+		 queued_age_ms, first_age_ms,
+		 tqp->owner ? atomic64_read(&tqp->owner->data_wr_live) : 0);
+}
+
 static bool tbv_qp_mark_error(struct tbv_qp *tqp)
 {
 	unsigned long flags;
 	bool changed = false;
 
+	tbv_qp_destroy_trace(tqp, "mark-error-enter");
 	spin_lock_irqsave(&tqp->lock, flags);
 	if (!tqp->closing && tqp->state != IB_QPS_ERR) {
 		tqp->state = IB_QPS_ERR;
@@ -1251,9 +1324,11 @@ static bool tbv_qp_mark_error(struct tbv_qp *tqp)
 	spin_unlock_irqrestore(&tqp->lock, flags);
 
 	if (changed) {
+		tbv_qp_destroy_trace(tqp, "mark-error-before-flush");
 		wake_up_all(&tqp->credit_wait);
 		wake_up_all(&tqp->apple_tx_wait);
 		tbv_qp_flush_error(tqp);
+		tbv_qp_destroy_trace(tqp, "mark-error-after-flush");
 	}
 
 	return changed;
@@ -3374,10 +3449,16 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 	u32 pending;
 	u32 i;
 
+	if (tqp->owner)
+		atomic64_inc(&tqp->owner->data_qp_destroy_enter);
+	tbv_qp_destroy_trace(tqp, "enter");
+
 	spin_lock_irqsave(&tqp->lock, flags);
 	tqp->closing = true;
 	spin_unlock_irqrestore(&tqp->lock, flags);
+	tbv_qp_destroy_trace(tqp, "closing-set");
 	tbv_qp_publish_tombstone(tqp);
+	tbv_qp_destroy_trace(tqp, "tombstone-published");
 
 	if (tqp->type == IB_QPT_GSI && tqp->rail && tqp->rail->ibdev) {
 		mutex_lock(&tqp->owner->lock);
@@ -3388,9 +3469,12 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 
 	wake_up_all(&tqp->credit_wait);
 	wake_up_all(&tqp->apple_tx_wait);
+	tbv_qp_destroy_trace(tqp, "before-apple-cancel");
 	cancel_work_sync(&tqp->apple_sq_work);
+	tbv_qp_destroy_trace(tqp, "after-apple-cancel");
 
 	mutex_lock(&tqp->dv_mutex);
+	tbv_qp_destroy_trace(tqp, "before-dv-detach");
 	tbv_dv_poll_detach_locked(tqp);
 	spin_lock_irqsave(&tqp->lock, flags);
 	if (tqp->dv_queue_active) {
@@ -3410,14 +3494,21 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 			USB4_RDMA_DV_QP_DEAD, dv_generation);
 	mutex_unlock(&tqp->dv_mutex);
 	tbv_dv_release_resources(&dv_old);
+	tbv_qp_destroy_trace(tqp, "after-dv-detach");
 
+	tbv_qp_destroy_trace(tqp, "before-timeout-cancel");
 	cancel_delayed_work_sync(&tqp->timeout_work);
+	tbv_qp_destroy_trace(tqp, "after-timeout-cancel");
 	spin_lock_irqsave(&tqp->lock, flags);
 	tqp->timeout_work_armed = false;
 	spin_unlock_irqrestore(&tqp->lock, flags);
 
+	tbv_qp_destroy_trace(tqp, "before-flush-apple-sq");
 	tbv_qp_flush_apple_sq(tqp);
+	tbv_qp_destroy_trace(tqp, "after-flush-apple-sq");
+	tbv_qp_destroy_trace(tqp, "before-flush-sends");
 	tbv_qp_flush_sends(tqp, &flush);
+	tbv_qp_destroy_trace(tqp, "after-flush-sends");
 	while (!list_empty(&flush)) {
 		struct tbv_send_ctx *send =
 			list_first_entry(&flush, struct tbv_send_ctx, node);
@@ -3428,8 +3519,11 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 		tbv_send_complete(send, status);
 		tbv_send_ctx_put(send);
 	}
+	tbv_qp_destroy_trace(tqp, "after-complete-sends");
 
+	tbv_qp_destroy_trace(tqp, "before-flush-reads");
 	tbv_qp_flush_reads(tqp, &flush);
+	tbv_qp_destroy_trace(tqp, "after-flush-reads");
 	while (!list_empty(&flush)) {
 		struct tbv_read_ctx *read =
 			list_first_entry(&flush, struct tbv_read_ctx, node);
@@ -3439,8 +3533,11 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 		tbv_read_complete(read, -ECANCELED);
 		tbv_read_ctx_put(read);
 	}
+	tbv_qp_destroy_trace(tqp, "after-complete-reads");
 
+	tbv_qp_destroy_trace(tqp, "before-cancel-read-resps");
 	tbv_qp_cancel_read_resps(tqp, &flush);
+	tbv_qp_destroy_trace(tqp, "after-cancel-read-resps");
 	while (!list_empty(&flush)) {
 		struct tbv_read_resp_ctx *ctx =
 			list_first_entry(&flush, struct tbv_read_resp_ctx, node);
@@ -3448,14 +3545,19 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 		list_del_init(&ctx->node);
 		tbv_read_resp_ctx_put(ctx);
 	}
+	tbv_qp_destroy_trace(tqp, "before-ref-wait");
 
 	if (!wait_event_timeout(tqp->refs_wait,
 				refcount_read(&tqp->refs) == 1,
 				msecs_to_jiffies(5000))) {
+		if (tqp->owner)
+			atomic64_inc(&tqp->owner->data_qp_destroy_timeout);
+		tbv_qp_destroy_trace(tqp, "ref-wait-timeout");
 		pr_warn("QP %u destroy timed out with %u refs; leaving it closing for retry\n",
 			qp->qp_num, refcount_read(&tqp->refs));
 		return -ETIMEDOUT;
 	}
+	tbv_qp_destroy_trace(tqp, "after-ref-wait");
 
 	tbv_qp_publish_tombstone(tqp);
 	if (tqp->owner && tqp->qpn_allocated) {
@@ -3464,8 +3566,13 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 		xa_unlock_irqrestore(&tqp->owner->verbs_qps_xa, flags);
 	}
 
+	if (tqp->owner)
+		atomic64_inc(&tqp->owner->data_qp_destroy_completed);
+	tbv_qp_destroy_trace(tqp, "before-final-put");
 	tbv_qp_put(tqp);
+	tbv_qp_destroy_trace(tqp, "before-refs-zero");
 	wait_for_completion(&tqp->refs_zero);
+	tbv_qp_destroy_trace(tqp, "after-refs-zero");
 	tbv_qp_flush_active_rx(tqp);
 	tbv_qp_flush_reorder(tqp);
 	tbv_qp_flush_apple_pending(tqp);
@@ -3611,50 +3718,6 @@ static void tbv_send_ctx_put(struct tbv_send_ctx *send)
 	}
 }
 
-static void tbv_apple_sq_release_slot(struct tbv_send_ctx *send)
-{
-	struct tbv_qp *tqp = send->tqp;
-	unsigned long flags;
-	bool wake = false;
-
-	spin_lock_irqsave(&tqp->lock, flags);
-	if (send->apple_sq_counted) {
-		send->apple_sq_counted = false;
-		if (tqp->apple_sq_outstanding)
-			tqp->apple_sq_outstanding--;
-		wake = true;
-	}
-	spin_unlock_irqrestore(&tqp->lock, flags);
-
-	if (wake)
-		wake_up_all(&tqp->apple_tx_wait);
-}
-
-static int tbv_apple_sq_reserve_slot(struct tbv_qp *tqp,
-				     struct tbv_send_ctx *send)
-{
-	unsigned long flags;
-	u32 max_wr = tqp->init_attr.cap.max_send_wr;
-	int ret = 0;
-
-	if (!max_wr)
-		max_wr = 1;
-
-	spin_lock_irqsave(&tqp->lock, flags);
-	if (tqp->closing || tqp->state == IB_QPS_ERR) {
-		ret = -ECANCELED;
-	} else if (tqp->apple_sq_outstanding >= max_wr) {
-		ret = -ENOMEM;
-		atomic64_inc(&tqp->owner->apple_sq_full);
-	} else {
-		tqp->apple_sq_outstanding++;
-		send->apple_sq_counted = true;
-	}
-	spin_unlock_irqrestore(&tqp->lock, flags);
-
-	return ret;
-}
-
 static void tbv_apple_sq_free_entry(struct tbv_apple_sq_entry *entry)
 {
 	if (!entry)
@@ -3706,7 +3769,8 @@ static void tbv_qp_release_apple_tx_window(struct tbv_qp *tqp,
 		wake_up_all(&tqp->apple_tx_wait);
 }
 
-static bool tbv_send_complete(struct tbv_send_ctx *send, int status)
+static bool tbv_send_complete_common(struct tbv_send_ctx *send, int status,
+				     bool cancel_packets)
 {
 	struct tbv_qp *tqp = send->tqp;
 	unsigned long flags;
@@ -3721,8 +3785,8 @@ static bool tbv_send_complete(struct tbv_send_ctx *send, int status)
 	if (!complete)
 		return false;
 
-	tbv_cancel_send_ctx_packets(send);
-	tbv_apple_sq_release_slot(send);
+	if (cancel_packets)
+		tbv_cancel_send_ctx_packets(send);
 
 	if (send->apple_window_acquired) {
 		tbv_qp_release_apple_tx_window(tqp,
@@ -3757,6 +3821,26 @@ static bool tbv_send_complete(struct tbv_send_ctx *send, int status)
 	}
 
 	return true;
+}
+
+static bool tbv_send_complete(struct tbv_send_ctx *send, int status)
+{
+	return tbv_send_complete_common(send, status, true);
+}
+
+static bool tbv_apple_send_complete_after_tx(struct tbv_send_ctx *send,
+					     int status)
+{
+	/*
+	 * A successful Apple UC SEND reaches this path from the TX completion
+	 * callback after the path packet has already left the staging ring.
+	 * The generic completion helper scans all queued/in-flight path frames
+	 * to cancel stale retransmit work; doing that here is both unnecessary
+	 * and expensive because Apple-compatible rings use 16K staging frames.
+	 * Keep the scan for errors, where later frames for the same WR may
+	 * still need to be canceled.
+	 */
+	return tbv_send_complete_common(send, status, status != 0);
 }
 
 static bool tbv_send_is_completed(struct tbv_send_ctx *send)
@@ -4033,7 +4117,7 @@ static void tbv_apple_send_complete_work(struct work_struct *work)
 		container_of(to_delayed_work(work), struct tbv_send_ctx,
 			     apple_complete_work);
 
-	tbv_send_complete(send, send->apple_complete_status);
+	tbv_apple_send_complete_after_tx(send, send->apple_complete_status);
 	tbv_send_ctx_put(send);
 }
 
@@ -4065,7 +4149,7 @@ static void tbv_apple_complete_ordered_sends(struct tbv_qp *tqp,
 			}
 		}
 
-		tbv_send_complete(send, status);
+		tbv_apple_send_complete_after_tx(send, status);
 		tbv_send_ctx_put(send);
 	}
 }
@@ -4106,6 +4190,7 @@ static bool tbv_qp_timeout_reap_tx(struct tbv_qp *tqp,
 	bool need_resched = false;
 
 	spin_lock_irqsave(&tqp->lock, flags);
+restart_sends:
 	list_for_each_entry_safe(send, send_tmp, &tqp->pending_sends, node) {
 		u8 max_retries = send->max_retries;
 		unsigned long send_timeout =
@@ -4162,7 +4247,7 @@ static bool tbv_qp_timeout_reap_tx(struct tbv_qp *tqp,
 			if (tx_failed)
 				*tx_failed = true;
 			tbv_qp_drain_ready_sends_locked(tqp, completed_sends);
-			continue;
+			goto restart_sends;
 		}
 
 		if (!tbv_qp_entry_expired(send->queued_jiffies, now,
@@ -4211,6 +4296,7 @@ static bool tbv_qp_timeout_reap_tx(struct tbv_qp *tqp,
 		if (tx_failed)
 			*tx_failed = true;
 		tbv_qp_drain_ready_sends_locked(tqp, completed_sends);
+		goto restart_sends;
 	}
 	list_for_each_entry_safe(read, read_tmp, &tqp->pending_reads, node) {
 		if (read->ready) {
@@ -4468,19 +4554,23 @@ static void tbv_qp_timeout_work(struct work_struct *work)
 	if (!timeout)
 		return;
 
+	tbv_qp_destroy_trace(tqp, "timeout-enter");
 	need_resched |= tbv_qp_timeout_reap_tx(tqp, &ack_probe_sends,
 					       &retry_sends,
 					       &completed_sends,
 					       &timed_out_reads, now,
 					       timeout, &tx_timed_out);
+	tbv_qp_destroy_trace(tqp, "timeout-after-reap-tx");
 	tx_timed_out |= !list_empty(&timed_out_reads);
 	if (tx_timed_out) {
+		tbv_qp_destroy_trace(tqp, "timeout-tx-failed");
 		need_resched = false;
 	} else {
 		need_resched |=
 			tbv_qp_timeout_reap_read_resps(tqp, &retry_read_resps,
 						       &drop_read_resps, now,
 						       read_resp_timeout);
+		tbv_qp_destroy_trace(tqp, "timeout-after-reap-read-resps");
 	}
 
 	while (!list_empty(&ack_probe_sends)) {
@@ -4519,20 +4609,39 @@ static void tbv_qp_timeout_work(struct work_struct *work)
 			list_first_entry(&retry_sends, struct tbv_send_ctx,
 					 retry_node);
 		enum tbv_send_post_reason reason = send->retry_reason;
+		struct tbv_state *state = tqp->owner;
 		bool pending = false;
 		bool fatal = false;
 		int ret;
 
-			list_del_init(&send->retry_node);
-			if (tbv_send_is_completed(send) ||
-			    !tbv_qp_send_retry_pending(tqp, send)) {
-				tbv_send_ctx_put(send);
-				continue;
-			}
+		list_del_init(&send->retry_node);
+		tbv_send_retry_trace(send, "retry-picked", 0);
+		if (tbv_send_is_completed(send) ||
+		    !tbv_qp_send_retry_pending(tqp, send)) {
+			tbv_send_retry_trace(send, "retry-skip", 0);
+			tbv_send_ctx_put(send);
+			continue;
+		}
 
+		if (state)
+			atomic64_inc(&state->data_wr_retry_post_attempt);
+		tbv_send_retry_trace(send, "retry-before-post", 0);
 		ret = tbv_native_send_ctx_post_frames(send, reason);
-		if (ret)
-			atomic64_inc(&tqp->owner->data_wr_retry_enqueue_error);
+		tbv_send_retry_trace(send, "retry-after-post", ret);
+		if (!ret) {
+			if (state)
+				atomic64_inc(&state->data_wr_retry_post_ok);
+		} else {
+			if (state) {
+				atomic64_inc(&state->data_wr_retry_enqueue_error);
+				if (ret == -ENOMEM)
+					atomic64_inc(&state->data_wr_retry_post_enomem);
+				else if (ret == -ENOTCONN)
+					atomic64_inc(&state->data_wr_retry_post_enotconn);
+				else
+					atomic64_inc(&state->data_wr_retry_post_error);
+			}
+		}
 
 		spin_lock_irqsave(&tqp->lock, flags);
 		pending = send->pending && !send->completed &&
@@ -4573,12 +4682,14 @@ static void tbv_qp_timeout_work(struct work_struct *work)
 			send->retrying = false;
 		}
 		spin_unlock_irqrestore(&tqp->lock, flags);
+		tbv_send_retry_trace(send, "retry-after-state", ret);
 
 		if (fatal)
 			tx_timed_out = true;
 		tbv_send_ctx_put(send);
 	}
 	if (tx_timed_out) {
+		tbv_qp_destroy_trace(tqp, "timeout-before-mark-error");
 		need_resched = false;
 	}
 
@@ -5117,9 +5228,12 @@ static int tbv_post_apple_send(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	}
 	atomic64_inc(&tqp->owner->data_wr_copied);
 
-	ret = tbv_apple_sq_reserve_slot(tqp, ctx);
-	if (ret)
+	ret = tbv_qp_reserve_sendq(tqp);
+	if (ret) {
+		atomic64_inc(&tqp->owner->data_wr_post_reject_sendq);
 		goto err_free_payload;
+	}
+	ctx->sq_counted = true;
 
 	spin_lock_irqsave(&tqp->lock, flags);
 	ctx->psn = tqp->send_psn & TBV_PSN_MASK;
@@ -5139,10 +5253,11 @@ static int tbv_post_apple_send(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	return 0;
 
 err_free_payload:
+	if (ctx->sq_counted)
+		tbv_qp_release_sendq_counted(tqp, &ctx->sq_counted);
 	kvfree(payload);
 err_free_entry:
 	kfree(entry);
-	tbv_apple_sq_release_slot(ctx);
 err_put_ctx:
 	tbv_send_ctx_put(ctx);
 	tbv_release_send_segments(segs, nsegs);
@@ -6924,10 +7039,15 @@ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 	qpn = tbv_apple_qpn_from_path(path);
 	if (sof)
 		atomic64_inc(&state->apple_rx_sof);
-	if (eof == 3)
+	if (eof == TBV_APPLE_EOF_FRAME)
 		atomic64_inc(&state->apple_rx_eof3);
 	else
 		atomic64_inc(&state->apple_rx_eof_other);
+
+	if (!tbv_apple_rx_markers_valid(sof, eof, raw_rx)) {
+		atomic64_inc(&state->data_rx_bad_frame);
+		return;
+	}
 
 	tqp = tbv_qp_get_by_num(state, qpn);
 	if (!tqp) {
@@ -6941,7 +7061,14 @@ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 		tbv_apple_rx_drain_pending_locked(state, tqp);
 	if (sof && tqp->apple_pending_active >= 0)
 		atomic64_inc(&state->apple_rx_sof_while_active);
-	if (tqp->apple_pending_active < 0 && !sof && !raw_rx) {
+	/*
+	 * Apple uses EOF=3 alone for some single-frame SENDs. Treat an
+	 * idle EOF frame as a complete message start; non-final
+	 * continuations still need an active message or SOF to avoid
+	 * delivering a truncated tail as a fresh receive.
+	 */
+	if (!tbv_apple_rx_idle_frame_valid(tqp->apple_pending_active >= 0, sof,
+					   eof, raw_rx)) {
 		atomic64_inc(&state->apple_rx_no_sof_when_idle);
 		atomic64_inc(&state->data_rx_bad_frame);
 		mutex_unlock(&tqp->rx_lock);
@@ -6972,7 +7099,7 @@ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 			IB_WC_LOC_LEN_ERR : IB_WC_LOC_PROT_ERR;
 	}
 
-	if (eof == 3) {
+	if (eof == TBV_APPLE_EOF_FRAME) {
 		tbv_apple_pending_finish_locked(tqp);
 		tbv_apple_rx_drain_pending_locked(state, tqp);
 	} else if (!pending->active) {
@@ -9039,11 +9166,16 @@ static void tbv_qp_flush_error(struct tbv_qp *tqp)
 {
 	LIST_HEAD(flush);
 
+	tbv_qp_destroy_trace(tqp, "flush-error-enter");
 	wake_up_all(&tqp->credit_wait);
 	wake_up_all(&tqp->apple_tx_wait);
+	tbv_qp_destroy_trace(tqp, "flush-error-before-apple-sq");
 	tbv_qp_flush_apple_sq(tqp);
+	tbv_qp_destroy_trace(tqp, "flush-error-after-apple-sq");
 
+	tbv_qp_destroy_trace(tqp, "flush-error-before-sends");
 	tbv_qp_flush_sends(tqp, &flush);
+	tbv_qp_destroy_trace(tqp, "flush-error-after-sends");
 	while (!list_empty(&flush)) {
 		struct tbv_send_ctx *send =
 			list_first_entry(&flush, struct tbv_send_ctx, node);
@@ -9054,8 +9186,11 @@ static void tbv_qp_flush_error(struct tbv_qp *tqp)
 		tbv_send_complete(send, status);
 		tbv_send_ctx_put(send);
 	}
+	tbv_qp_destroy_trace(tqp, "flush-error-after-complete-sends");
 
+	tbv_qp_destroy_trace(tqp, "flush-error-before-reads");
 	tbv_qp_flush_reads(tqp, &flush);
+	tbv_qp_destroy_trace(tqp, "flush-error-after-reads");
 	while (!list_empty(&flush)) {
 		struct tbv_read_ctx *read =
 			list_first_entry(&flush, struct tbv_read_ctx, node);
@@ -9065,8 +9200,11 @@ static void tbv_qp_flush_error(struct tbv_qp *tqp)
 		tbv_read_complete(read, -ECANCELED);
 		tbv_read_ctx_put(read);
 	}
+	tbv_qp_destroy_trace(tqp, "flush-error-after-complete-reads");
 
+	tbv_qp_destroy_trace(tqp, "flush-error-before-read-resps");
 	tbv_qp_cancel_read_resps(tqp, &flush);
+	tbv_qp_destroy_trace(tqp, "flush-error-after-read-resps");
 	while (!list_empty(&flush)) {
 		struct tbv_read_resp_ctx *ctx =
 			list_first_entry(&flush, struct tbv_read_resp_ctx, node);
@@ -9074,15 +9212,19 @@ static void tbv_qp_flush_error(struct tbv_qp *tqp)
 		list_del_init(&ctx->node);
 		tbv_read_resp_ctx_put(ctx);
 	}
+	tbv_qp_destroy_trace(tqp, "flush-error-after-complete-read-resps");
 
 	mutex_lock(&tqp->rx_lock);
+	tbv_qp_destroy_trace(tqp, "flush-error-rx-locked");
 	tbv_rx_fail_active_send(tqp->owner, tqp, NULL, IB_WC_WR_FLUSH_ERR);
 	tbv_rx_fail_active_write_locked(tqp->owner, tqp, NULL,
 					    IB_WC_WR_FLUSH_ERR);
 	tbv_qp_flush_reorder(tqp);
 	mutex_unlock(&tqp->rx_lock);
+	tbv_qp_destroy_trace(tqp, "flush-error-after-rx");
 
 	tbv_qp_flush_recv_wqes(tqp);
+	tbv_qp_destroy_trace(tqp, "flush-error-after-recv-wqes");
 }
 
 static bool tbv_rx_deliver_reorder_msg_locked(struct tbv_state *state,

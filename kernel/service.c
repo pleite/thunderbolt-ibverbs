@@ -606,13 +606,14 @@ int tbv_services_start(struct tbv_state *state, bool bind_services,
 	state->negotiate_native = service_cfg->negotiate_native;
 	state->enable_tunnels = service_cfg->enable_tunnels;
 	/*
-	 * Minimal TBnet identity is still advertised so macOS sees a normal
-	 * ThunderboltIP-capable peer, but Apple AD/FA57 data tunnels must not
-	 * depend on macOS bringing the matching IP interface up. macOS can keep
-	 * the RDMA port usable while the enX side is inactive or has not
-	 * exchanged neighbor traffic yet.
+	 * When this module owns the ThunderboltIP identity, macOS still expects a
+	 * live ThunderboltIP neighbor before the AD/FA57 path is usable. Do not
+	 * program the AD/FA57 tunnel until the minimal packet path has answered the
+	 * peer's ARP for our RDMA GID address. Stock/proxy identity modes already
+	 * depend on an external TBnet carrier, so they keep the immediate FA57 path.
 	 */
-	state->apple_tunnels_wait_tbnet = false;
+	state->apple_tunnels_wait_tbnet =
+		state->cfg.tbnet_identity == TBV_TBNET_ID_MINIMAL_PACKET;
 	state->apple_tunnels_pending = false;
 	INIT_WORK(&state->apple_tunnel_work, tbv_service_apple_tunnel_work);
 

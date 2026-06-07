@@ -34,12 +34,11 @@
 #define TBV_APPLE_PRTCID 0xfa57
 #define TBV_APPLE_PRTCVERS 1
 #define TBV_APPLE_PRTCREVS 0
-#define TBV_APPLE_QPN_SHIFT 8
-#define TBV_APPLE_FRAME_SIZE SZ_4K
-#define TBV_APPLE_MAX_MSG_SIZE SZ_16M
 #define TBV_RX_NO_QP_OPCODE_SLOTS 16
 #define TBV_DV_WRITE_LOCAL_BUCKETS 8
 #define TBV_DV_WRITE_LOCAL_BUCKET_SHIFT 26
+
+#include "../proto/apple_wire.h"
 
 static inline bool tbv_dma_device_ready(const struct device *dev)
 {
@@ -500,6 +499,11 @@ struct tbv_state {
 	atomic64_t data_wr_retransmit_closing_qp;
 	atomic64_t data_wr_retransmit_no_live_path;
 	atomic64_t data_wr_retransmit_teardown_path;
+	atomic64_t data_wr_retry_post_attempt;
+	atomic64_t data_wr_retry_post_ok;
+	atomic64_t data_wr_retry_post_enomem;
+	atomic64_t data_wr_retry_post_enotconn;
+	atomic64_t data_wr_retry_post_error;
 	atomic64_t data_wr_ack_probe;
 	atomic64_t data_wr_ack_probe_fallback;
 	atomic64_t data_wr_retry_enqueue_error;
@@ -516,11 +520,12 @@ struct tbv_state {
 	atomic64_t data_wr_rnr_wait_qp_error;
 	atomic64_t data_wr_rnr_wait_unknown;
 	atomic64_t data_wr_timeout;
-	atomic64_t data_wr_send_timeout;
 	atomic64_t data_wr_timeout_last_psn;
+	atomic64_t data_qp_destroy_enter;
+	atomic64_t data_qp_destroy_timeout;
+	atomic64_t data_qp_destroy_completed;
 	atomic64_t apple_sq_queued;
 	atomic64_t apple_sq_dequeued;
-	atomic64_t apple_sq_full;
 	atomic64_t apple_sq_flushed;
 	atomic64_t data_tx_accepted;
 	atomic64_t data_tx_posted;

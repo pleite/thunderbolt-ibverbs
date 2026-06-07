@@ -265,6 +265,16 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_wr_retransmit_no_live_path));
 	seq_printf(s, "data_wr_retransmit_teardown_path: %lld\n",
 		   atomic64_read(&state->data_wr_retransmit_teardown_path));
+	seq_printf(s, "data_wr_retry_post_attempt: %lld\n",
+		   atomic64_read(&state->data_wr_retry_post_attempt));
+	seq_printf(s, "data_wr_retry_post_ok: %lld\n",
+		   atomic64_read(&state->data_wr_retry_post_ok));
+	seq_printf(s, "data_wr_retry_post_enomem: %lld\n",
+		   atomic64_read(&state->data_wr_retry_post_enomem));
+	seq_printf(s, "data_wr_retry_post_enotconn: %lld\n",
+		   atomic64_read(&state->data_wr_retry_post_enotconn));
+	seq_printf(s, "data_wr_retry_post_error: %lld\n",
+		   atomic64_read(&state->data_wr_retry_post_error));
 	seq_printf(s, "data_wr_ack_probe: %lld\n",
 		   atomic64_read(&state->data_wr_ack_probe));
 	seq_printf(s, "data_wr_ack_probe_fallback: %lld\n",
@@ -297,16 +307,18 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_wr_rnr_wait_unknown));
 	seq_printf(s, "data_wr_timeout: %lld\n",
 		   atomic64_read(&state->data_wr_timeout));
-	seq_printf(s, "data_wr_send_timeout: %lld\n",
-		   atomic64_read(&state->data_wr_send_timeout));
 	seq_printf(s, "data_wr_timeout_last_psn: %lld\n",
 		   atomic64_read(&state->data_wr_timeout_last_psn));
+	seq_printf(s, "data_qp_destroy_enter: %lld\n",
+		   atomic64_read(&state->data_qp_destroy_enter));
+	seq_printf(s, "data_qp_destroy_timeout: %lld\n",
+		   atomic64_read(&state->data_qp_destroy_timeout));
+	seq_printf(s, "data_qp_destroy_completed: %lld\n",
+		   atomic64_read(&state->data_qp_destroy_completed));
 	seq_printf(s, "apple_sq_queued: %lld\n",
 		   atomic64_read(&state->apple_sq_queued));
 	seq_printf(s, "apple_sq_dequeued: %lld\n",
 		   atomic64_read(&state->apple_sq_dequeued));
-	seq_printf(s, "apple_sq_full: %lld\n",
-		   atomic64_read(&state->apple_sq_full));
 	seq_printf(s, "apple_sq_flushed: %lld\n",
 		   atomic64_read(&state->apple_sq_flushed));
 	seq_printf(s, "data_tx_accepted: %lld\n",
