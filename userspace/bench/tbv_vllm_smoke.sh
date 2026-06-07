@@ -10,7 +10,7 @@ ssh_cmd=${TBV_SSH:-ssh}
 capture_counters_enabled=${TBV_VLLM_COUNTERS:-1}
 counter_summary=${TBV_DEBUGFS_SUMMARY:-/sys/kernel/debug/thunderbolt_ibverbs/summary}
 counter_keys=${TBV_VLLM_COUNTER_KEYS:-"dv_poll_wqes dv_admission_attempts dv_hard_error data_wr_retransmit data_wr_retry_exhausted data_wr_timeout data_wr_retransmit_closing_qp data_wr_retransmit_no_live_path data_wr_retransmit_teardown_path data_tx_posted data_tx_completed data_tx_errors data_tx_canceled data_rx_canceled data_rx_ack data_rx_ack_matched data_rx_ack_match_retried data_rx_ack_miss data_rx_late_ack data_rx_no_qp data_rx_no_qp_reack data_rx_no_qp_error_ack data_qp_tombstone_evicted"}
-hard_error_keys=${TBV_VLLM_HARD_ERROR_KEYS:-"dv_hard_error data_wr_retry_exhausted data_wr_timeout data_wr_retransmit_closing_qp data_wr_retransmit_no_live_path data_wr_retransmit_teardown_path data_tx_errors data_tx_canceled data_rx_canceled data_rx_ack_miss data_rx_no_qp data_rx_no_qp_reack data_rx_no_qp_error_ack data_qp_tombstone_evicted"}
+hard_error_keys=${TBV_VLLM_HARD_ERROR_KEYS:-"dv_hard_error data_wr_retry_exhausted data_wr_timeout data_wr_retransmit_closing_qp data_wr_retransmit_no_live_path data_wr_retransmit_teardown_path data_tx_errors data_tx_canceled data_rx_canceled data_rx_no_qp data_rx_no_qp_reack data_rx_no_qp_error_ack data_qp_tombstone_evicted"}
 
 wrapper=${VLLM_USB4_ENV:-${TBV_VLLM_WRAPPER:-}}
 model=${TBV_VLLM_MODEL:-/mnt/Home/tmp/tbv-vllm-tiny-qwen3-gda}
