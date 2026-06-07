@@ -116,6 +116,7 @@
               tools/ci/distro-package.sh \
               userspace/bench/tbv_app_gate.sh \
               userspace/bench/tbv_app_gate_summarize.sh \
+              userspace/bench/tbv_pytorch_chunk_report.sh \
               userspace/bench/tbv_pytorch_chunk_sweep.sh \
               userspace/bench/tbv_rocshmem_example.sh \
               userspace/bench/tbv_vllm_smoke.sh \
@@ -154,6 +155,7 @@
             shellcheck \
               userspace/bench/tbv_app_gate.sh \
               userspace/bench/tbv_app_gate_summarize.sh \
+              userspace/bench/tbv_pytorch_chunk_report.sh \
               userspace/bench/tbv_pytorch_chunk_sweep.sh \
               userspace/bench/tbv_rocshmem_example.sh \
               userspace/bench/tbv_vllm_smoke.sh
@@ -445,6 +447,14 @@
             program = "${pkgsAt.bench-tools}/bin/tbv_pytorch_chunk_sweep.sh";
             meta = {
               description = "Run the PyTorch USB4 GDA chunk-size discriminator";
+              maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
+            };
+          };
+          tbv-pytorch-chunk-report = {
+            type = "app";
+            program = "${pkgsAt.bench-tools}/bin/tbv_pytorch_chunk_report.sh";
+            meta = {
+              description = "Summarize PyTorch USB4 GDA chunk-size discriminator roots";
               maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
             };
           };

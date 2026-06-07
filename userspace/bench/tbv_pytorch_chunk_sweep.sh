@@ -8,6 +8,7 @@ hosts=${TBV_APP_HOSTS:-192.168.23.136,192.168.23.192}
 counter_hosts=${TBV_COUNTER_HOSTS:-root@192.168.23.136,root@192.168.23.192}
 iface=${TBV_APP_IFACE:-eno1}
 log_parent=${TBV_APP_LOG_PARENT:-/mnt/Home/tmp/tbv-app-gate-logs}
+sweep_root=${TBV_PYTORCH_CHUNK_SWEEP_ROOT:-}
 timeout_s=${TBV_APP_TIMEOUT:-420}
 threshold=${RCCL_ROCSHMEM_THRESHOLD:-67108864}
 bench_mode=${RCCL_ROCSHMEM_GDA_BENCH_MODE:-2}
@@ -44,6 +45,7 @@ Options:
   --counter-hosts H1,H2     Default: $counter_hosts
   --iface IFACE             Default: $iface
   --log-parent DIR          Default: $log_parent
+  --sweep-root DIR          Default: log-parent/pytorch-chunk-sweep-TIMESTAMP
   --timeout SECONDS         Default: $timeout_s
   --threshold BYTES         RCCL_ROCSHMEM_THRESHOLD. Default: $threshold
   --bench-mode N            RCCL_ROCSHMEM_GDA_BENCH_MODE. Default: $bench_mode
@@ -76,6 +78,7 @@ while (($#)); do
     --counter-hosts) counter_hosts=$2; shift 2 ;;
     --iface) iface=$2; shift 2 ;;
     --log-parent) log_parent=$2; shift 2 ;;
+    --sweep-root) sweep_root=$2; shift 2 ;;
     --timeout) timeout_s=$2; shift 2 ;;
     --threshold) threshold=$2; shift 2 ;;
     --bench-mode) bench_mode=$2; shift 2 ;;
@@ -133,7 +136,7 @@ run_chunk() {
   local -a env_vars
   local -a cmd
 
-  root="${log_parent%/}/postcopy-chunk${chunk}-$(date +%Y%m%d-%H%M%S)"
+  root="${sweep_root%/}/chunk-$chunk"
   env_vars=(
     "RCCL_ROCSHMEM_THRESHOLD=$threshold"
     "RCCL_ROCSHMEM_GDA_BENCH_MODE=$bench_mode"
@@ -175,6 +178,9 @@ run_chunk() {
     return 0
   fi
 
+  mkdir -p "$sweep_root"
+  printf '%s\t%s\n' "$chunk" "$root" >>"$sweep_root/chunk-roots.tsv"
+
   if env "${env_vars[@]}" "${cmd[@]}"; then
     status=0
   else
@@ -185,6 +191,22 @@ run_chunk() {
   fi
   return "$status"
 }
+
+if [[ -z "$sweep_root" ]]; then
+  sweep_root="${log_parent%/}/pytorch-chunk-sweep-$(date +%Y%m%d-%H%M%S)"
+fi
+
+if [[ "$dry_run" == 1 ]]; then
+  printf 'sweep_root=%s\n' "$sweep_root"
+elif [[ -e "$sweep_root" ]]; then
+  echo "ERROR: sweep root already exists: $sweep_root" >&2
+  exit 2
+fi
+
+if [[ "$dry_run" != 1 ]]; then
+  mkdir -p "$sweep_root"
+  printf 'chunk\tlog_root\n' >"$sweep_root/chunk-roots.tsv"
+fi
 
 overall=0
 for chunk in $(split_csv "$chunks"); do

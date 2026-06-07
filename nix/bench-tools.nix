@@ -38,6 +38,7 @@ let
     "tbv_perftest_runner.py"
     "tbv_pytorch_smoke.py"
     "tbv_pytorch_chunk_sweep.sh"
+    "tbv_pytorch_chunk_report.sh"
     "tbv_rdma_sweep.py"
     "tbv_uc_stress.py"
     "tbv_rocshmem_example.sh"
