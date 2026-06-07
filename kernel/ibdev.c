@@ -3086,6 +3086,39 @@ static void tbv_apple_send_complete_work(struct work_struct *work)
 	tbv_send_ctx_put(send);
 }
 
+static void tbv_apple_complete_ordered_sends(struct tbv_qp *tqp,
+					     struct list_head *complete)
+{
+	while (!list_empty(complete)) {
+		struct tbv_send_ctx *send =
+			list_first_entry(complete, struct tbv_send_ctx, node);
+		int status = send->completion_status;
+
+		list_del_init(&send->node);
+		if (!status) {
+			u32 delay_us = READ_ONCE(apple_tx_completion_delay_us);
+
+			if (delay_us) {
+				struct workqueue_struct *wq =
+					tqp->owner && tqp->owner->workqueue ?
+						tqp->owner->workqueue :
+						system_unbound_wq;
+				unsigned long delay =
+					max_t(unsigned long, 1,
+					      usecs_to_jiffies(delay_us));
+
+				send->apple_complete_status = 0;
+				queue_delayed_work(wq, &send->apple_complete_work,
+						   delay);
+				continue;
+			}
+		}
+
+		tbv_send_complete(send, status);
+		tbv_send_ctx_put(send);
+	}
+}
+
 static bool tbv_qp_timeout_reap_tx(struct tbv_qp *tqp,
 				   struct list_head *retry_sends,
 				   struct list_head *completed_sends,
@@ -3724,33 +3757,12 @@ static void tbv_apple_send_tx_done(void *ctx, int status)
 
 	last = atomic_dec_and_test(&send->apple_pending);
 	wake_up_all(&tqp->apple_tx_wait);
-	if (status) {
-		if (tbv_qp_unqueue_send(tqp, send)) {
-			tbv_send_complete(send, status);
-			tbv_send_ctx_put(send);
-		}
-	} else if (last) {
-		if (tbv_qp_unqueue_send(tqp, send)) {
-			u32 delay_us = READ_ONCE(apple_tx_completion_delay_us);
+	if (status || last) {
+		LIST_HEAD(complete);
 
-			if (delay_us) {
-				struct workqueue_struct *wq =
-					tqp->owner && tqp->owner->workqueue ?
-						tqp->owner->workqueue :
-						system_unbound_wq;
-				unsigned long delay =
-					max_t(unsigned long, 1,
-					      usecs_to_jiffies(delay_us));
-
-				send->apple_complete_status = 0;
-				queue_delayed_work(wq,
-						   &send->apple_complete_work,
-						   delay);
-			} else {
-				tbv_send_complete(send, 0);
-				tbv_send_ctx_put(send);
-			}
-		}
+		if (tbv_qp_complete_send_ordered(tqp, send->psn, status,
+						 &complete, NULL))
+			tbv_apple_complete_ordered_sends(tqp, &complete);
 	}
 
 	tbv_send_ctx_put(send);
