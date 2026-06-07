@@ -614,6 +614,7 @@ struct tbv_send_ctx {
 	u32 dv_imm_data;
 	u64 dv_tx_start_ns;
 	u64 dv_copy_ns;
+	u64 dv_submit_done_ns;
 	u32 dv_local_mr_bucket;
 	u32 dv_local_addr_bucket;
 	atomic_t apple_pending;
@@ -4066,9 +4067,16 @@ static void tbv_send_tx_done(void *ctx, int status)
 
 	if (note_dv_write_timing) {
 		struct tbv_state *state = tqp->owner;
-		u64 elapsed = ktime_get_ns() - send->dv_tx_start_ns;
+		u64 done_ns = ktime_get_ns();
+		u64 elapsed = done_ns - send->dv_tx_start_ns;
 		u64 copy_ns = send->dv_copy_ns;
 		u64 postcopy_ns = elapsed > copy_ns ? elapsed - copy_ns : 0;
+		u64 submit_ns = send->dv_submit_done_ns > send->dv_tx_start_ns ?
+			send->dv_submit_done_ns - send->dv_tx_start_ns : 0;
+		u64 enqueue_ns = submit_ns > copy_ns ? submit_ns - copy_ns : 0;
+		u64 drain_ns = send->dv_submit_done_ns &&
+				done_ns > send->dv_submit_done_ns ?
+			done_ns - send->dv_submit_done_ns : 0;
 		u32 mr_bucket = send->dv_local_mr_bucket;
 		u32 addr_bucket = send->dv_local_addr_bucket;
 
@@ -4080,6 +4088,12 @@ static void tbv_send_tx_done(void *ctx, int status)
 			     &state->dv_write_copy_mr_bucket_ns[mr_bucket]);
 		atomic64_add(postcopy_ns,
 			     &state->dv_write_postcopy_mr_bucket_ns[mr_bucket]);
+		atomic64_add(submit_ns,
+			     &state->dv_write_submit_mr_bucket_ns[mr_bucket]);
+		atomic64_add(enqueue_ns,
+			     &state->dv_write_enqueue_mr_bucket_ns[mr_bucket]);
+		atomic64_add(drain_ns,
+			     &state->dv_write_drain_mr_bucket_ns[mr_bucket]);
 		atomic64_inc(&state->dv_write_tx_addr_bucket_count[addr_bucket]);
 		atomic64_add(elapsed,
 			     &state->dv_write_tx_addr_bucket_ns[addr_bucket]);
@@ -5570,6 +5584,9 @@ static int tbv_native_send_ctx_post_frames(struct tbv_send_ctx *ctx,
 			atomic64_inc(&tqp->owner->data_wr_path_send_error);
 			return ret;
 		}
+		if (ctx->dv_write_timing_valid &&
+		    reason == TBV_SEND_POST_INITIAL)
+			ctx->dv_submit_done_ns = ktime_get_ns();
 		tbv_send_ctx_put(ctx);
 		return 0;
 	}
@@ -5792,6 +5809,8 @@ out_unlock_paths:
 		}
 	}
 
+	if (ctx->dv_write_timing_valid && reason == TBV_SEND_POST_INITIAL)
+		ctx->dv_submit_done_ns = ktime_get_ns();
 	tbv_kick_paths(paths, path_count);
 	tbv_release_path_refs(paths, path_count);
 	return 0;

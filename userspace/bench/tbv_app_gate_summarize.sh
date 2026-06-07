@@ -627,13 +627,19 @@ print_dv_write_tx_mr_bucket_aggregates() {
             bytes_key = "dv_write_tx_mr_bucket_" i "_bytes"
             copy_ns_key = "dv_write_copy_mr_bucket_" i "_ns"
             postcopy_ns_key = "dv_write_postcopy_mr_bucket_" i "_ns"
+            submit_ns_key = "dv_write_submit_mr_bucket_" i "_ns"
+            enqueue_ns_key = "dv_write_enqueue_mr_bucket_" i "_ns"
+            drain_ns_key = "dv_write_drain_mr_bucket_" i "_ns"
             count = (after[count_key] + 0) - (before[count_key] + 0)
             ns = (after[ns_key] + 0) - (before[ns_key] + 0)
             bytes = (after[bytes_key] + 0) - (before[bytes_key] + 0)
             copy_ns = (after[copy_ns_key] + 0) - (before[copy_ns_key] + 0)
             postcopy_ns = (after[postcopy_ns_key] + 0) - (before[postcopy_ns_key] + 0)
-            if (count || ns || bytes || copy_ns || postcopy_ns)
-              print suite, collective, mode, i, count, ns, bytes, copy_ns, postcopy_ns
+            submit_ns = (after[submit_ns_key] + 0) - (before[submit_ns_key] + 0)
+            enqueue_ns = (after[enqueue_ns_key] + 0) - (before[enqueue_ns_key] + 0)
+            drain_ns = (after[drain_ns_key] + 0) - (before[drain_ns_key] + 0)
+            if (count || ns || bytes || copy_ns || postcopy_ns || submit_ns || enqueue_ns || drain_ns)
+              print suite, collective, mode, i, count, ns, bytes, copy_ns, postcopy_ns, submit_ns, enqueue_ns, drain_ns
           }
         }
       ' "$before" "$after"
@@ -646,6 +652,9 @@ print_dv_write_tx_mr_bucket_aggregates() {
       bytes[key] += $7
       copy_ns[key] += $8
       postcopy_ns[key] += $9
+      submit_ns[key] += $10
+      enqueue_ns[key] += $11
+      drain_ns[key] += $12
     }
     END {
       if (!length(count))
@@ -656,13 +665,19 @@ print_dv_write_tx_mr_bucket_aggregates() {
         avg_ms = count[key] ? ns[key] / count[key] / 1000000 : 0
         copy_avg_ms = count[key] ? copy_ns[key] / count[key] / 1000000 : 0
         postcopy_avg_ms = count[key] ? postcopy_ns[key] / count[key] / 1000000 : 0
+        submit_avg_ms = count[key] ? submit_ns[key] / count[key] / 1000000 : 0
+        enqueue_avg_ms = count[key] ? enqueue_ns[key] / count[key] / 1000000 : 0
+        drain_avg_ms = count[key] ? drain_ns[key] / count[key] / 1000000 : 0
         total_gbps = ns[key] ? bytes[key] * 8 / ns[key] : 0
         copy_gbps = copy_ns[key] ? bytes[key] * 8 / copy_ns[key] : 0
         postcopy_gbps = postcopy_ns[key] ? bytes[key] * 8 / postcopy_ns[key] : 0
-        printf "%s %s %s %s %d %d %.0f %.3f %.3f %.3f %.2f %.2f %.2f\n",
+        enqueue_gbps = enqueue_ns[key] ? bytes[key] * 8 / enqueue_ns[key] : 0
+        drain_gbps = drain_ns[key] ? bytes[key] * 8 / drain_ns[key] : 0
+        printf "%s %s %s %s %d %d %.0f %.3f %.3f %.3f %.3f %.3f %.3f %.2f %.2f %.2f %.2f %.2f\n",
           p[1], p[2], p[3], p[4], count[key], bytes[key], avg_bytes,
           avg_ms, copy_avg_ms, postcopy_avg_ms,
-          total_gbps, copy_gbps, postcopy_gbps
+          submit_avg_ms, enqueue_avg_ms, drain_avg_ms,
+          total_gbps, copy_gbps, postcopy_gbps, enqueue_gbps, drain_gbps
       }
     }
   ' | sort -V | awk '
@@ -672,7 +687,7 @@ print_dv_write_tx_mr_bucket_aggregates() {
     {
       if (!printed) {
         printf "\ndv_write_tx_mr_bucket aggregates:\n"
-        printf "suite collective mode bucket count bytes avg_bytes avg_ms copy_avg_ms postcopy_avg_ms total_gbps copy_gbps postcopy_gbps\n"
+        printf "suite collective mode bucket count bytes avg_bytes avg_ms copy_avg_ms postcopy_avg_ms submit_avg_ms enqueue_avg_ms drain_avg_ms total_gbps copy_gbps postcopy_gbps enqueue_gbps drain_gbps\n"
         printed = 1
       }
       print

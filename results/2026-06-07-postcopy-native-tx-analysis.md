@@ -10,11 +10,14 @@ throughput in addition to time:
 
 ```text
 dv_write_tx_mr_bucket aggregates:
-suite collective mode bucket count bytes avg_bytes avg_ms copy_avg_ms postcopy_avg_ms total_gbps copy_gbps postcopy_gbps
+suite collective mode bucket count bytes avg_bytes avg_ms copy_avg_ms postcopy_avg_ms submit_avg_ms enqueue_avg_ms drain_avg_ms total_gbps copy_gbps postcopy_gbps enqueue_gbps drain_gbps
 ```
 
 `avg_bytes` confirms the WRITE size seen by the module, while `postcopy_gbps`
 turns the post-copy/native-TX span into a direct throughput signal.
+After the follow-up split, `enqueue_avg_ms` covers post-copy submission work up
+to native path kick, and `drain_avg_ms` covers the wait from path kick to final
+TX completion.
 
 ## Saved-log comparison
 
@@ -48,6 +51,10 @@ The 4 MiB payload row still uses 1 MiB module-level WRs. The copy span remains
 small, but post-copy/native TX drops from about 8 Gb/s to roughly 1.8-3.1 Gb/s.
 That makes the next bottleneck a queueing/completion/backpressure problem under
 larger exchanges, not an MR-offset or CPU-copy problem.
+
+These saved roots predate the `submit/enqueue/drain` split, so the historical
+tables keep the older columns. New runs will include non-zero split columns in
+the summarizer output.
 
 ## Tail correlation
 
