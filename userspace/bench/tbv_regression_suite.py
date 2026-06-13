@@ -147,12 +147,13 @@ def compare_with_baseline(current_csv: Path, baseline_csv: Path, bw_drop_pct: fl
                     "allowed_ceiling": ceiling,
                 })
 
+    ok = len(failures) == 0 and compared > 0 and missing == 0
     return {
         "baseline_csv": str(baseline_csv),
         "compared_rows": compared,
         "missing_baseline_rows": missing,
         "regressions": failures,
-        "ok": len(failures) == 0,
+        "ok": ok,
     }
 
 

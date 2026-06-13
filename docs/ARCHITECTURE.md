@@ -56,6 +56,9 @@ GPL-2.0 licence.  At a high level it does four things:
    discovers remote peers automatically.  The module registers as a `tb_service`
    driver for both the native Linux UUID and the Apple AD/FA57 UUID.  Peers that
    are not in `peer_allowlist` are rejected before any DMA ring is allocated.
+   Native Linux peers must also match `peer_auth_acl`, which binds each admitted
+   remote UUID to a pre-shared key used during native control-plane
+   authentication.
 
 2. **Path and ring setup** (`path.c`, `rail.c`).  For each accepted peer the
    module negotiates a set of Thunderbolt paths (one TX + one RX DMA ring per
@@ -66,6 +69,8 @@ GPL-2.0 licence.  At a high level it does four things:
    transport framing lives in `native.c`; the Apple-compatible path in
    `apple.c`.  Both funnel into the shared send/receive engine in `backend.c`
    which handles zero-copy, scatter-gather, reliability, and PSN sequencing.
+   Native rails are not considered data-ready until the peer completes the PSK
+   handshake and establishes a per-peer authenticated session.
 
 4. **IB device registration** (`ibdev.c`).  After the transport is ready the
    module calls `ib_register_device()` and exposes a single-port InfiniBand
@@ -86,6 +91,7 @@ The most important parameters at load time:
 | `register_verbs` | `0` / `1` | Expose the ib_device to userspace |
 | `lanes` | `auto`, `N`, `MIN-MAX` | Lane count for DMA ring allocation |
 | `peer_allowlist` | comma-separated UUIDs | Restrict which remote peers are accepted |
+| `peer_auth_acl` | `uuid=32hexpsk[,uuid=32hexpsk...]` | Native peer ACL + PSK handshake material |
 
 Run `make -C kernel help` for the full list.
 

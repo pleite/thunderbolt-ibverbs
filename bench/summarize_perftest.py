@@ -34,6 +34,86 @@ def load_rows(paths: list[Path]) -> list[dict[str, str]]:
     return rows
 
 
+def compare_rows(
+    rows: list[dict[str, str]],
+    baseline_rows: list[dict[str, str]],
+    bw_drop_pct: float,
+    lat_rise_pct: float,
+    require_baseline_match: bool,
+) -> dict[str, object]:
+    baseline = {
+        (row.get("case", ""), row.get("direction", "")): row
+        for row in baseline_rows
+        if row.get("status") == "ok"
+    }
+    regressions: list[dict[str, object]] = []
+    missing: list[tuple[str, str]] = []
+    compared = 0
+
+    for row in rows:
+        if row.get("status") != "ok":
+            continue
+        key = (row.get("case", ""), row.get("direction", ""))
+        base = baseline.get(key)
+        if base is None:
+            missing.append(key)
+            continue
+
+        kind = row.get("kind", "")
+        if kind == "bw":
+            metric = "bw_avg_gbps"
+            current = num(row, metric)
+            reference = num(base, metric)
+            if current is None or reference is None or reference <= 0:
+                continue
+            compared += 1
+            floor = reference * (1.0 - (bw_drop_pct / 100.0))
+            if current < floor:
+                regressions.append(
+                    {
+                        "case": key[0],
+                        "direction": key[1],
+                        "metric": metric,
+                        "baseline": reference,
+                        "current": current,
+                        "limit": floor,
+                        "kind": "floor",
+                    }
+                )
+        elif kind == "lat":
+            metric = "lat_typical_us"
+            current = num(row, metric)
+            reference = num(base, metric)
+            if current is None or reference is None or reference <= 0:
+                continue
+            compared += 1
+            ceiling = reference * (1.0 + (lat_rise_pct / 100.0))
+            if current > ceiling:
+                regressions.append(
+                    {
+                        "case": key[0],
+                        "direction": key[1],
+                        "metric": metric,
+                        "baseline": reference,
+                        "current": current,
+                        "limit": ceiling,
+                        "kind": "ceiling",
+                    }
+                )
+
+    ok = len(regressions) == 0 and compared > 0
+    if require_baseline_match and missing:
+        ok = False
+
+    return {
+        "ok": ok,
+        "compared_rows": compared,
+        "missing_baseline_rows": len(missing),
+        "missing_cases": missing,
+        "regressions": regressions,
+    }
+
+
 def print_row_counts(rows: list[dict[str, str]]) -> None:
     grouped: dict[str, list[dict[str, str]]] = defaultdict(list)
     for row in rows:
@@ -114,8 +194,45 @@ def print_latency(rows: list[dict[str, str]]) -> None:
         print()
 
 
+def print_regressions(report: dict[str, object], baseline: Path) -> None:
+    print(f"## Regression check vs {baseline}")
+    print(f"- compared rows: {report['compared_rows']}")
+    print(f"- missing baseline rows: {report['missing_baseline_rows']}")
+    print(f"- status: {'ok' if report['ok'] else 'fail'}")
+    print()
+
+    regressions = report["regressions"]
+    if regressions:
+        print("### Regressions")
+        for row in regressions:
+            limit_label = "min" if row["kind"] == "floor" else "max"
+            print(
+                "- {case} {direction} {metric}: baseline={baseline:.2f}, current={current:.2f}, {limit_label}={limit:.2f}".format(
+                    case=row["case"],
+                    direction=row["direction"],
+                    metric=row["metric"],
+                    baseline=row["baseline"],
+                    current=row["current"],
+                    limit=row["limit"],
+                    limit_label=limit_label,
+                )
+            )
+        print()
+
+    missing = report["missing_cases"]
+    if missing:
+        print("### Missing baseline rows")
+        for case, direction in missing:
+            print(f"- {case} {direction}")
+        print()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--baseline", type=Path)
+    parser.add_argument("--bw-drop-pct", type=float, default=7.5)
+    parser.add_argument("--lat-rise-pct", type=float, default=12.5)
+    parser.add_argument("--require-baseline-match", action="store_true")
     parser.add_argument("csv", nargs="+", type=Path)
     args = parser.parse_args()
 
@@ -125,7 +242,18 @@ def main() -> int:
     print_row_counts(rows)
     print_bandwidth(rows)
     print_latency(rows)
-    return 0
+    if args.baseline is None:
+        return 0
+
+    report = compare_rows(
+        rows,
+        load_rows([args.baseline]),
+        args.bw_drop_pct,
+        args.lat_rise_pct,
+        args.require_baseline_match,
+    )
+    print_regressions(report, args.baseline)
+    return 0 if report["ok"] else 1
 
 
 if __name__ == "__main__":

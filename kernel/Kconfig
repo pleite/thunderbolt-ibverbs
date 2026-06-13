@@ -10,3 +10,12 @@ config THUNDERBOLT_IBVERBS
 
 	  This tree is the release-track rewrite. Experimental hardware
 	  probing and debug-only modes should stay out of this driver.
+
+config THUNDERBOLT_IBVERBS_DEBUG_SURFACES
+	bool "Enable thunderbolt-ibverbs debugfs/configfs surfaces"
+	depends on THUNDERBOLT_IBVERBS
+	default y
+	help
+	  Build the debugfs and configfs control/diagnostic surfaces.
+	  Disable this for production builds that must compile these
+	  interfaces out entirely.

@@ -13,6 +13,17 @@
 #include "transport.h"
 #include "trace.h"
 
+#if !TBV_DEBUG_SURFACES_COMPILED
+int tbv_configfs_start(struct tbv_state *state)
+{
+	return 0;
+}
+
+void tbv_configfs_stop(struct tbv_state *state)
+{
+}
+#else
+
 struct tbv_cfgfs_link {
 	struct config_item item;
 	struct mutex lock;
@@ -26,6 +37,7 @@ struct tbv_cfgfs_link {
 static struct configfs_subsystem tbv_cfgfs_subsys;
 static atomic_t tbv_cfgfs_next_link_id = ATOMIC_INIT(0);
 static struct tbv_state *tbv_cfgfs_state;
+static bool tbv_cfgfs_registered;
 
 static struct tbv_cfgfs_link *tbv_cfgfs_to_link(struct config_item *item)
 {
@@ -439,48 +451,48 @@ unlock:
 
 static struct configfs_attribute tbv_cfgfs_attr_backend = {
 	.ca_name = "backend",
-	.ca_mode = 0644,
+	.ca_mode = 0600,
 	.show = backend_show,
 	.store = backend_store,
 };
 
 static struct configfs_attribute tbv_cfgfs_attr_local_src_ipv4 = {
 	.ca_name = "local_src_ipv4",
-	.ca_mode = 0644,
+	.ca_mode = 0600,
 	.show = local_src_ipv4_show,
 	.store = local_src_ipv4_store,
 };
 
 static struct configfs_attribute tbv_cfgfs_attr_peer_ipv4 = {
 	.ca_name = "peer_ipv4",
-	.ca_mode = 0644,
+	.ca_mode = 0600,
 	.show = peer_ipv4_show,
 	.store = peer_ipv4_store,
 };
 
 static struct configfs_attribute tbv_cfgfs_attr_nccl_addr_range = {
 	.ca_name = "nccl_addr_range",
-	.ca_mode = 0644,
+	.ca_mode = 0600,
 	.show = nccl_addr_range_show,
 	.store = nccl_addr_range_store,
 };
 
 static struct configfs_attribute tbv_cfgfs_attr_app_gids = {
 	.ca_name = "app_gids",
-	.ca_mode = 0644,
+	.ca_mode = 0600,
 	.show = app_gids_show,
 	.store = app_gids_store,
 };
 
 static struct configfs_attribute tbv_cfgfs_attr_state = {
 	.ca_name = "state",
-	.ca_mode = 0444,
+	.ca_mode = 0400,
 	.show = state_show,
 };
 
 static struct configfs_attribute tbv_cfgfs_attr_selection = {
 	.ca_name = "selection",
-	.ca_mode = 0444,
+	.ca_mode = 0400,
 	.show = selection_show,
 };
 
@@ -577,6 +589,11 @@ int tbv_configfs_start(struct tbv_state *state)
 {
 	int ret;
 
+	if (!tbv_debug_surfaces_enabled()) {
+		pr_debug("configfs surfaces disabled\n");
+		return 0;
+	}
+
 	config_group_init_type_name(&tbv_cfgfs_subsys.su_group, TBV_DRV_NAME,
 				    &tbv_cfgfs_root_type);
 	tbv_cfgfs_state = state;
@@ -586,13 +603,20 @@ int tbv_configfs_start(struct tbv_state *state)
 	if (ret)
 		return ret;
 
+	tbv_cfgfs_registered = true;
 	pr_info("registered /sys/kernel/config/%s\n", TBV_DRV_NAME);
 	return 0;
 }
 
 void tbv_configfs_stop(struct tbv_state *state)
 {
+	if (!tbv_cfgfs_registered)
+		return;
+
 	configfs_unregister_subsystem(&tbv_cfgfs_subsys);
+	tbv_cfgfs_registered = false;
 	tbv_cfgfs_state = NULL;
 	pr_info("unregistered\n");
 }
+
+#endif
