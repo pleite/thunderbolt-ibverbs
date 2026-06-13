@@ -87,6 +87,22 @@ tbv_vllm_smoke.sh \
   --require-rdma auto
 ```
 
+For one command that runs both transport smoke (`tbv_vllm_smoke.sh`) and a
+perftest verb smoke (`tbv-perftest`) with per-run result recording:
+
+```sh
+nix run .#tbv-regression -- \
+  --hosts 192.168.23.136,192.168.23.192 \
+  --iface eno1 \
+  --transport native \
+  --wrapper /path/to/vllm-env
+```
+
+The run writes `manifest.json`, `regression.json`, per-step logs, and perftest
+CSV/JSONL into `thunderbolt-ibverbs/results/regression/<run-id>/`, then exits
+non-zero if transport/verb smoke fails or if perftest metrics regress beyond
+the configured thresholds versus baseline.
+
 ## Documentation
 
 - [Architecture overview](docs/ARCHITECTURE.md) — kernel module ↔ provider ↔ verbs layer diagram and data path description
