@@ -209,14 +209,16 @@ jobs:
             range="HEAD~1...HEAD"
           fi
 
-          mapfile -t files < <(git diff --name-only --diff-filter=ACMR "$range" -- 'kernel/*.[ch]' 'proto/*.[ch]')
-          if [[ ${#files[@]} -eq 0 ]]; then
+          diff="$(git diff --diff-filter=ACMR "$range" -- 'kernel/*.[ch]' 'proto/*.[ch]')"
+          if [[ -z "$diff" ]]; then
             echo "No kernel/proto changes; skipping checkpatch."
             exit 0
           fi
 
-          perl "$checkpatch" --no-tree --strict --show-types --terse --file "${files[@]}" || {
-            echo "checkpatch found issues in changed kernel/proto files." >&2
+          # Run in patch mode (not --file) so only added/modified lines are
+          # checked; this avoids failing on pre-existing whole-file findings.
+          printf '%s\n' "$diff" | perl "$checkpatch" --no-tree --strict --show-types - || {
+            echo "checkpatch found issues in changed kernel/proto lines." >&2
             exit 1
           }
 
