@@ -310,7 +310,6 @@ profile=linux_perf|mac_compat|mixed
 tbnet=auto|allow|prefer_rdma|block
 lanes=auto|N|MIN-MAX
 register_verbs=0|1
-native_wr_striping=0|1
 native_fragment_striping=0|1
 zcopy_min_bytes=<bytes>
 qp_timeout_ms=<ms>
@@ -318,6 +317,9 @@ nhi_interrupt_throttle_ns=<ns>
 ```
 
 Run `make -C kernel help` for the full parameter list.
+
+For recommended values and the benchmark sweep that produced them, see
+[**`docs/TUNING.md`**](docs/TUNING.md).
 
 ## Nix Thunderbolt Kernel
 
