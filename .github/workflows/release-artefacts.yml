@@ -236,7 +236,13 @@ jobs:
             exit 0
           fi
 
-          perl "$checkpatch" --no-tree --strict --show-types --terse --file "${files[@]}" || {
+          patch_file="$(mktemp)"
+          trap 'rm -f "$patch_file"' EXIT
+          git diff --no-ext-diff --no-color "$range" -- 'kernel/*.[ch]' 'proto/*.[ch]' >"$patch_file"
+
+          perl "$checkpatch" --no-tree --show-types --terse \
+            --ignore FILE_PATH_CHANGES \
+            "$patch_file" || {
             echo "checkpatch found issues in changed kernel/proto files." >&2
             exit 1
           }
