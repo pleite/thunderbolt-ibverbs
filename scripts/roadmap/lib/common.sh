@@ -168,6 +168,19 @@ remote_branch_exists() {
   gh api "repos/$REPO/branches/$branch" >/dev/null 2>&1
 }
 
+# branch_ahead_count <branch> -> prints how many commits <branch> is ahead of
+# BASE_BRANCH on the remote. Prints 0 when equal or when it cannot be
+# determined, so callers can safely use it in an integer comparison.
+branch_ahead_count() {
+  local branch="$1" ahead
+  ahead="$(gh api "repos/$REPO/compare/$BASE_BRANCH...$branch" --jq '.ahead_by' \
+             2>/dev/null || true)"
+  case "$ahead" in
+    ''|*[!0-9]*) ahead=0 ;;
+  esac
+  printf '%s\n' "$ahead"
+}
+
 # create_branch_with_seed <branch> <seed-rel-path> <seed-file> <commit-msg>
 # Seeds the branch with a task file so the PR has a real diff and the coding
 # agent has the spec on the branch to start from.
@@ -175,7 +188,45 @@ create_branch_with_seed() {
   local branch="$1" seed_rel="$2" seed_src="$3" msg="$4"
 
   if remote_branch_exists "$branch"; then
-    ok "branch exists on remote: $branch"
+    # The branch already exists, but a PR can only be opened when it has at
+    # least one commit that BASE_BRANCH lacks. Otherwise `gh pr create` fails
+    # with "No commits between <base> and <branch>". If a previous run created
+    # the branch but never committed the seed (or it was created empty), the
+    # branch sits level with base and PR creation would fail — so back-fill the
+    # seed commit here to keep the flow idempotent.
+    local ahead
+    ahead="$(branch_ahead_count "$branch")"
+    if [ "$ahead" -gt 0 ]; then
+      ok "branch exists on remote ($ahead commit(s) ahead of $BASE_BRANCH): $branch"
+      return 0
+    fi
+
+    warn "branch exists but is not ahead of $BASE_BRANCH: $branch — adding seed commit"
+    if [ -n "$DRY_RUN" ]; then
+      printf '   [dry-run] checkout existing %s + seed %s + push\n' "$branch" "$seed_rel"
+      return 0
+    fi
+
+    local tmp; tmp="$(mktemp -d)"
+    (
+      cd "$tmp"
+      git clone --depth 1 --branch "$branch" \
+        "https://github.com/$REPO.git" repo >/dev/null 2>&1
+      cd repo
+      mkdir -p "$(dirname "$seed_rel")"
+      if [ -f "$seed_rel" ]; then
+        # Seed already present on the branch; an empty commit is enough to get
+        # the branch ahead of base so a PR can be opened.
+        git commit --allow-empty -m "$msg" >/dev/null
+      else
+        cp "$seed_src" "$seed_rel"
+        git add "$seed_rel"
+        git commit -m "$msg" >/dev/null
+      fi
+      git push origin "$branch" >/dev/null 2>&1
+    ) || die "failed to seed existing branch: $branch"
+    rm -rf "$tmp"
+    ok "seeded existing branch: $branch"
     return 0
   fi
 
