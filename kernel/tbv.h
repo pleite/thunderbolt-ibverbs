@@ -311,6 +311,7 @@ struct tbv_peer {
 	u64 auth_local_nonce;
 	u64 auth_remote_nonce;
 	u64 auth_session_id;
+	u64 auth_established_session_id;
 	u32 auth_acl_index;
 	bool auth_acl_configured;
 	bool auth_local_nonce_valid;
@@ -324,8 +325,7 @@ struct tbv_peer {
 static inline bool tbv_peer_session_authenticated(const struct tbv_peer *peer)
 {
 	return peer && peer->auth_acl_configured &&
-	       READ_ONCE(peer->auth_authenticated) &&
-	       READ_ONCE(peer->auth_session_id);
+	       READ_ONCE(peer->auth_established_session_id);
 }
 
 static inline bool tbv_rail_data_ready(const struct tbv_rail *rail)

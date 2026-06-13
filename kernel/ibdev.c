@@ -855,9 +855,8 @@ static bool tbv_qp_native_session_matches(const struct tbv_qp *tqp)
 	if (!peer || peer->backend != TBV_BACKEND_NATIVE)
 		return true;
 
-	session_id = READ_ONCE(peer->auth_session_id);
-	return READ_ONCE(peer->auth_authenticated) && tqp->peer_session_id &&
-	       session_id == tqp->peer_session_id;
+	session_id = READ_ONCE(peer->auth_established_session_id);
+	return tqp->peer_session_id && session_id == tqp->peer_session_id;
 }
 
 static struct tbv_mr *tbv_mr_get(struct tbv_state *state, u32 key, u32 peer_id)
@@ -2566,7 +2565,8 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 		return -ENOTCONN;
 	}
 	if (tqp->backend == TBV_BACKEND_NATIVE && tqp->rail->peer)
-		tqp->peer_session_id = tqp->rail->peer->auth_session_id;
+		tqp->peer_session_id =
+			tqp->rail->peer->auth_established_session_id;
 	mutex_unlock(&state->lock);
 	if (init_attr->cap.max_send_wr > TBV_IBDEV_MAX_QP_WR ||
 	    init_attr->cap.max_recv_wr > TBV_IBDEV_MAX_QP_WR ||
@@ -8230,6 +8230,7 @@ static void tbv_kunit_qp_native_session_match_test(struct kunit *test)
 		.auth_acl_configured = true,
 		.auth_authenticated = true,
 		.auth_session_id = 11,
+		.auth_established_session_id = 11,
 	};
 	struct tbv_rail rail = {
 		.peer = &peer,
@@ -8244,6 +8245,7 @@ static void tbv_kunit_qp_native_session_match_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, tbv_qp_native_session_matches(&qp));
 	qp.peer_session_id = 11;
 	peer.auth_authenticated = false;
+	peer.auth_established_session_id = 0;
 	KUNIT_EXPECT_FALSE(test, tbv_qp_native_session_matches(&qp));
 }
 

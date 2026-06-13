@@ -76,6 +76,7 @@ void tbv_peer_auth_reset(struct tbv_peer *peer)
 	peer->auth_local_nonce = 0;
 	peer->auth_remote_nonce = 0;
 	peer->auth_session_id = 0;
+	peer->auth_established_session_id = 0;
 	peer->auth_local_nonce_valid = false;
 	peer->auth_challenge_valid = false;
 	peer->auth_ack_verified = false;

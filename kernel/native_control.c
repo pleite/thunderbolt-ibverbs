@@ -23,6 +23,14 @@
 
 static void tbv_native_control_work(struct work_struct *work);
 
+static u64 tbv_native_control_random_nonce(void)
+{
+	u64 nonce;
+
+	get_random_bytes(&nonce, sizeof(nonce));
+	return nonce;
+}
+
 struct tbv_native_auth_material {
 	/*
 	 * Canonical SipHash input for native control-plane authentication.
@@ -93,10 +101,11 @@ static int tbv_native_control_prepare_initiator_hello(struct tbv_state *state,
 
 	mutex_lock(&state->lock);
 	if (!peer->auth_local_nonce_valid) {
-		peer->auth_local_nonce = get_random_u64();
+		peer->auth_local_nonce = tbv_native_control_random_nonce();
 		peer->auth_local_nonce_valid = true;
 		peer->auth_remote_nonce = 0;
 		peer->auth_session_id = 0;
+		peer->auth_established_session_id = 0;
 		peer->auth_challenge_valid = false;
 		peer->auth_ack_verified = false;
 		peer->auth_authenticated = false;
@@ -123,12 +132,13 @@ static int tbv_native_control_accept_responder_hello(
 
 	mutex_lock(&state->lock);
 	if (!peer->auth_challenge_valid || peer->auth_remote_nonce != remote->nonce) {
-		local_nonce = get_random_u64();
+		local_nonce = tbv_native_control_random_nonce();
 		peer->auth_remote_nonce = remote->nonce;
 		peer->auth_local_nonce = local_nonce;
 		peer->auth_local_nonce_valid = true;
 		peer->auth_session_id = tbv_native_control_session_id(
 			peer, remote->nonce, local_nonce);
+		peer->auth_established_session_id = 0;
 		peer->auth_challenge_valid = peer->auth_session_id != 0;
 		peer->auth_ack_verified = false;
 		peer->auth_authenticated = false;
@@ -175,6 +185,7 @@ static int tbv_native_control_verify_hello_ack(struct tbv_state *state,
 	}
 	peer->auth_remote_nonce = remote->nonce;
 	peer->auth_session_id = session_id;
+	peer->auth_established_session_id = 0;
 	peer->auth_challenge_valid = true;
 	peer->auth_ack_verified = true;
 	peer->auth_authenticated = false;
@@ -232,6 +243,7 @@ static int tbv_native_control_accept_responder_ready(
 		return -EACCES;
 	}
 	peer->auth_authenticated = true;
+	peer->auth_established_session_id = peer->auth_session_id;
 	local->auth_flags = TBV_NATIVE_WIRE_AUTH_REQUIRED;
 	local->nonce = peer->auth_local_nonce;
 	local->session_id = peer->auth_session_id;
@@ -267,6 +279,7 @@ static int tbv_native_control_verify_ready_ack(struct tbv_state *state,
 		return -EACCES;
 	}
 	peer->auth_authenticated = true;
+	peer->auth_established_session_id = peer->auth_session_id;
 	mutex_unlock(&state->lock);
 	return 0;
 }

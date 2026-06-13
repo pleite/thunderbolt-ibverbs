@@ -216,6 +216,7 @@ static int tbv_parse_peer_auth_acl(struct tbv_state *state, const char *acl)
 		hex = strchr(token, '=');
 		if (!hex) {
 			pr_err("peer_auth_acl entries must use uuid=32hexpsk\n");
+			memzero_explicit(&key, sizeof(key));
 			kfree(dup);
 			return -EINVAL;
 		}
@@ -226,16 +227,19 @@ static int tbv_parse_peer_auth_acl(struct tbv_state *state, const char *acl)
 		if (!*token || !*hex ||
 		    strlen(hex) != TBV_PEER_AUTH_PSK_HEX_LEN) {
 			pr_err("peer_auth_acl entries must use uuid=32hexpsk\n");
+			memzero_explicit(&key, sizeof(key));
 			kfree(dup);
 			return -EINVAL;
 		}
 		if (uuid_parse(token, &parsed)) {
 			pr_err("peer_auth_acl contains an invalid UUID entry\n");
+			memzero_explicit(&key, sizeof(key));
 			kfree(dup);
 			return -EINVAL;
 		}
 		if (hex2bin((u8 *)key.key, hex, sizeof(key.key))) {
 			pr_err("peer_auth_acl contains an invalid PSK entry\n");
+			memzero_explicit(&key, sizeof(key));
 			kfree(dup);
 			return -EINVAL;
 		}
@@ -246,17 +250,21 @@ static int tbv_parse_peer_auth_acl(struct tbv_state *state, const char *acl)
 				break;
 			}
 		}
-		if (duplicate)
+		if (duplicate) {
+			memzero_explicit(&key, sizeof(key));
 			continue;
+		}
 		if (state->peer_auth_acl_count >= TBV_PEER_ALLOWLIST_MAX) {
 			pr_err("peer_auth_acl supports at most %u peers\n",
 			       TBV_PEER_ALLOWLIST_MAX);
+			memzero_explicit(&key, sizeof(key));
 			kfree(dup);
 			return -E2BIG;
 		}
 
 		state->peer_auth_acl_uuid[state->peer_auth_acl_count] = parsed;
 		state->peer_auth_acl_psk[state->peer_auth_acl_count++] = key;
+		memzero_explicit(&key, sizeof(key));
 	}
 
 	kfree(dup);
