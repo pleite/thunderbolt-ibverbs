@@ -384,6 +384,24 @@
               maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
             };
           };
+          regressionSuiteApp = pkgs.writeShellApplication {
+            name = "tbv-regression-suite";
+            runtimeInputs = [
+              pkgs.python3
+              pkgs.coreutils
+              pkgs.findutils
+              pkgs.nix
+              pkgs.openssh
+            ];
+            text = ''
+              export TBV_VLLM_SMOKE_BIN=${./userspace/bench/tbv_vllm_smoke.sh}
+              exec ${pkgs.python3}/bin/python3 -u ${./userspace/bench/tbv_regression_suite.py} "$@"
+            '';
+            meta = {
+              description = "Run one-command two-node transport + perftest regression smoke";
+              maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
+            };
+          };
         in
         {
           tbv-perftest = {
@@ -399,6 +417,14 @@
             program = lib.getExe targetModuleApp;
             meta = {
               description = "Build and reload thunderbolt_ibverbs only when the module matches the target's booted kernel";
+              maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
+            };
+          };
+          tbv-regression = {
+            type = "app";
+            program = lib.getExe regressionSuiteApp;
+            meta = {
+              description = "Run one-command two-node transport + verbs regression smoke";
               maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
             };
           };

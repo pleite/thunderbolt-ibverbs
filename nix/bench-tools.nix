@@ -31,6 +31,7 @@ let
 
   scripts = [
     "tbv_perftest_runner.py"
+    "tbv_regression_suite.py"
     "tbv_rdma_sweep.py"
     "tbv_uc_stress.py"
     "tbv_vllm_smoke.sh"
