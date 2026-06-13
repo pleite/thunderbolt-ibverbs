@@ -1339,8 +1339,11 @@ static int tbv_qp_reserve_sendq(struct tbv_qp *tqp)
 		ret = -ENOMEM;
 	} else if (peer_limit && peer) {
 		peer_used = atomic_inc_return(&peer->tx_sendq_reserved);
-		if ((u32)peer_used > peer_limit)
+		if ((u32)peer_used > peer_limit) {
+			atomic_dec(&peer->tx_sendq_reserved);
+			peer_used = 0;
 			ret = -EAGAIN;
+		}
 	}
 
 	if (!ret) {
@@ -1364,10 +1367,8 @@ static void tbv_qp_release_sendq_counted_locked(struct tbv_qp *tqp,
 		tqp->sendq_count = 0;
 	else
 		tqp->sendq_count--;
-	if (peer && WARN_ON_ONCE(!atomic_read(&peer->tx_sendq_reserved)))
-		atomic_set(&peer->tx_sendq_reserved, 0);
-	else if (peer)
-		atomic_dec(&peer->tx_sendq_reserved);
+	if (peer && !atomic_add_unless(&peer->tx_sendq_reserved, -1, 0))
+		WARN_ON_ONCE(1);
 	*counted = false;
 }
 
