@@ -137,9 +137,10 @@ All eight roadmap steps have shipped; their automation is archived under
 [scripts/archive/roadmap/](scripts/archive/roadmap/).
 
 The driver performance/security analysis findings, and the prioritized fixes
-they drive, are tracked in [docs/FINDINGS.md](docs/FINDINGS.md). Automation that
-files an issue + branch + draft PR per open finding lives in
-[scripts/fixes/](scripts/fixes/).
+they drive, are tracked in [docs/FINDINGS.md](docs/FINDINGS.md). All findings
+have been addressed, so the automation that filed an issue + branch + draft PR
+per open finding is archived under
+[scripts/archive/fixes/](scripts/archive/fixes/).
 
 ## License
 

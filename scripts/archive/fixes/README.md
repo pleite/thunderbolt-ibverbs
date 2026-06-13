@@ -1,12 +1,21 @@
-# Fix automation scripts
+# Fix automation scripts (archived)
+
+> **Archived — every analysis finding shipped.** Fixes 01–14 were filed and
+> merged via PRs #19, #21, #23, #25, #27, #29, #31, #33, #35, #37, #39, #41,
+> #43, and #45 (finding S1 shipped earlier in PR #1), so this toolkit is kept
+> here for reference only. The findings it drove are all marked `fixed` in
+> [`docs/FINDINGS.md`](../../../docs/FINDINGS.md).
+>
+> Paths in the rest of this file are written relative to the original
+> `scripts/fixes/` location.
 
 These scripts turn each **open finding** from the driver performance/security
 analysis in [`docs/FINDINGS.md`](../../docs/FINDINGS.md) into a **separate GitHub
 issue + branch + draft PR**, and hand the implementation off to the GitHub
 Copilot coding agent by `@copilot`-mentioning it on the PR.
 
-They are the successor to the now-archived roadmap toolkit
-([`scripts/archive/roadmap/`](../archive/roadmap/)), whose eight steps all
+They are the successor to the earlier roadmap toolkit
+([`scripts/archive/roadmap/`](../roadmap/)), whose eight steps all
 shipped. The mechanics are identical — only the source of work changed (analysis
 findings instead of roadmap steps).
 
