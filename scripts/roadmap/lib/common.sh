@@ -169,12 +169,17 @@ remote_branch_exists() {
 }
 
 # branch_ahead_count <branch> -> prints how many commits <branch> is ahead of
-# BASE_BRANCH on the remote. Prints 0 when equal or when it cannot be
-# determined, so callers can safely use it in an integer comparison.
+# BASE_BRANCH on the remote. Prints 0 when equal, or when the compare cannot be
+# performed (after warning), so callers can use it directly in an integer test.
+# Defaulting to 0 on error is deliberate: the caller then re-seeds, and seeding
+# is idempotent, so an uncertain compare degrades safely to "ensure a commit".
 branch_ahead_count() {
   local branch="$1" ahead
-  ahead="$(gh api "repos/$REPO/compare/$BASE_BRANCH...$branch" --jq '.ahead_by' \
-             2>/dev/null || true)"
+  if ! ahead="$(gh api "repos/$REPO/compare/$BASE_BRANCH...$branch" \
+                  --jq '.ahead_by' 2>/dev/null)"; then
+    warn "could not compare $branch against $BASE_BRANCH; assuming not ahead"
+    ahead=0
+  fi
   case "$ahead" in
     ''|*[!0-9]*) ahead=0 ;;
   esac

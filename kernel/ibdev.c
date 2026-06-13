@@ -618,6 +618,12 @@ struct tbv_gsi_send_ctx {
 };
 
 static DEFINE_IDA(tbv_qpn_ida);
+/*
+ * MR keys are no longer handed out from a sequential atomic_t counter; they are
+ * drawn from a CSPRNG in tbv_mr_insert_random_key() so a remote peer cannot
+ * guess a valid rkey and perform arbitrary remote DMA.  The old global counter
+ * is therefore intentionally gone.
+ */
 
 static int tbv_cq_push(struct tbv_cq *tcq, const struct ib_wc *wc);
 static void tbv_send_ctx_put(struct tbv_send_ctx *send);
