@@ -9078,7 +9078,8 @@ void tbv_ibdev_rx_frame(struct tbv_state *state, struct tbv_path *rx_path,
  * Insert @mr under a freshly drawn random key, retrying on the (astronomically
  * unlikely) event of a collision with an existing key.  Key 0 is reserved: it
  * is the implicit local_dma_lkey value, which this driver intentionally does
- * not honour.  Must be called with owner->verbs_mrs_xa locked.
+ * not honour.  Must be called with owner->verbs_mrs_xa locked, so insertion
+ * uses GFP_ATOMIC (the lock is held with IRQs disabled).
  */
 static int tbv_mr_insert_random_key(struct tbv_state *owner, struct tbv_mr *mr,
 				    u32 *out_key)
