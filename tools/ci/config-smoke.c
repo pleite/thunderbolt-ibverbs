@@ -82,6 +82,39 @@ static int test_canonical_apple_uses_same_identity_gate(void)
 	return 0;
 }
 
+static int test_apple_accepts_roce_v1_gid(void)
+{
+	/*
+	 * Older macOS releases advertise a RoCE V1 GID on the
+	 * AppleThunderboltIP-backed IOEthernetInterface.  The apple backend
+	 * must seal successfully with a V1 GID when the NCCL policy is
+	 * configured accordingly.  The native backend would enforce V2 in its
+	 * own validate_config hook; the apple hook does not repeat that check.
+	 */
+	struct tbv_id_gid gids[] = {
+		/* device_id=4, port=1, gid_index=0, addr=10.0.4.2 */
+		mk_gid(4, 1, 0, TBV_ID_GID_ROCE_V1, 10, 0, 4, 2),
+	};
+	/* peer at 10.0.5.2, local source 10.0.4.2 (matches GID addr above) */
+	struct tbv_id_route route = mk_route(10, 0, 5, 2, 10, 0, 4, 2);
+	struct tbv_id_nccl_policy nccl;
+	struct tbv_cfg_link link;
+
+	tbv_id_nccl_policy_default(&nccl);
+	nccl.roce_version = 1;
+
+	tbv_cfg_link_init(&link, 20);
+	CHECK(tbv_cfg_link_set_backend(&link, TBV_CFG_BACKEND_APPLE) == 0);
+	CHECK(tbv_cfg_link_set_route(&link, &route) == 0);
+	CHECK(tbv_cfg_link_set_nccl_policy(&link, &nccl) == 0);
+	CHECK(tbv_cfg_link_set_app_gids(&link, gids, 1) == 0);
+	CHECK(tbv_cfg_link_seal(&link) == 0);
+	CHECK(link.app_selection.valid);
+	CHECK(link.app_selection.gid_type == TBV_ID_GID_ROCE_V1);
+
+	return 0;
+}
+
 static int test_partial_links_cannot_activate(void)
 {
 	struct tbv_cfg_link link;
@@ -174,6 +207,7 @@ int main(void)
 {
 	CHECK(test_canonical_native_activates() == 0);
 	CHECK(test_canonical_apple_uses_same_identity_gate() == 0);
+	CHECK(test_apple_accepts_roce_v1_gid() == 0);
 	CHECK(test_partial_links_cannot_activate() == 0);
 	CHECK(test_current_bridge_shape_cannot_seal() == 0);
 	CHECK(test_nccl_workaround_mismatch_cannot_seal() == 0);

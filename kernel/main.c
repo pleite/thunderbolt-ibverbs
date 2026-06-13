@@ -98,10 +98,15 @@ module_param(native_data, bool, 0444);
 MODULE_PARM_DESC(native_data,
 		 "Allow native Linux peers to allocate rings and enable data paths");
 
-static bool apple_data;
-module_param(apple_data, bool, 0444);
+/*
+ * apple_data: -1 = auto (true when the resolved profile enables the Apple
+ * transport), 0 = off, positive = on.  Most users should leave this unset;
+ * the profile=mac_compat and profile=mixed selections enable it implicitly.
+ */
+static int apple_data_param = -1;
+module_param_named(apple_data, apple_data_param, int, 0444);
 MODULE_PARM_DESC(apple_data,
-		 "Allow Apple-compatible peers to allocate rings and enable data paths");
+		 "Allow Apple-compatible data paths: -1=auto (from profile), 0=off, 1=on");
 
 static bool native_fragment_striping;
 module_param(native_fragment_striping, bool, 0444);
@@ -178,6 +183,7 @@ static int __init tbv_init(void)
 	struct tbv_tbnet_identity_config identity_cfg;
 	struct tbv_service_config service_cfg;
 	struct tbv_config cfg;
+	bool apple_data;
 	int ret;
 
 	ret = tbv_config_parse(&cfg, compat, profile, tbnet,
@@ -188,6 +194,14 @@ static int __init tbv_init(void)
 	ret = tbv_config_resolve(&resolved, &cfg);
 	if (ret)
 		return ret;
+
+	/*
+	 * Resolve apple_data: when the caller did not override it (-1), derive
+	 * the value from the profile so that profile=mac_compat and
+	 * profile=mixed enable Apple data paths automatically.
+	 */
+	apple_data = (apple_data_param >= 0) ? (apple_data_param != 0)
+					     : resolved.apple_enabled;
 
 	ret = tbv_tbnet_identity_check_config(&resolved);
 	if (ret)
