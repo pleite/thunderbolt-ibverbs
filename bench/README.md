@@ -106,6 +106,19 @@ nix run .#tbv-regression -- \
 The self-hosted GitHub Actions entrypoint is
 `.github/workflows/regression-self-hosted.yml` (`workflow_dispatch`).
 
+## Hot-unplug with in-flight traffic smoke
+
+Use `userspace/bench/tbv_hot_unplug_inflight.sh` to exercise hot-unplug while
+`ib_send_bw` traffic is in flight. Provide two SSH hosts and an unplug command:
+
+```sh
+userspace/bench/tbv_hot_unplug_inflight.sh \
+  --hosts strix-1,strix-2 \
+  --dev usb4_rdma0 \
+  --unplug-host strix-1 \
+  --unplug-cmd 'sudo sh -c "echo 1 > /sys/bus/thunderbolt/devices/domain0/remove"'
+```
+
 ## Ad-hoc subsets
 
 Filter cases with one or more `--only` fnmatch patterns:

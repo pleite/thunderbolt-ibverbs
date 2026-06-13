@@ -703,6 +703,7 @@ const char *tbv_ibdev_roce_netdev_name(void);
  */
 int tbv_ibdev_rail_event(struct tbv_state *state, struct tbv_rail *rail,
 			 bool joined);
+void tbv_ibdev_flush_rail_qps(struct tbv_state *state, struct tbv_rail *rail);
 void tbv_ibdev_rx_frame(struct tbv_state *state, struct tbv_path *rx_path,
 			const void *data, u32 len);
 void tbv_ibdev_rx_native_frame(struct tbv_state *state,

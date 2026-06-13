@@ -421,6 +421,8 @@ void tbv_peer_remove_rail(struct tbv_rail *rail)
 	rail->removing = true;
 	mutex_unlock(&peer->state->lock);
 
+	tbv_ibdev_flush_rail_qps(peer->state, rail);
+
 	/*
 	 * Tear down the per-rail ib_device (if any) before the path. Any QPs
 	 * pinned to this rail hold a rail refcount, so ib_unregister_device's
