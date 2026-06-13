@@ -12,6 +12,10 @@ provider_type=""
 server_dev=""
 client_dev=""
 tmp_dir=""
+# When set to 1, missing RDMA capabilities are treated as a hard failure
+# instead of a skip. Default 0 so shared CI workers without a software RDMA
+# backend (rdma_rxe/siw) skip cleanly rather than failing the pipeline.
+require_rdma="${TBV_CI_REQUIRE_RDMA:-0}"
 timeout_seconds="${TBV_CI_TIMEOUT_SECONDS:-60}"
 server_startup_delay="${TBV_CI_SERVER_STARTUP_DELAY:-2}"
 perftest_duration_seconds="${TBV_CI_PERFTEST_DURATION_SECONDS:-3}"
@@ -28,12 +32,28 @@ Creates a virtual two-node RDMA harness in Linux network namespaces, runs:
   - ib_send_bw
   - rping --validate
 and fails if any RDMA error counters move.
+
+If no software RDMA backend (rdma_rxe/siw) or required tooling is available,
+the test is skipped (exit 0). Set TBV_CI_REQUIRE_RDMA=1 to treat a missing
+RDMA backend as a hard failure instead (e.g. on hosts with real RDMA).
 EOF
 }
 
 die() {
 	printf 'error: %s\n' "$*" >&2
 	exit 1
+}
+
+# Skip the test when the worker lacks RDMA capabilities (e.g. no software
+# RDMA backend). Exits 0 so the CI job passes, unless TBV_CI_REQUIRE_RDMA=1
+# forces a hard failure on hosts that are expected to have RDMA.
+skip() {
+	if [[ "$require_rdma" == "1" ]]; then
+		die "$* (TBV_CI_REQUIRE_RDMA=1)"
+	fi
+	printf '==> SKIP: %s\n' "$*"
+	printf '==> Set TBV_CI_REQUIRE_RDMA=1 to treat this as a failure.\n'
+	exit 0
 }
 
 cleanup() {
@@ -48,6 +68,7 @@ trap cleanup EXIT
 require_root() {
 	if [[ "$(id -u)" -ne 0 ]]; then
 		exec sudo \
+			TBV_CI_REQUIRE_RDMA="${TBV_CI_REQUIRE_RDMA:-}" \
 			TBV_CI_TIMEOUT_SECONDS="${TBV_CI_TIMEOUT_SECONDS:-}" \
 			TBV_CI_SERVER_STARTUP_DELAY="${TBV_CI_SERVER_STARTUP_DELAY:-}" \
 			TBV_CI_PERFTEST_DURATION_SECONDS="${TBV_CI_PERFTEST_DURATION_SECONDS:-}" \
@@ -128,13 +149,11 @@ create_netns() {
 	ip -n "$ns_client" link set "$veth_client" up
 }
 
-setup_rdma_backend() {
+detect_rdma_backend() {
 	if modprobe rdma_rxe >/dev/null 2>&1; then
 		provider_type="rxe"
 		server_dev="tbv_ci_rxe_srv"
 		client_dev="tbv_ci_rxe_cli"
-		ip netns exec "$ns_server" rdma link add "$server_dev" type rxe netdev "$veth_server"
-		ip netns exec "$ns_client" rdma link add "$client_dev" type rxe netdev "$veth_client"
 		return 0
 	fi
 
@@ -142,12 +161,15 @@ setup_rdma_backend() {
 		provider_type="siw"
 		server_dev="tbv_ci_siw_srv"
 		client_dev="tbv_ci_siw_cli"
-		ip netns exec "$ns_server" rdma link add "$server_dev" type siw netdev "$veth_server"
-		ip netns exec "$ns_client" rdma link add "$client_dev" type siw netdev "$veth_client"
 		return 0
 	fi
 
-	die "no software RDMA backend available (need rdma_rxe or siw)"
+	return 1
+}
+
+setup_rdma_backend() {
+	ip netns exec "$ns_server" rdma link add "$server_dev" type "$provider_type" netdev "$veth_server"
+	ip netns exec "$ns_client" rdma link add "$client_dev" type "$provider_type" netdev "$veth_client"
 }
 
 run_pair() {
@@ -218,8 +240,12 @@ main() {
 	require_root "$@"
 
 	for cmd in ip rdma ib_write_bw ib_send_bw rping timeout; do
-		command -v "$cmd" >/dev/null 2>&1 || die "$cmd not found"
+		command -v "$cmd" >/dev/null 2>&1 || skip "$cmd not found; RDMA datapath tooling unavailable"
 	done
+
+	if ! detect_rdma_backend; then
+		skip "no software RDMA backend available (need rdma_rxe or siw)"
+	fi
 
 	modprobe ib_uverbs >/dev/null 2>&1 || true
 	modprobe rdma_cm >/dev/null 2>&1 || true
