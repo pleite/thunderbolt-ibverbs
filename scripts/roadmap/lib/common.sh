@@ -181,6 +181,48 @@ branch_ahead_count() {
   printf '%s\n' "$ahead"
 }
 
+# base SHA of BASE_BRANCH on the remote.
+base_branch_sha() {
+  gh api "repos/$REPO/git/ref/heads/$BASE_BRANCH" --jq '.object.sha' 2>/dev/null
+}
+
+# ensure_branch_ref <branch>
+# Create refs/heads/<branch> pointing at the tip of BASE_BRANCH when it does not
+# already exist. Uses the git refs API so it needs no local git identity or push
+# credentials beyond the gh auth the rest of this library already relies on.
+ensure_branch_ref() {
+  local branch="$1" sha
+  if remote_branch_exists "$branch"; then
+    return 0
+  fi
+  sha="$(base_branch_sha)" || true
+  [ -n "$sha" ] || die "could not resolve tip of $BASE_BRANCH to create $branch"
+  info "creating branch ref: $branch (from $BASE_BRANCH @ ${sha:0:7})"
+  gh api "repos/$REPO/git/refs" -X POST \
+      -f "ref=refs/heads/$branch" -f "sha=$sha" >/dev/null \
+    || die "failed to create branch ref: $branch"
+}
+
+# put_seed_file <branch> <seed-rel-path> <seed-file> <commit-msg>
+# Commit <seed-file> to <seed-rel-path> on <branch> via the Contents API. This
+# produces a real commit (and therefore a diff against BASE_BRANCH) without
+# needing git author identity or push credentials in the environment.
+put_seed_file() {
+  local branch="$1" seed_rel="$2" seed_src="$3" msg="$4" content sha
+  content="$(base64 < "$seed_src" | tr -d '\n')"
+
+  # If the file already exists on the branch we must pass its blob sha to update
+  # it; otherwise the create call is used.
+  sha="$(gh api "repos/$REPO/contents/$seed_rel?ref=$branch" --jq '.sha' \
+           2>/dev/null || true)"
+
+  local args=(-X PUT -f "message=$msg" -f "branch=$branch" -f "content=$content")
+  [ -n "$sha" ] && [ "$sha" != "null" ] && args+=(-f "sha=$sha")
+
+  gh api "repos/$REPO/contents/$seed_rel" "${args[@]}" >/dev/null \
+    || die "failed to commit seed file to branch: $branch"
+}
+
 # create_branch_with_seed <branch> <seed-rel-path> <seed-file> <commit-msg>
 # Seeds the branch with a task file so the PR has a real diff and the coding
 # agent has the spec on the branch to start from.
@@ -203,53 +245,25 @@ create_branch_with_seed() {
 
     warn "branch exists but is not ahead of $BASE_BRANCH: $branch — adding seed commit"
     if [ -n "$DRY_RUN" ]; then
-      printf '   [dry-run] checkout existing %s + seed %s + push\n' "$branch" "$seed_rel"
+      printf '   [dry-run] commit seed %s to existing %s via contents API\n' \
+        "$seed_rel" "$branch"
       return 0
     fi
 
-    local tmp; tmp="$(mktemp -d)"
-    (
-      cd "$tmp"
-      git clone --depth 1 --branch "$branch" \
-        "https://github.com/$REPO.git" repo >/dev/null 2>&1
-      cd repo
-      mkdir -p "$(dirname "$seed_rel")"
-      if [ -f "$seed_rel" ]; then
-        # Seed already present on the branch; an empty commit is enough to get
-        # the branch ahead of base so a PR can be opened.
-        git commit --allow-empty -m "$msg" >/dev/null
-      else
-        cp "$seed_src" "$seed_rel"
-        git add "$seed_rel"
-        git commit -m "$msg" >/dev/null
-      fi
-      git push origin "$branch" >/dev/null 2>&1
-    ) || die "failed to seed existing branch: $branch"
-    rm -rf "$tmp"
+    put_seed_file "$branch" "$seed_rel" "$seed_src" "$msg"
     ok "seeded existing branch: $branch"
     return 0
   fi
 
   info "creating branch: $branch (from $BASE_BRANCH)"
   if [ -n "$DRY_RUN" ]; then
-    printf '   [dry-run] git clone + branch + seed %s + push\n' "$seed_rel"
+    printf '   [dry-run] create ref %s + commit seed %s via contents API\n' \
+      "$branch" "$seed_rel"
     return 0
   fi
 
-  local tmp; tmp="$(mktemp -d)"
-  (
-    cd "$tmp"
-    git clone --depth 1 --branch "$BASE_BRANCH" \
-      "https://github.com/$REPO.git" repo >/dev/null 2>&1
-    cd repo
-    git checkout -b "$branch"
-    mkdir -p "$(dirname "$seed_rel")"
-    cp "$seed_src" "$seed_rel"
-    git add "$seed_rel"
-    git commit -m "$msg" >/dev/null
-    git push -u origin "$branch" >/dev/null 2>&1
-  ) || die "failed to seed/push branch: $branch"
-  rm -rf "$tmp"
+  ensure_branch_ref "$branch"
+  put_seed_file "$branch" "$seed_rel" "$seed_src" "$msg"
   ok "pushed branch: $branch"
 }
 
