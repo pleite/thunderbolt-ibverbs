@@ -12,6 +12,11 @@ thunderbolt_ibverbs-y := main.o profile.o backend.o configfs.o core.o debugfs.o 
 
 ccflags-y := -Wall -Wextra -Wno-unused-parameter -I$(src) -I$(src)/.. -DTBV_DEBUG_SURFACES_COMPILED=$(tbv_debug_surfaces)
 
+# Feature detection: ib_dmah parameter added to reg_user_mr in Linux 6.13.
+ifneq ($(shell grep -q 'struct ib_dmah' $(KDIR)/include/rdma/ib_verbs.h 2>/dev/null && echo yes),)
+    ccflags-y += -DTBV_KERNEL_HAS_IB_DMAH
+endif
+
 .PHONY: all clean modules modules_install help
 
 all: modules

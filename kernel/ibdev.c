@@ -23,7 +23,6 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/thunderbolt.h>
-#include <linux/version.h>
 #include <linux/vmalloc.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
@@ -112,8 +111,7 @@ MODULE_PARM_DESC(zcopy_min_bytes,
 static uint qp_timeout_ms = TBV_QP_TIMEOUT_DEFAULT_MS;
 module_param(qp_timeout_ms, uint, 0644);
 MODULE_PARM_DESC(qp_timeout_ms,
-		 "Fallback milliseconds for pending native/Apple WRs and partial native receives "
-		 "when a QP has no verbs ACK timeout; 0 disables fallback timeout work");
+		 "Fallback milliseconds for pending native/Apple WRs and partial native receives when a QP has no verbs ACK timeout; 0 disables fallback timeout work");
 
 static uint apple_tx_max_inflight_wr = 1;
 module_param(apple_tx_max_inflight_wr, uint, 0644);
@@ -1217,17 +1215,16 @@ tbv_qp_validate_native_endpoint(struct tbv_qp *tqp,
 	unsigned long flags;
 
 	spin_lock_irqsave(&tqp->lock, flags);
-	if (tqp->closing || tqp->state == IB_QPS_ERR) {
+	if (tqp->closing || tqp->state == IB_QPS_ERR)
 		status = TBV_RX_ENDPOINT_QP_ERROR;
-	} else if (!tbv_qp_native_session_matches(tqp)) {
+	else if (!tbv_qp_native_session_matches(tqp))
 		status = TBV_RX_ENDPOINT_BAD_PEER;
-	} else if (hdr->dest_qp != tqp->base.qp_num) {
+	else if (hdr->dest_qp != tqp->base.qp_num)
 		status = TBV_RX_ENDPOINT_BAD_PEER;
-	} else if (!tqp->dest_qp_known) {
+	else if (!tqp->dest_qp_known)
 		status = TBV_RX_ENDPOINT_UNCONNECTED;
-	} else if (hdr->src_qp != tqp->attr.dest_qp_num) {
+	else if (hdr->src_qp != tqp->attr.dest_qp_num)
 		status = TBV_RX_ENDPOINT_BAD_PEER;
-	}
 	spin_unlock_irqrestore(&tqp->lock, flags);
 
 	return status;
@@ -2963,11 +2960,10 @@ static void tbv_qp_release_apple_tunnel(struct tbv_qp *tqp)
 	spin_lock_irqsave(&tqp->lock, flags);
 	if (tqp->apple_tunnel_active) {
 		tqp->apple_tunnel_active = false;
-		if (WARN_ON_ONCE(!rail->apple_tunnel_qps)) {
+		if (WARN_ON_ONCE(!rail->apple_tunnel_qps))
 			rail->apple_tunnel_qps = 0;
-		} else {
+		else
 			rail->apple_tunnel_qps--;
-		}
 		refs = rail->apple_tunnel_qps;
 		route = peer->xd->route;
 		disable = !refs && !rail->removing &&
@@ -3937,9 +3933,8 @@ static void tbv_qp_timeout_work(struct work_struct *work)
 			tx_timed_out = true;
 		tbv_send_ctx_put(send);
 	}
-	if (tx_timed_out) {
+	if (tx_timed_out)
 		need_resched = false;
-	}
 
 	while (!list_empty(&completed_sends)) {
 		struct tbv_send_ctx *send =
@@ -6483,7 +6478,7 @@ static int tbv_apple_sq_get_tx_resources(struct tbv_qp *tqp,
 		tbv_release_path_refs(&path, 1);
 		if (ret != -ENOMEM)
 			return ret;
-		msleep(1);
+		usleep_range(1000, 2000);
 	}
 }
 
@@ -8116,6 +8111,16 @@ static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 		return;
 	}
 
+	if (!msg->active &&
+	    (tbv_rx_reorder_find(tqp, psn) ||
+	     psn != tqp->rx_expected_psn)) {
+		tbv_rx_buffer_fragment_locked(state, tqp, rx_path, hdr, psn,
+					      total_len, offset, last,
+					      payload);
+		mutex_unlock(&tqp->rx_lock);
+		return;
+	}
+
 	if (msg->active) {
 		if (msg->src_qp != hdr->src_qp || msg->psn != psn ||
 		    msg->total_len != total_len ||
@@ -8142,11 +8147,24 @@ static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 				mutex_unlock(&tqp->rx_lock);
 				return;
 			}
-			if (msg->src_qp == hdr->src_qp && msg->psn == psn &&
-			    msg->total_len == total_len &&
-			    msg->with_imm == with_imm &&
-			    msg->imm_data == imm_data &&
-			    offset < msg->received) {
+			if (msg->src_qp != hdr->src_qp ||
+			    msg->psn != psn ||
+			    msg->total_len != total_len ||
+			    msg->with_imm != with_imm ||
+			    msg->imm_data != imm_data) {
+				tbv_rx_fail_active_send(state, tqp, rx_path,
+							IB_WC_LOC_PROT_ERR);
+				mutex_unlock(&tqp->rx_lock);
+				tbv_rx_send_error_ack(state, tqp, rx_path, hdr,
+						      psn, "active mismatch",
+						      true);
+				return;
+			}
+			if (offset > msg->received) {
+				mutex_unlock(&tqp->rx_lock);
+				return;
+			}
+			if (offset < msg->received) {
 				u32 duplicate = msg->received - offset;
 
 				if (duplicate >= hdr->length) {
@@ -8156,31 +8174,8 @@ static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 				copy_payload = (const u8 *)payload + duplicate;
 				copy_offset = msg->received;
 				copy_len = hdr->length - duplicate;
-			} else if (msg->src_qp == hdr->src_qp &&
-				   msg->psn == psn &&
-				   msg->total_len == total_len &&
-				   msg->with_imm == with_imm &&
-				   msg->imm_data == imm_data &&
-				   offset > msg->received) {
-				mutex_unlock(&tqp->rx_lock);
-				return;
-			} else {
-				tbv_rx_fail_active_send(state, tqp, rx_path,
-							IB_WC_LOC_PROT_ERR);
-				mutex_unlock(&tqp->rx_lock);
-				tbv_rx_send_error_ack(state, tqp, rx_path, hdr,
-						      psn, "active mismatch",
-						      true);
-				return;
 			}
 		}
-	} else if (tbv_rx_reorder_find(tqp, psn) ||
-		   psn != tqp->rx_expected_psn) {
-		tbv_rx_buffer_fragment_locked(state, tqp, rx_path, hdr, psn,
-					      total_len, offset, last,
-					      payload);
-		mutex_unlock(&tqp->rx_lock);
-		return;
 	} else {
 		if (offset) {
 			mutex_unlock(&tqp->rx_lock);
@@ -9514,7 +9509,7 @@ static struct ib_mr *tbv_get_dma_mr(struct ib_pd *pd, int access)
 
 static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 				     u64 virt_addr, int access,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+#ifdef TBV_KERNEL_HAS_IB_DMAH
 				     struct ib_dmah *dmah,
 #endif
 				     struct ib_udata *udata)
