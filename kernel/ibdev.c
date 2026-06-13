@@ -36,6 +36,7 @@
 #include "../proto/native_data.h"
 #include "../proto/reliability.h"
 #include "tbv.h"
+#include "ibdev_split.h"
 
 #if IS_ENABLED(CONFIG_KUNIT)
 #include <kunit/test.h>
@@ -2482,7 +2483,7 @@ static int tbv_dealloc_pd(struct ib_pd *pd, struct ib_udata *udata)
 	return 0;
 }
 
-static int tbv_create_cq(struct ib_cq *cq, const struct ib_cq_init_attr *attr,
+int tbv_create_cq_impl(struct ib_cq *cq, const struct ib_cq_init_attr *attr,
 			 struct uverbs_attr_bundle *attrs)
 {
 	struct tbv_cq *tcq = container_of(cq, struct tbv_cq, base);
@@ -2501,7 +2502,7 @@ static int tbv_create_cq(struct ib_cq *cq, const struct ib_cq_init_attr *attr,
 	return 0;
 }
 
-static int tbv_destroy_cq(struct ib_cq *cq, struct ib_udata *udata)
+int tbv_destroy_cq_impl(struct ib_cq *cq, struct ib_udata *udata)
 {
 	struct tbv_cq *tcq = container_of(cq, struct tbv_cq, base);
 
@@ -2511,7 +2512,7 @@ static int tbv_destroy_cq(struct ib_cq *cq, struct ib_udata *udata)
 	return 0;
 }
 
-static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
+int tbv_create_qp_impl(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 			 struct ib_udata *udata)
 {
 	struct tbv_qp *tqp = container_of(qp, struct tbv_qp, base);
@@ -2657,7 +2658,7 @@ err_put_rail:
 	return ret;
 }
 
-static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
+int tbv_destroy_qp_impl(struct ib_qp *qp, struct ib_udata *udata)
 {
 	struct tbv_qp *tqp = container_of(qp, struct tbv_qp, base);
 	LIST_HEAD(flush);
@@ -2897,7 +2898,7 @@ static int tbv_validate_modify_qp_locked(struct tbv_qp *tqp,
 	return 0;
 }
 
-static int tbv_modify_qp(struct ib_qp *qp, struct ib_qp_attr *attr,
+int tbv_modify_qp_impl(struct ib_qp *qp, struct ib_qp_attr *attr,
 			 int attr_mask, struct ib_udata *udata)
 {
 	struct tbv_qp *tqp = container_of(qp, struct tbv_qp, base);
@@ -3010,7 +3011,7 @@ out_unlock:
 	return 0;
 }
 
-static int tbv_query_qp(struct ib_qp *qp, struct ib_qp_attr *attr,
+int tbv_query_qp_impl(struct ib_qp *qp, struct ib_qp_attr *attr,
 			int attr_mask, struct ib_qp_init_attr *init_attr)
 {
 	struct tbv_qp *tqp = container_of(qp, struct tbv_qp, base);
@@ -5256,7 +5257,7 @@ err_put_qp:
 	return ret;
 }
 
-static int tbv_post_send(struct ib_qp *qp, const struct ib_send_wr *wr,
+int tbv_post_send_impl(struct ib_qp *qp, const struct ib_send_wr *wr,
 			 const struct ib_send_wr **bad_wr)
 {
 	struct tbv_qp *tqp = container_of(qp, struct tbv_qp, base);
@@ -5313,7 +5314,7 @@ err_put:
 	return ret;
 }
 
-static int tbv_post_recv(struct ib_qp *qp, const struct ib_recv_wr *wr,
+int tbv_post_recv_impl(struct ib_qp *qp, const struct ib_recv_wr *wr,
 			 const struct ib_recv_wr **bad_wr)
 {
 	struct tbv_qp *tqp = container_of(qp, struct tbv_qp, base);
@@ -5700,7 +5701,7 @@ static int tbv_apple_rx_copy_frame_to_buf(struct tbv_qp *tqp,
 	return 0;
 }
 
-void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
+void tbv_ibdev_rx_apple_frame_impl(struct tbv_state *state,
 			      const struct tbv_path *path,
 			      const void *payload, u32 len, u8 sof, u8 eof)
 {
@@ -8831,7 +8832,7 @@ complete_ack:
 	tbv_read_ctx_put(read);
 }
 
-static int tbv_poll_cq(struct ib_cq *cq, int num_entries, struct ib_wc *wc)
+int tbv_poll_cq_impl(struct ib_cq *cq, int num_entries, struct ib_wc *wc)
 {
 	struct tbv_cq *tcq = container_of(cq, struct tbv_cq, base);
 	unsigned long flags;
@@ -8855,7 +8856,7 @@ static int tbv_poll_cq(struct ib_cq *cq, int num_entries, struct ib_wc *wc)
 	return polled;
 }
 
-static int tbv_req_notify_cq(struct ib_cq *cq, enum ib_cq_notify_flags flags)
+int tbv_req_notify_cq_impl(struct ib_cq *cq, enum ib_cq_notify_flags flags)
 {
 	struct tbv_cq *tcq = container_of(cq, struct tbv_cq, base);
 	unsigned long irq_flags;
@@ -8957,7 +8958,7 @@ static void tbv_rx_handle_mad(struct tbv_state *state, struct tbv_path *rx_path,
 	tbv_qp_put(tqp);
 }
 
-void tbv_ibdev_rx_native_frame(struct tbv_state *state,
+void tbv_ibdev_rx_native_frame_impl(struct tbv_state *state,
 			       struct tbv_path *rx_path,
 			       const struct tbv_native_data_header *hdr,
 			       const void *payload)
@@ -9152,7 +9153,7 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 	tbv_qp_put(tqp);
 }
 
-void tbv_ibdev_rx_frame(struct tbv_state *state, struct tbv_path *rx_path,
+void tbv_ibdev_rx_frame_impl(struct tbv_state *state, struct tbv_path *rx_path,
 			const void *data, u32 len)
 {
 	struct tbv_native_data_header hdr;
@@ -9175,7 +9176,7 @@ void tbv_ibdev_rx_frame(struct tbv_state *state, struct tbv_path *rx_path,
 	}
 
 	payload = (const u8 *)data + TBV_NATIVE_DATA_HDR_SIZE;
-	tbv_ibdev_rx_native_frame(state, rx_path, &hdr, payload);
+	tbv_ibdev_rx_native_frame_impl(state, rx_path, &hdr, payload);
 }
 
 static int tbv_mr_publish(struct tbv_mr *mr, struct ib_pd *pd)
@@ -9219,7 +9220,7 @@ static int tbv_mr_publish(struct tbv_mr *mr, struct ib_pd *pd)
 	return 0;
 }
 
-static struct ib_mr *tbv_get_dma_mr(struct ib_pd *pd, int access)
+struct ib_mr *tbv_get_dma_mr_impl(struct ib_pd *pd, int access)
 {
 	struct tbv_mr *mr;
 	int ret;
@@ -9246,7 +9247,7 @@ static struct ib_mr *tbv_get_dma_mr(struct ib_pd *pd, int access)
 	return &mr->base;
 }
 
-static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+struct ib_mr *tbv_reg_user_mr_impl(struct ib_pd *pd, u64 start, u64 length,
 				     u64 virt_addr, int access,
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 				     struct ib_dmah *dmah,
@@ -9292,7 +9293,7 @@ static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	return &mr->base;
 }
 
-static int tbv_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
+int tbv_dereg_mr_impl(struct ib_mr *ibmr, struct ib_udata *udata)
 {
 	struct tbv_mr *mr = container_of(ibmr, struct tbv_mr, base);
 	unsigned long flags;
