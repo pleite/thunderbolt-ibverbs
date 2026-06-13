@@ -2,8 +2,8 @@
 
 > **Archived — all eight roadmap steps shipped.** Steps 1–8 were filed and merged
 > via PRs #3, #5, #7, #9, #11, #13, #15, and #17, so this toolkit is kept here for
-> reference only. New work driven by the driver analysis uses
-> [`scripts/fixes/`](../../fixes/) instead; see
+> reference only. The follow-on work driven by the driver analysis used the
+> [`scripts/archive/fixes/`](../fixes/) toolkit (now archived too); see
 > [`docs/FINDINGS.md`](../../../docs/FINDINGS.md).
 >
 > Paths in the rest of this file are written relative to the original

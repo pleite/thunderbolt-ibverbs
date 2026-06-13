@@ -755,9 +755,9 @@ tbv_qp_validate_native_endpoint(struct tbv_qp *tqp,
 				const struct tbv_native_data_header *hdr)
 {
 	/*
-	 * FINDINGS.md S3 (open): endpoint acceptance below is a plaintext QPN
-	 * check only and is not bound to an authenticated session; see
-	 * scripts/fixes/04-peer-authentication.sh.
+	 * FINDINGS.md S3 (fixed, PR #25): the plaintext QPN check below is now
+	 * gated on tbv_qp_native_session_matches(), so acceptance is bound to an
+	 * authenticated native session rather than the QPN alone.
 	 */
 	enum tbv_rx_endpoint_status status = TBV_RX_ENDPOINT_OK;
 	unsigned long flags;
