@@ -354,6 +354,16 @@ def run_ssh(target: str, command: str, *, check: bool = True, timeout: int | Non
     return run_local(ssh_args(target, command), check=check, timeout=timeout)
 
 
+def run_repeat_hook(host: str, command: str, *, timeout: int) -> None:
+    proc = run_ssh(host, command, check=False, timeout=timeout)
+    if proc.stdout.strip():
+        print(proc.stdout.rstrip(), flush=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"repeat hook failed on {host} with exit {proc.returncode}: {command}"
+        )
+
+
 def detect_system(host: str) -> str:
     """Return 'Linux' or 'Darwin' for the host via `uname -s`."""
     out = run_ssh(host, "uname -s", check=False, timeout=10).stdout.strip()
@@ -1043,6 +1053,22 @@ def main() -> int:
         default=1,
         help="Repeat the selected benchmark case/direction sequence N times",
     )
+    parser.add_argument(
+        "--between-repeat-server-cmd",
+        default="",
+        help="sudo bash command to run on the server host between repeats (for module reload / fault injection)",
+    )
+    parser.add_argument(
+        "--between-repeat-client-cmd",
+        default="",
+        help="sudo bash command to run on the client host between repeats (for module reload / fault injection)",
+    )
+    parser.add_argument(
+        "--between-repeat-timeout",
+        type=int,
+        default=120,
+        help="timeout in seconds for each between-repeat hook command",
+    )
     args = parser.parse_args()
     if args.repeat < 1:
         die("--repeat must be >= 1")
@@ -1303,6 +1329,27 @@ def main() -> int:
                             if stop_on_fail:
                                 print(f"tbv-perftest: stopping after failure: {error}", file=sys.stderr)
                                 return 1
+            if repeat_index < args.repeat:
+                if args.between_repeat_server_cmd:
+                    print(
+                        f"tbv-perftest: running between-repeat server hook on {server}",
+                        flush=True,
+                    )
+                    run_repeat_hook(
+                        server,
+                        args.between_repeat_server_cmd,
+                        timeout=args.between_repeat_timeout,
+                    )
+                if args.between_repeat_client_cmd:
+                    print(
+                        f"tbv-perftest: running between-repeat client hook on {client}",
+                        flush=True,
+                    )
+                    run_repeat_hook(
+                        client,
+                        args.between_repeat_client_cmd,
+                        timeout=args.between_repeat_timeout,
+                    )
     finally:
         csv_handle.close()
         jsonl_handle.close()
