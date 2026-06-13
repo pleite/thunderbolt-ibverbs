@@ -13,8 +13,15 @@ broadly accessible — useful information for an attacker.
 - Reduce sensitive fields in the `summary` output.
 
 ### Acceptance criteria
-- [ ] Sensitive debug/config surfaces are not readable/writable unprivileged.
-- [ ] Production builds can disable them entirely.
+- [x] Sensitive debug/config surfaces are not readable/writable unprivileged.
+- [x] Production builds can disable them entirely.
+
+### Implementation notes
+- debugfs entries are now root-readable only (`0400`) and the summary output no
+  longer emits proxy-IP or identity netdev names.
+- configfs link attributes are now root-only (`0600`/`0400`).
+- `production_mode=1` disables both surfaces at runtime.
+- `CONFIG_THUNDERBOLT_IBVERBS_DEBUG_SURFACES=n` compiles both surfaces out.
 
 ### Labels
 `security`, `kernel`

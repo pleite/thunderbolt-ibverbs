@@ -123,7 +123,20 @@ module_param(peer_allowlist, charp, 0444);
 MODULE_PARM_DESC(peer_allowlist,
 		 "Optional comma-separated remote host UUID allow-list (for example 00112233-4455-6677-8899-aabbccddeeff)");
 
+static bool production_mode;
+module_param(production_mode, bool, 0444);
+MODULE_PARM_DESC(production_mode,
+		 "Disable debugfs/configfs diagnostic surfaces for production deployments");
+
 static struct tbv_state tbv_driver_state;
+
+bool tbv_debug_surfaces_enabled(void)
+{
+	if (!IS_ENABLED(CONFIG_THUNDERBOLT_IBVERBS_DEBUG_SURFACES))
+		return false;
+
+	return !production_mode;
+}
 
 static int tbv_parse_peer_allowlist(struct tbv_state *state, const char *allowlist)
 {
