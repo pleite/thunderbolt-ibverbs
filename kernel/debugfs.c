@@ -498,7 +498,7 @@ DEFINE_SHOW_ATTRIBUTE(tbv_debugfs_configured_links);
 int tbv_debugfs_init(struct tbv_state *state)
 {
 	if (!tbv_debug_surfaces_enabled()) {
-		pr_info("debugfs surfaces disabled\n");
+		pr_info_once("debugfs surfaces disabled\n");
 		return 0;
 	}
 

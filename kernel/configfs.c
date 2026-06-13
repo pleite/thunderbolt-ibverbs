@@ -590,7 +590,7 @@ int tbv_configfs_start(struct tbv_state *state)
 	int ret;
 
 	if (!tbv_debug_surfaces_enabled()) {
-		pr_info("configfs surfaces disabled\n");
+		pr_info_once("configfs surfaces disabled\n");
 		return 0;
 	}
 
