@@ -124,7 +124,7 @@ MODULE_PARM_DESC(peer_allowlist,
 		 "Optional comma-separated remote host UUID allow-list (for example 00112233-4455-6677-8899-aabbccddeeff)");
 
 static bool production_mode;
-module_param(production_mode, bool, 0400);
+module_param(production_mode, bool, 0444);
 MODULE_PARM_DESC(production_mode,
 		 "Disable debugfs/configfs diagnostic surfaces for production deployments");
 

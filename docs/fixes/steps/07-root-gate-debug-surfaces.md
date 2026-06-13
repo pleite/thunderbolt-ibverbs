@@ -20,8 +20,8 @@ broadly accessible — useful information for an attacker.
 - debugfs entries are now root-readable only (`0400`) and the summary output no
   longer emits proxy-IP or identity netdev names.
 - configfs link attributes are now root-only (`0600`/`0400`).
-- `production_mode=1` (read-only module param) disables both surfaces at
-  runtime when set at module load.
+- `production_mode=1` disables both surfaces at runtime when set at module
+  load.
 - `tbv_debug_surfaces=0` (or
   `CONFIG_THUNDERBOLT_IBVERBS_DEBUG_SURFACES=n` for Kconfig builds) compiles
   both surfaces out.
