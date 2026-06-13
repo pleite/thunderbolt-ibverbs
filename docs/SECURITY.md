@@ -6,10 +6,12 @@ as potentially malicious unless explicitly trusted.
 ## Trust boundary
 
 - **Trusted local kernel + local userspace process owning the PD/MRs**
-- **Untrusted remote host on the cable**
+- **Remote host remains untrusted until it proves possession of its configured
+  `peer_auth_acl` PSK**
 
 The remote side can send transport frames, replay stale frames, and try random
-RKEY/LKEY values. It must not gain arbitrary host-memory read/write.
+RKEY/LKEY values. It must not gain arbitrary host-memory read/write. A Thunderbolt
+service match and cable presence alone are not a trust signal.
 
 ## Threats considered
 
@@ -46,10 +48,24 @@ RKEY/LKEY values. It must not gain arbitrary host-memory read/write.
 - If allow-listing is enabled but the peer UUID is unavailable, admission fails
   closed.
 
+### 4) Required native peer authentication / ACL
+
+- New module parameter:
+  `peer_auth_acl=<uuid=32hexpsk[,uuid=32hexpsk...]>`
+- Native Linux peers are admitted only when their Thunderbolt `remote_uuid`
+  appears in `peer_auth_acl`; the configured PSK is both the ACL entry and the
+  authenticator for the control-plane handshake.
+- The native HELLO/READY exchange derives a per-peer authenticated session from
+  fresh nonces and the peer PSK before a rail becomes data-ready.
+- Native QPs snapshot the authenticated session ID at create time; RX endpoint
+  validation rejects packets once the peer loses authentication or the session
+  changes, so stale QPNs cannot be reused across sessions.
+
 ## Tests added for high-risk paths
 
 - KUnit tests for:
   - RDMA write header validation edge cases.
   - MR peer-scope matching behavior.
+  - Native QP/session binding behavior.
 
 These tests live in `kernel/ibdev.c` under `CONFIG_KUNIT`.

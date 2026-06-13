@@ -14,6 +14,7 @@
 #include <linux/notifier.h>
 #include <linux/refcount.h>
 #include <linux/sizes.h>
+#include <linux/siphash.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/uuid.h>
@@ -32,6 +33,7 @@
 #define TBV_NATIVE_PROTOCOL_KEY "tbverbs"
 #define TBV_NATIVE_MAX_LANES 4
 #define TBV_PEER_ALLOWLIST_MAX 32
+#define TBV_PEER_AUTH_PSK_LEN 16
 #define TBV_DATA_PDF_FRAME_START 1
 #define TBV_DATA_PDF_FRAME_END 3
 #define TBV_NATIVE_PRTCID 1
@@ -311,9 +313,25 @@ struct tbv_peer {
 	struct ida rail_ids;
 	/* Serializes XDomain control and tunnel setup transactions per link. */
 	struct mutex control_lock;
+	u64 auth_local_nonce;
+	u64 auth_remote_nonce;
+	u64 auth_session_id;
+	u64 auth_established_session_id;
+	u32 auth_acl_index;
+	bool auth_acl_configured;
+	bool auth_local_nonce_valid;
+	bool auth_challenge_valid;
+	bool auth_ack_verified;
+	bool auth_authenticated;
 	u32 native_qp_rr_rail_id;
 	u32 nr_rails;
 };
+
+static inline bool tbv_peer_session_authenticated(const struct tbv_peer *peer)
+{
+	return peer && peer->auth_acl_configured &&
+	       READ_ONCE(peer->auth_established_session_id);
+}
 
 static inline bool tbv_rail_data_ready(const struct tbv_rail *rail)
 {
@@ -321,7 +339,8 @@ static inline bool tbv_rail_data_ready(const struct tbv_rail *rail)
 		return false;
 	if (!rail->peer || rail->peer->backend != TBV_BACKEND_NATIVE)
 		return true;
-	return rail->native_ready_sent && rail->native_remote_ready;
+	return rail->native_ready_sent && rail->native_remote_ready &&
+	       tbv_peer_session_authenticated(rail->peer);
 }
 
 static inline bool tbv_rail_apple_data_ready(const struct tbv_rail *rail)
@@ -449,7 +468,10 @@ struct tbv_state {
 	u32 next_peer_id;
 	u32 configured_link_count;
 	u32 peer_allowlist_count;
+	u32 peer_auth_acl_count;
 	uuid_t peer_allowlist[TBV_PEER_ALLOWLIST_MAX];
+	uuid_t peer_auth_acl_uuid[TBV_PEER_ALLOWLIST_MAX];
+	siphash_key_t peer_auth_acl_psk[TBV_PEER_ALLOWLIST_MAX];
 	struct tbv_tbnet_identity tbnet_identity;
 	struct tb_property_dir *native_dirs[TBV_NATIVE_MAX_LANES];
 	u32 native_dir_count;
@@ -467,6 +489,7 @@ struct tbv_state {
 	bool verbs_registered;
 	bool native_control_registered;
 	bool peer_allowlist_enabled;
+	bool peer_auth_acl_enabled;
 	bool native_control_source_aware;
 	bool native_legacy_multicable_warned;
 	bool apple_rails_wait_tbnet;
@@ -685,6 +708,7 @@ const char *tbv_ibdev_roce_netdev_name(void);
  */
 int tbv_ibdev_rail_event(struct tbv_state *state, struct tbv_rail *rail,
 			 bool joined);
+void tbv_ibdev_flush_rail_qps(struct tbv_state *state, struct tbv_rail *rail);
 void tbv_ibdev_rx_frame(struct tbv_state *state, struct tbv_path *rx_path,
 			const void *data, u32 len);
 void tbv_ibdev_rx_native_frame(struct tbv_state *state,
@@ -758,6 +782,10 @@ void tbv_rail_key_init(struct tbv_rail_key *key, u64 route,
 int tbv_rail_key_cmp(const struct tbv_rail_key *a,
 		     const struct tbv_rail_key *b);
 u32 tbv_rail_key_hash(const struct tbv_rail_key *key);
+int tbv_peer_auth_acl_index(const struct tbv_state *state,
+			    const struct tb_xdomain *xd);
+bool tbv_peer_auth_is_initiator(const struct tbv_peer *peer);
+void tbv_peer_auth_reset(struct tbv_peer *peer);
 struct tbv_peer *tbv_peer_get_or_create(struct tbv_state *state,
 					enum tbv_backend_type backend,
 					struct tb_xdomain *xd);
