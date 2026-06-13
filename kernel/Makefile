@@ -5,11 +5,27 @@
 KVER ?= $(shell uname -r)
 KDIR ?= /lib/modules/$(KVER)/build
 PWD := $(shell pwd)
+tbv_debug_surfaces ?= 1
 
 obj-m := thunderbolt_ibverbs.o
 thunderbolt_ibverbs-y := main.o profile.o backend.o configfs.o core.o debugfs.o ibdev.o ibdev_native.o ibdev_apple.o ibdev_cq.o ibdev_mr.o ibdev_qp.o link.o native.o apple.o trace.o native_control.o native_control_legacy.o native_control_xdomain.o path.o peer.o rail.o service.o tbnet_identity.o tbnet_minimal.o tbv_compat.o ../proto/config.o ../proto/identity.o ../proto/reliability.o
 
-ccflags-y := -Wall -Wextra -Wno-unused-parameter -I$(src) -I$(src)/..
+ccflags-y := -Wall -Wextra -Wno-unused-parameter -I$(src) -I$(src)/.. -DTBV_DEBUG_SURFACES_COMPILED=$(tbv_debug_surfaces)
+
+# Feature detection: ib_dmah parameter added to reg_user_mr in Linux 6.13.
+# On Debian/Ubuntu the rdma headers live in a *-common sibling of KDIR
+# (e.g. linux-headers-7.0.12+deb14.1-common) rather than in the arch-specific
+# tree that KDIR points to.  Probe both locations so detection works on
+# monolithic and split-header distros alike.
+_tbv_kdir_real   := $(realpath $(KDIR))
+_tbv_kdir_common := $(firstword $(wildcard $(dir $(_tbv_kdir_real))*-common))
+_tbv_ib_verbs_h  := $(firstword $(wildcard \
+    $(KDIR)/include/rdma/ib_verbs.h \
+    $(_tbv_kdir_common)/include/rdma/ib_verbs.h))
+ifneq ($(shell test -n "$(_tbv_ib_verbs_h)" && \
+    grep -q 'struct ib_dmah' "$(_tbv_ib_verbs_h)" 2>/dev/null && echo yes),)
+    ccflags-y += -DTBV_KERNEL_HAS_IB_DMAH
+endif
 
 .PHONY: all clean modules modules_install help
 
@@ -41,6 +57,7 @@ help:
 	@echo "  tbnet_identity_minimal_e2e=0|1"
 	@echo "  tbnet_identity_minimal_apple_only=0|1"
 	@echo "  bind_services=0|1"
+	@echo "  tbv_debug_surfaces=0|1"
 	@echo "  allocate_rings=0|1"
 	@echo "  start_rings=0|1"
 	@echo "  negotiate_native=0|1"
@@ -48,6 +65,8 @@ help:
 	@echo "  register_verbs=0|1"
 	@echo "  native_prtcstns=<u32>"
 	@echo "  apple_prtcstns=<u32>"
+	@echo "  peer_allowlist=<uuid[,uuid...]>"
+	@echo "  peer_auth_acl=<uuid=32hexpsk[,uuid=32hexpsk...]>"
 	@echo "  apple_tx_max_inflight_wr=<N>"
 	@echo "  apple_tx_max_inflight_frames=<N>"
 	@echo "  apple_rx_pending_bytes=<bytes>"

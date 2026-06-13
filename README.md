@@ -105,9 +105,13 @@ the configured thresholds versus baseline.
 
 ## Documentation
 
+- [Security policy](SECURITY.md) — vulnerability reporting and threat model summary
+- [Contributing guide](CONTRIBUTING.md) — contributor workflow and expectations
+- [Wire protocol spec](proto/WIRE_PROTOCOL.md) — native control/data frame contracts
+- [Module parameter reference](docs/MODULE_PARAMETERS.md) — full `thunderbolt_ibverbs` parameter catalog
 - [Architecture overview](docs/ARCHITECTURE.md) — kernel module ↔ provider ↔ verbs layer diagram and data path description
 - [Troubleshooting guide](docs/TROUBLESHOOTING.md) — symptom-by-symptom checklist
-- [Contributing guide](docs/CONTRIBUTING.md) — build instructions, code style, and PR process
+- [Detailed contributor notes](docs/CONTRIBUTING.md) — build instructions, code style, and PR process
 
 ## Status
 
@@ -126,6 +130,16 @@ the configured thresholds versus baseline.
 - The Nix flake builds a Thunderbolt testing kernel from the maintainer
   `next` branch with the local kernel patches applied.
 - Debian, Fedora, Arch, and Nix builds are exercised in CI.
+
+For the big-picture plan of where the project is headed — and the issue /
+feature / PR workflow for each step — see [docs/ROADMAP.md](docs/ROADMAP.md).
+All eight roadmap steps have shipped; their automation is archived under
+[scripts/archive/roadmap/](scripts/archive/roadmap/).
+
+The driver performance/security analysis findings, and the prioritized fixes
+they drive, are tracked in [docs/FINDINGS.md](docs/FINDINGS.md). Automation that
+files an issue + branch + draft PR per open finding lives in
+[scripts/fixes/](scripts/fixes/).
 
 ## License
 

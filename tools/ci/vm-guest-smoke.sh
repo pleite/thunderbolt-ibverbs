@@ -91,7 +91,8 @@ build_module() {
 	[[ -d "/lib/modules/$kver/build" ]] ||
 		die "kernel headers missing: /lib/modules/$kver/build"
 
-	make -C "$src_dir" KVER="$kver" KDIR="/lib/modules/$kver/build" modules
+	make -C "$src_dir" KVER="$kver" KDIR="/lib/modules/$kver/build" \
+		KCFLAGS="-Werror" modules
 	install -D -m 0644 "$src_dir/kernel/thunderbolt_ibverbs.ko" \
 		"/lib/modules/$kver/extra/thunderbolt_ibverbs.ko"
 	depmod -a "$kver"

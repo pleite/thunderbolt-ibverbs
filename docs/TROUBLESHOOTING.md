@@ -130,6 +130,27 @@ otherwise valid.  Leave `peer_allowlist` unset (empty) to accept all peers.
 
 ---
 
+## Symptom: native peer authentication rejects an expected peer
+
+Native Linux peers now require a `peer_auth_acl` entry in the form
+`<uuid>=<32 hex chars>`, where the UUID is the remote Thunderbolt host UUID and
+the hex value is the 16-byte PSK shared by both hosts.
+
+```sh
+sudo modprobe thunderbolt_ibverbs \
+  profile=linux_perf \
+  bind_services=1 allocate_rings=1 start_rings=1 \
+  negotiate_native=1 enable_tunnels=1 register_verbs=1 \
+  peer_auth_acl=<uuid1>=00112233445566778899aabbccddeeff
+```
+
+If `peer_auth_acl` is empty or the remote UUID is missing from it, native peers
+are rejected before a usable RDMA session is published.  If both sides list the
+UUID but use different PSKs, the native HELLO/READY handshake never reaches the
+data-ready edge.
+
+---
+
 ## Symptom: high latency or low bandwidth compared to benchmarks
 
 **Check interrupt throttle.**  On kernels that export `tb_ring_throttling()`,

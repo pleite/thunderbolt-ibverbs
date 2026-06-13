@@ -12,21 +12,21 @@ typedef u32 tbv_wire_u32;
 typedef u64 tbv_wire_u64;
 #else
 #include <errno.h>
+#include <linux/types.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include <stdint.h>
 #include <string.h>
-typedef uint8_t tbv_wire_u8;
-typedef uint16_t tbv_wire_u16;
-typedef uint32_t tbv_wire_u32;
-typedef uint64_t tbv_wire_u64;
+typedef __u8 tbv_wire_u8;
+typedef __u16 tbv_wire_u16;
+typedef __u32 tbv_wire_u32;
+typedef __u64 tbv_wire_u64;
 #endif
 
 #define TBV_NATIVE_WIRE_MAGIC		0x31564254u /* "TBV1" little-endian */
 #define TBV_NATIVE_WIRE_VERSION		1u
 #define TBV_NATIVE_WIRE_XDOMAIN_HDR_SIZE 32u
 #define TBV_NATIVE_WIRE_HDR_SIZE	16u
-#define TBV_NATIVE_WIRE_HELLO_SIZE	40u
+#define TBV_NATIVE_WIRE_HELLO_SIZE	68u
 #define TBV_NATIVE_WIRE_HELLO_MSG_SIZE \
 	(TBV_NATIVE_WIRE_XDOMAIN_HDR_SIZE + TBV_NATIVE_WIRE_HDR_SIZE + \
 	 TBV_NATIVE_WIRE_HELLO_SIZE)
@@ -72,6 +72,10 @@ struct tbv_native_wire_hello {
 	tbv_wire_u32 tx_ring_size;
 	tbv_wire_u32 rx_ring_size;
 	tbv_wire_u32 path_flags;
+	tbv_wire_u32 auth_flags;
+	tbv_wire_u64 nonce;
+	tbv_wire_u64 session_id;
+	tbv_wire_u64 auth_tag;
 };
 
 static inline void tbv_wire_put_le16(tbv_wire_u8 *p, tbv_wire_u16 value)
@@ -128,10 +132,10 @@ static inline void tbv_native_wire_put_header(tbv_wire_u8 *p,
 }
 
 static inline void tbv_native_wire_put_xdomain_header(tbv_wire_u8 *p,
-						     tbv_wire_u64 route,
-						     tbv_wire_u8 sequence,
-						     tbv_wire_u32 type,
-						     tbv_wire_u16 size)
+						      tbv_wire_u64 route,
+						      tbv_wire_u8 sequence,
+						      tbv_wire_u32 type,
+						      tbv_wire_u16 size)
 {
 	tbv_wire_u32 length_sn = (size - 12u) / 4u;
 
@@ -182,6 +186,10 @@ tbv_native_wire_build_hello(void *buf, size_t size,
 	tbv_wire_put_le32(p + 28, hello->tx_ring_size);
 	tbv_wire_put_le32(p + 32, hello->rx_ring_size);
 	tbv_wire_put_le32(p + 36, hello->path_flags);
+	tbv_wire_put_le32(p + 40, hello->auth_flags);
+	tbv_wire_put_le64(p + 44, hello->nonce);
+	tbv_wire_put_le64(p + 52, hello->session_id);
+	tbv_wire_put_le64(p + 60, hello->auth_tag);
 
 	return TBV_NATIVE_WIRE_HELLO_MSG_SIZE;
 }
@@ -260,6 +268,10 @@ tbv_native_wire_parse_hello(const void *buf, size_t size,
 	hello->tx_ring_size = tbv_wire_get_le32(p + 28);
 	hello->rx_ring_size = tbv_wire_get_le32(p + 32);
 	hello->path_flags = tbv_wire_get_le32(p + 36);
+	hello->auth_flags = tbv_wire_get_le32(p + 40);
+	hello->nonce = tbv_wire_get_le64(p + 44);
+	hello->session_id = tbv_wire_get_le64(p + 52);
+	hello->auth_tag = tbv_wire_get_le64(p + 60);
 
 	return 0;
 }
