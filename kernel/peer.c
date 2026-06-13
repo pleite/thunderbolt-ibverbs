@@ -6,6 +6,7 @@
 #include <linux/moduleparam.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/thunderbolt.h>
 
 #include "tbv.h"
@@ -42,11 +43,61 @@ static bool tbv_native_e2e_enabled(const struct tbv_peer *peer)
 	return tbv_native_e2e_auto_enabled(peer);
 }
 
+int tbv_peer_auth_acl_index(const struct tbv_state *state,
+			    const struct tb_xdomain *xd)
+{
+	u32 i;
+
+	if (!state || !state->peer_auth_acl_enabled || !xd || !xd->remote_uuid)
+		return -ENOENT;
+
+	for (i = 0; i < state->peer_auth_acl_count; i++) {
+		if (uuid_equal(xd->remote_uuid, &state->peer_auth_acl_uuid[i]))
+			return (int)i;
+	}
+
+	return -ENOENT;
+}
+
+bool tbv_peer_auth_is_initiator(const struct tbv_peer *peer)
+{
+	if (!peer || !peer->xd || !peer->xd->local_uuid || !peer->xd->remote_uuid)
+		return false;
+
+	return memcmp(peer->xd->local_uuid, peer->xd->remote_uuid,
+		      sizeof(*peer->xd->local_uuid)) < 0;
+}
+
+void tbv_peer_auth_reset(struct tbv_peer *peer)
+{
+	if (!peer)
+		return;
+
+	peer->auth_local_nonce = 0;
+	peer->auth_remote_nonce = 0;
+	peer->auth_session_id = 0;
+	peer->auth_challenge_valid = false;
+	peer->auth_ack_verified = false;
+	peer->auth_authenticated = false;
+}
+
 static bool tbv_peer_matches(const struct tbv_peer *peer,
 			     enum tbv_backend_type backend,
 			     const struct tb_xdomain *xd)
 {
-	return peer->backend == backend && peer->xd == xd;
+	int acl_index;
+
+	if (peer->backend != backend || peer->xd != xd)
+		return false;
+	if (backend != TBV_BACKEND_NATIVE)
+		return true;
+
+	acl_index = tbv_peer_auth_acl_index(peer->state, xd);
+	if (acl_index < 0)
+		return !peer->auth_acl_configured;
+
+	return peer->auth_acl_configured &&
+	       peer->auth_acl_index == (u32)acl_index;
 }
 
 static bool tbv_peer_is_allowlisted(const struct tbv_state *state,
@@ -141,6 +192,7 @@ struct tbv_peer *tbv_peer_get_or_create(struct tbv_state *state,
 {
 	struct tbv_peer *peer;
 	struct tbv_peer *pos;
+	int auth_acl_index = -ENOENT;
 	u32 existing_peer_id = 0;
 
 	if (!tbv_backend_get(backend))
@@ -168,6 +220,24 @@ struct tbv_peer *tbv_peer_get_or_create(struct tbv_state *state,
 		tb_xdomain_put(peer->xd);
 		kfree(peer);
 		return ERR_PTR(-EACCES);
+	}
+	if (backend == TBV_BACKEND_NATIVE) {
+		auth_acl_index = tbv_peer_auth_acl_index(state, xd);
+		if (auth_acl_index < 0) {
+			pr_warn_ratelimited("peer rejected by auth ACL backend=%s route=0x%llx link=%u depth=%u remote_uuid=%pUb\n",
+					    tbv_backend_name(backend),
+					    xd ? (unsigned long long)xd->route : 0ULL,
+					    xd ? xd->link : 0,
+					    xd ? xd->depth : 0,
+					    xd ? xd->remote_uuid : NULL);
+			mutex_unlock(&state->lock);
+			tb_xdomain_put(peer->xd);
+			kfree(peer);
+			return ERR_PTR(-EACCES);
+		}
+		peer->auth_acl_configured = true;
+		peer->auth_acl_index = auth_acl_index;
+		tbv_peer_auth_reset(peer);
 	}
 
 	list_for_each_entry(pos, &state->peers, node) {

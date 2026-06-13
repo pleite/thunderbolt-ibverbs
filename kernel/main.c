@@ -11,6 +11,7 @@
 #define pr_fmt(fmt) "thunderbolt_ibverbs: " fmt
 
 #include <linux/init.h>
+#include <linux/hex.h>
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -123,6 +124,11 @@ module_param(peer_allowlist, charp, 0444);
 MODULE_PARM_DESC(peer_allowlist,
 		 "Optional comma-separated remote host UUID allow-list (for example 00112233-4455-6677-8899-aabbccddeeff)");
 
+static char *peer_auth_acl;
+module_param(peer_auth_acl, charp, 0444);
+MODULE_PARM_DESC(peer_auth_acl,
+		 "Required native peer auth ACL as comma-separated uuid=32hexpsk entries");
+
 static struct tbv_state tbv_driver_state;
 
 static int tbv_parse_peer_allowlist(struct tbv_state *state, const char *allowlist)
@@ -173,6 +179,83 @@ static int tbv_parse_peer_allowlist(struct tbv_state *state, const char *allowli
 
 	kfree(dup);
 	state->peer_allowlist_enabled = state->peer_allowlist_count > 0;
+	return 0;
+}
+
+static int tbv_parse_peer_auth_acl(struct tbv_state *state, const char *acl)
+{
+	char *dup;
+	char *cursor;
+	char *token;
+
+	state->peer_auth_acl_enabled = false;
+	state->peer_auth_acl_count = 0;
+	if (!acl || !*acl)
+		return 0;
+
+	dup = kstrdup(acl, GFP_KERNEL);
+	if (!dup)
+		return -ENOMEM;
+
+	cursor = dup;
+	while ((token = strsep(&cursor, ",")) != NULL) {
+		siphash_key_t key;
+		char *hex;
+		uuid_t parsed;
+		u32 i;
+		bool duplicate = false;
+
+		strim(token);
+		if (!*token)
+			continue;
+
+		hex = strchr(token, '=');
+		if (!hex) {
+			pr_err("peer_auth_acl entries must use uuid=32hexpsk\n");
+			kfree(dup);
+			return -EINVAL;
+		}
+
+		*hex++ = '\0';
+		strim(token);
+		strim(hex);
+		if (!*token || !*hex || strlen(hex) != TBV_PEER_AUTH_PSK_LEN * 2) {
+			pr_err("peer_auth_acl entries must use uuid=32hexpsk\n");
+			kfree(dup);
+			return -EINVAL;
+		}
+		if (uuid_parse(token, &parsed)) {
+			pr_err("peer_auth_acl contains an invalid UUID entry\n");
+			kfree(dup);
+			return -EINVAL;
+		}
+		if (hex2bin((u8 *)&key, hex, sizeof(key))) {
+			pr_err("peer_auth_acl contains an invalid PSK entry\n");
+			kfree(dup);
+			return -EINVAL;
+		}
+
+		for (i = 0; i < state->peer_auth_acl_count; i++) {
+			if (uuid_equal(&state->peer_auth_acl_uuid[i], &parsed)) {
+				duplicate = true;
+				break;
+			}
+		}
+		if (duplicate)
+			continue;
+		if (state->peer_auth_acl_count >= TBV_PEER_ALLOWLIST_MAX) {
+			pr_err("peer_auth_acl supports at most %u peers\n",
+			       TBV_PEER_ALLOWLIST_MAX);
+			kfree(dup);
+			return -E2BIG;
+		}
+
+		state->peer_auth_acl_uuid[state->peer_auth_acl_count] = parsed;
+		state->peer_auth_acl_psk[state->peer_auth_acl_count++] = key;
+	}
+
+	kfree(dup);
+	state->peer_auth_acl_enabled = state->peer_auth_acl_count > 0;
 	return 0;
 }
 
@@ -249,6 +332,13 @@ static int __init tbv_init(void)
 		tbv_core_exit(&tbv_driver_state);
 		goto err_path_symbols;
 	}
+	ret = tbv_parse_peer_auth_acl(&tbv_driver_state, peer_auth_acl);
+	if (ret) {
+		tbv_core_exit(&tbv_driver_state);
+		goto err_path_symbols;
+	}
+	if (resolved.native_enabled && !tbv_driver_state.peer_auth_acl_enabled)
+		pr_warn("native peer authentication requires peer_auth_acl entries; unlisted peers will be rejected\n");
 
 	service_cfg.native_prtcstns = native_prtcstns;
 	service_cfg.apple_prtcstns = apple_prtcstns;
@@ -280,7 +370,7 @@ static int __init tbv_init(void)
 		snprintf(lanes_desc, sizeof(lanes_desc), "%u-%u",
 			 cfg.lanes_min, cfg.lanes_max);
 
-	pr_info("loaded compat=%s profile=%s resolved_profile=%s tbnet=%s tbnet_identity=%s tbnet_identity_minimal_e2e=%u tbnet_identity_minimal_apple_only=%u lanes=%s native_control=%s native_data=%u apple_data=%u native_fragment_striping=%u peer_allowlist=%u\n",
+	pr_info("loaded compat=%s profile=%s resolved_profile=%s tbnet=%s tbnet_identity=%s tbnet_identity_minimal_e2e=%u tbnet_identity_minimal_apple_only=%u lanes=%s native_control=%s native_data=%u apple_data=%u native_fragment_striping=%u peer_allowlist=%u peer_auth_acl=%u\n",
 		tbv_compat_name(cfg.compat),
 		tbv_profile_name(cfg.profile),
 		tbv_profile_name(resolved.profile),
@@ -293,7 +383,8 @@ static int __init tbv_init(void)
 		native_data,
 		apple_data,
 		native_fragment_striping,
-		tbv_driver_state.peer_allowlist_count);
+		tbv_driver_state.peer_allowlist_count,
+		tbv_driver_state.peer_auth_acl_count);
 
 	return 0;
 
