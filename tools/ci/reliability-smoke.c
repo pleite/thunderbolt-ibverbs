@@ -237,7 +237,7 @@ static int test_wrap_safe_sequence_helpers(void)
 
 static int test_retry_interval_uses_retry_budget(void)
 {
-	tbv_rel_u64 previous = 0;
+	tbv_rel_u64 previous_interval = 0;
 	tbv_rel_u32 retry;
 
 	CHECK(tbv_rel_retry_interval(0, 0) == 0);
@@ -250,8 +250,8 @@ static int test_retry_interval_uses_retry_budget(void)
 		CHECK(interval >= min);
 		CHECK(interval <= max);
 		if (retry)
-			CHECK(interval > previous);
-		previous = interval;
+			CHECK(interval > previous_interval);
+		previous_interval = interval;
 	}
 
 	return 0;

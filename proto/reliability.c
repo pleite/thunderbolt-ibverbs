@@ -217,51 +217,51 @@ int tbv_rel_tx_on_ack(struct tbv_rel_tx_op *tx,
 #define TBV_REL_RETRY_BACKOFF_SHIFT_MAX 20u
 #define TBV_REL_JITTER_PCT_BASE 875u
 #define TBV_REL_JITTER_PCT_SPAN 251u
-#define TBV_REL_RETRY_HASH_GOLDEN_RATIO 2654435761u
+#define TBV_REL_RETRY_HASH_MULTIPLIER 2654435761u
 
 tbv_rel_u64 tbv_rel_retry_interval(tbv_rel_u64 ack_timeout,
 				   tbv_rel_u32 retry_budget)
 {
-	tbv_rel_u32 shift = retry_budget;
+	tbv_rel_u32 backoff_shift = retry_budget;
 	tbv_rel_u64 backoff = ack_timeout;
 	tbv_rel_u64 jittered;
-	tbv_rel_u32 jitter_pct;
+	tbv_rel_u32 jitter_permille;
 
 	if (!ack_timeout)
 		return 0;
 
 	/* Cap exponential growth at 2^20 * base to avoid overflow. */
-	if (shift > TBV_REL_RETRY_BACKOFF_SHIFT_MAX)
-		shift = TBV_REL_RETRY_BACKOFF_SHIFT_MAX;
-	if (shift) {
-		if (backoff > (~0ull >> shift))
+	if (backoff_shift > TBV_REL_RETRY_BACKOFF_SHIFT_MAX)
+		backoff_shift = TBV_REL_RETRY_BACKOFF_SHIFT_MAX;
+	if (backoff_shift) {
+		if (backoff > (~0ull >> backoff_shift))
 			backoff = ~0ull;
 		else
-			backoff <<= shift;
+			backoff <<= backoff_shift;
 	}
 
 #ifdef __KERNEL__
 	/* Jitter in [87.5%, 112.5%] keeps retries from synchronizing. */
-	jitter_pct = TBV_REL_JITTER_PCT_BASE +
-		     (get_random_u32() % TBV_REL_JITTER_PCT_SPAN);
+	jitter_permille = TBV_REL_JITTER_PCT_BASE +
+			  get_random_u32_below(TBV_REL_JITTER_PCT_SPAN);
 #else
 	{
-		tbv_rel_u32 x = (tbv_rel_u32)ack_timeout ^
-				(retry_budget *
-				 TBV_REL_RETRY_HASH_GOLDEN_RATIO);
+		tbv_rel_u32 hash = (tbv_rel_u32)ack_timeout ^
+				   (retry_budget *
+				    TBV_REL_RETRY_HASH_MULTIPLIER);
 
 		/* Use a deterministic hash in userspace tests. */
-		x ^= x >> 16;
-		x *= 2246822519u;
-		x ^= x >> 13;
-		jitter_pct = TBV_REL_JITTER_PCT_BASE +
-			     (x % TBV_REL_JITTER_PCT_SPAN);
+		hash ^= hash >> 16;
+		hash *= 2246822519u;
+		hash ^= hash >> 13;
+		jitter_permille = TBV_REL_JITTER_PCT_BASE +
+				  (hash % TBV_REL_JITTER_PCT_SPAN);
 	}
 #endif
-	if (backoff > (~0ull / jitter_pct))
+	if (backoff > (~0ull / jitter_permille))
 		jittered = ~0ull;
 	else
-		jittered = backoff * jitter_pct;
+		jittered = backoff * jitter_permille;
 
 	return jittered / 1000u;
 }
