@@ -12,14 +12,14 @@ typedef u32 tbv_wire_u32;
 typedef u64 tbv_wire_u64;
 #else
 #include <errno.h>
+#include <linux/types.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include <stdint.h>
 #include <string.h>
-typedef uint8_t tbv_wire_u8;
-typedef uint16_t tbv_wire_u16;
-typedef uint32_t tbv_wire_u32;
-typedef uint64_t tbv_wire_u64;
+typedef __u8 tbv_wire_u8;
+typedef __u16 tbv_wire_u16;
+typedef __u32 tbv_wire_u32;
+typedef __u64 tbv_wire_u64;
 #endif
 
 #define TBV_NATIVE_WIRE_MAGIC		0x31564254u /* "TBV1" little-endian */
@@ -132,10 +132,10 @@ static inline void tbv_native_wire_put_header(tbv_wire_u8 *p,
 }
 
 static inline void tbv_native_wire_put_xdomain_header(tbv_wire_u8 *p,
-						     tbv_wire_u64 route,
-						     tbv_wire_u8 sequence,
-						     tbv_wire_u32 type,
-						     tbv_wire_u16 size)
+						      tbv_wire_u64 route,
+						      tbv_wire_u8 sequence,
+						      tbv_wire_u32 type,
+						      tbv_wire_u16 size)
 {
 	tbv_wire_u32 length_sn = (size - 12u) / 4u;
 
