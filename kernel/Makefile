@@ -8,7 +8,7 @@ PWD := $(shell pwd)
 tbv_debug_surfaces ?= 1
 
 obj-m := thunderbolt_ibverbs.o
-thunderbolt_ibverbs-y := main.o profile.o backend.o configfs.o core.o debugfs.o ibdev.o link.o native.o apple.o trace.o native_control.o native_control_legacy.o native_control_xdomain.o path.o peer.o rail.o service.o tbnet_identity.o tbnet_minimal.o tbv_compat.o ../proto/config.o ../proto/identity.o ../proto/reliability.o
+thunderbolt_ibverbs-y := main.o profile.o backend.o configfs.o core.o debugfs.o ibdev.o ibdev_native.o ibdev_apple.o ibdev_cq.o ibdev_mr.o ibdev_qp.o link.o native.o apple.o trace.o native_control.o native_control_legacy.o native_control_xdomain.o path.o peer.o rail.o service.o tbnet_identity.o tbnet_minimal.o tbv_compat.o ../proto/config.o ../proto/identity.o ../proto/reliability.o
 
 ccflags-y := -Wall -Wextra -Wno-unused-parameter -I$(src) -I$(src)/.. -DTBV_DEBUG_SURFACES_COMPILED=$(tbv_debug_surfaces)
 
