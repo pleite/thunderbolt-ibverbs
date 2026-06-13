@@ -46,6 +46,11 @@ static bool tbv_peer_matches(const struct tbv_peer *peer,
 			     enum tbv_backend_type backend,
 			     const struct tb_xdomain *xd)
 {
+	/*
+	 * FINDINGS.md S2 (open): peer trust here is purely Thunderbolt topology
+	 * (backend + xdomain). There is no cryptographic peer authentication;
+	 * see scripts/fixes/04-peer-authentication.sh.
+	 */
 	return peer->backend == backend && peer->xd == xd;
 }
 

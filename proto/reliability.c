@@ -216,6 +216,11 @@ int tbv_rel_tx_on_ack(struct tbv_rel_tx_op *tx,
 tbv_rel_u64 tbv_rel_retry_interval(tbv_rel_u64 ack_timeout,
 				   tbv_rel_u32 retry_budget)
 {
+	/*
+	 * FINDINGS.md R6 (open): the retry budget is ignored and the interval is
+	 * fixed (no exponential backoff or jitter), which invites synchronized
+	 * retry collapse; see scripts/fixes/12-reliability-backoff.sh.
+	 */
 	(void)retry_budget;
 
 	return ack_timeout;
