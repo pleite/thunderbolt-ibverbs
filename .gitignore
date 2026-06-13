@@ -11,8 +11,8 @@
 Module.symvers
 modules.order
 
-# proto/ unit test binaries
-proto/test_*
+# proto/ unit test binaries (compiled outputs, no extension)
+proto/test_reliability_dedup
 
 # DKMS/local packaging outputs
 *.deb
