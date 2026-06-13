@@ -47,6 +47,7 @@
 #define TBV_IBDEV_MAX_QP_WR 1024
 #define TBV_IBDEV_MAX_CQ 256
 #define TBV_IBDEV_MAX_CQE 4096
+#define TBV_IBDEV_MAX_MR 1024
 #define TBV_IBDEV_MAX_SGE 4
 #define TBV_IBDEV_MAX_READ_CTX 128
 #define TBV_IBDEV_QPN_MIN 0x900
@@ -135,7 +136,12 @@ static uint apple_rx_pending_total_bytes =
 	TBV_APPLE_PENDING_RX_TOTAL_BYTES_DEFAULT;
 module_param(apple_rx_pending_total_bytes, uint, 0644);
 MODULE_PARM_DESC(apple_rx_pending_total_bytes,
-		 "Maximum aggregate bytes buffered for early Apple UC receives per QP");
+		 "Maximum aggregate bytes buffered for early Apple UC receives per device");
+
+static uint peer_sendq_reserved_max = TBV_IBDEV_MAX_QP_WR;
+module_param(peer_sendq_reserved_max, uint, 0644);
+MODULE_PARM_DESC(peer_sendq_reserved_max,
+		 "Maximum in-flight SEND/READ work requests reserved per peer; 0 disables per-peer reservation");
 
 static uint apple_rx_trace;
 module_param(apple_rx_trace, uint, 0644);
@@ -835,11 +841,18 @@ static bool tbv_mr_matches_peer_id(const struct tbv_mr *mr, u32 peer_id)
 	return mr->peer_id == peer_id;
 }
 
-static u32 tbv_qp_peer_id(const struct tbv_qp *tqp)
+static struct tbv_peer *tbv_qp_peer(const struct tbv_qp *tqp)
 {
 	if (!tqp || !tqp->rail || !tqp->rail->peer)
-		return 0;
-	return tqp->rail->peer->peer_id;
+		return NULL;
+	return tqp->rail->peer;
+}
+
+static u32 tbv_qp_peer_id(const struct tbv_qp *tqp)
+{
+	struct tbv_peer *peer = tbv_qp_peer(tqp);
+
+	return peer ? peer->peer_id : 0;
 }
 
 static struct tbv_mr *tbv_mr_get(struct tbv_state *state, u32 key, u32 peer_id)
@@ -1309,19 +1322,32 @@ static void tbv_send_mark_queued(struct tbv_send_ctx *send,
 
 static int tbv_qp_reserve_sendq(struct tbv_qp *tqp)
 {
+	struct tbv_peer *peer = tbv_qp_peer(tqp);
 	unsigned long flags;
+	u32 peer_limit;
+	int peer_used = 0;
 	u32 max_wr;
 	int ret = 0;
 
 	spin_lock_irqsave(&tqp->lock, flags);
 	max_wr = tqp->init_attr.cap.max_send_wr;
+	peer_limit = READ_ONCE(peer_sendq_reserved_max);
 	if (tqp->closing || tqp->state == IB_QPS_RESET ||
 	    tqp->state == IB_QPS_ERR) {
 		ret = -EINVAL;
 	} else if (tqp->sendq_count >= max_wr) {
 		ret = -ENOMEM;
-	} else {
+	} else if (peer_limit && peer) {
+		peer_used = atomic_inc_return(&peer->tx_sendq_reserved);
+		if ((u32)peer_used > peer_limit)
+			ret = -EAGAIN;
+	}
+
+	if (!ret) {
 		tqp->sendq_count++;
+	} else {
+		if (peer_used > 0)
+			atomic_dec(&peer->tx_sendq_reserved);
 	}
 	spin_unlock_irqrestore(&tqp->lock, flags);
 	return ret;
@@ -1330,12 +1356,18 @@ static int tbv_qp_reserve_sendq(struct tbv_qp *tqp)
 static void tbv_qp_release_sendq_counted_locked(struct tbv_qp *tqp,
 						bool *counted)
 {
+	struct tbv_peer *peer = tbv_qp_peer(tqp);
+
 	if (!*counted)
 		return;
 	if (WARN_ON_ONCE(!tqp->sendq_count))
 		tqp->sendq_count = 0;
 	else
 		tqp->sendq_count--;
+	if (peer && WARN_ON_ONCE(!atomic_read(&peer->tx_sendq_reserved)))
+		atomic_set(&peer->tx_sendq_reserved, 0);
+	else if (peer)
+		atomic_dec(&peer->tx_sendq_reserved);
 	*counted = false;
 }
 
@@ -2238,7 +2270,7 @@ static int tbv_query_device(struct ib_device *ibdev,
 	attr->max_sge_rd = TBV_IBDEV_MAX_SGE;
 	attr->max_cq = TBV_IBDEV_MAX_CQ;
 	attr->max_cqe = TBV_IBDEV_MAX_CQE;
-	attr->max_mr = 1024;
+	attr->max_mr = TBV_IBDEV_MAX_MR;
 	attr->max_pd = 256;
 	attr->max_qp_rd_atom = apple ? 0 : TBV_IBDEV_MAX_READ_CTX;
 	attr->max_res_rd_atom = apple ? 0 :
@@ -2497,7 +2529,12 @@ static int tbv_create_cq(struct ib_cq *cq, const struct ib_cq_init_attr *attr,
 	spin_lock_init(&tcq->lock);
 	tcq->owner = tbv_ibdev_state(cq->device);
 	tcq->cqe = attr->cqe;
-	atomic_inc(&tcq->owner->verbs_cqs);
+	if ((u32)atomic_inc_return(&tcq->owner->verbs_cqs) > TBV_IBDEV_MAX_CQ) {
+		atomic_dec(&tcq->owner->verbs_cqs);
+		kfree(tcq->entries);
+		tcq->entries = NULL;
+		return -ENOSPC;
+	}
 	return 0;
 }
 
@@ -2519,6 +2556,8 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	struct tbv_ibdev *dev = tbv_to_ibdev(qp->device);
 	unsigned long flags;
 	bool gsi;
+	bool qp_counted = false;
+	u32 max_qp;
 	int qpn;
 	int ret;
 
@@ -2551,6 +2590,15 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 		ret = -EINVAL;
 		goto err_put_rail;
 	}
+	max_qp = U32_MAX;
+	if (!tbv_backend_is_apple(tqp->backend))
+		max_qp = TBV_IBDEV_MAX_QP + (state->cfg.apple_enabled ? 1 : 0);
+	if ((u32)atomic_inc_return(&state->verbs_qps) > max_qp) {
+		atomic_dec(&state->verbs_qps);
+		ret = -ENOSPC;
+		goto err_put_rail;
+	}
+	qp_counted = true;
 
 	if (gsi) {
 		qpn = TBV_GSI_QPN;
@@ -2649,10 +2697,11 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 		dev->gsi_qp = tqp;
 		mutex_unlock(&state->lock);
 	}
-	atomic_inc(&tqp->owner->verbs_qps);
 	return 0;
 
 err_put_rail:
+	if (qp_counted)
+		atomic_dec(&state->verbs_qps);
 	tbv_qp_unbind_rail(tqp);
 	return ret;
 }
@@ -5458,6 +5507,52 @@ static void tbv_apple_pending_reset(struct tbv_apple_pending_rx *p)
 	p->ready = false;
 }
 
+static bool tbv_apple_pending_reserve_total_bytes(struct tbv_state *state,
+						  u32 len, u32 limit)
+{
+	s64 old;
+	s64 new;
+
+	if (!limit)
+		return false;
+	if (!len)
+		return true;
+
+	do {
+		old = atomic64_read(&state->apple_rx_pending_bytes);
+		if (old < 0 || old > U32_MAX)
+			return false;
+		if (len > limit - (u32)old)
+			return false;
+		new = old + len;
+	} while (!atomic64_try_cmpxchg(&state->apple_rx_pending_bytes, &old,
+				       new));
+
+	return true;
+}
+
+static void tbv_apple_pending_release_total_bytes(struct tbv_state *state,
+						  u32 len)
+{
+	s64 old;
+	s64 new;
+
+	if (!state || !len)
+		return;
+
+	do {
+		old = atomic64_read(&state->apple_rx_pending_bytes);
+		if (old <= 0) {
+			atomic64_set(&state->apple_rx_pending_bytes, 0);
+			return;
+		}
+		new = old - len;
+		if (new < 0)
+			new = 0;
+	} while (!atomic64_try_cmpxchg(&state->apple_rx_pending_bytes, &old,
+				       new));
+}
+
 static void tbv_apple_pending_release(struct tbv_qp *tqp,
 				      struct tbv_apple_pending_rx *p)
 {
@@ -5466,6 +5561,7 @@ static void tbv_apple_pending_release(struct tbv_qp *tqp,
 			tqp->apple_pending_bytes -= p->delivered;
 		else
 			tqp->apple_pending_bytes = 0;
+		tbv_apple_pending_release_total_bytes(tqp->owner, p->delivered);
 	}
 	tbv_apple_pending_reset(p);
 }
@@ -5616,7 +5712,6 @@ static int tbv_apple_rx_copy_piece_to_buf(struct tbv_qp *tqp,
 	u32 max_bytes;
 	u32 required;
 	u32 total_limit;
-	u32 total_required;
 
 	if (!len)
 		return 0;
@@ -5629,9 +5724,7 @@ static int tbv_apple_rx_copy_piece_to_buf(struct tbv_qp *tqp,
 		return -EMSGSIZE;
 
 	total_limit = READ_ONCE(apple_rx_pending_total_bytes);
-	if (!total_limit ||
-	    check_add_overflow(tqp->apple_pending_bytes, len, &total_required) ||
-	    total_required > total_limit)
+	if (!tbv_apple_pending_reserve_total_bytes(tqp->owner, len, total_limit))
 		return -ENOSPC;
 
 	if (required > p->capacity) {
@@ -5652,8 +5745,10 @@ static int tbv_apple_rx_copy_piece_to_buf(struct tbv_qp *tqp,
 			return -EMSGSIZE;
 
 		buf = kvzalloc(new_capacity, GFP_KERNEL);
-		if (!buf)
+		if (!buf) {
+			tbv_apple_pending_release_total_bytes(tqp->owner, len);
 			return -ENOMEM;
+		}
 		if (p->buf && p->delivered)
 			memcpy(buf, p->buf, p->delivered);
 		kvfree(p->buf);
@@ -9215,7 +9310,13 @@ static int tbv_mr_publish(struct tbv_mr *mr, struct ib_pd *pd)
 	if (ret)
 		return ret;
 
-	atomic_inc(&owner->verbs_mrs);
+	if ((u32)atomic_inc_return(&owner->verbs_mrs) > TBV_IBDEV_MAX_MR) {
+		atomic_dec(&owner->verbs_mrs);
+		xa_lock_irqsave(&owner->verbs_mrs_xa, flags);
+		__xa_erase(&owner->verbs_mrs_xa, key);
+		xa_unlock_irqrestore(&owner->verbs_mrs_xa, flags);
+		return -ENOSPC;
+	}
 	return 0;
 }
 

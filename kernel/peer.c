@@ -151,6 +151,7 @@ struct tbv_peer *tbv_peer_get_or_create(struct tbv_state *state,
 		return ERR_PTR(-ENOMEM);
 
 	refcount_set(&peer->refcnt, 1);
+	atomic_set(&peer->tx_sendq_reserved, 0);
 	peer->state = state;
 	peer->backend = backend;
 	peer->xd = tb_xdomain_get(xd);
