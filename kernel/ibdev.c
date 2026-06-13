@@ -1142,6 +1142,11 @@ static enum tbv_rx_endpoint_status
 tbv_qp_validate_native_endpoint(struct tbv_qp *tqp,
 				const struct tbv_native_data_header *hdr)
 {
+	/*
+	 * FINDINGS.md S3 (open): endpoint acceptance below is a plaintext QPN
+	 * check only and is not bound to an authenticated session; see
+	 * scripts/fixes/04-peer-authentication.sh.
+	 */
 	enum tbv_rx_endpoint_status status = TBV_RX_ENDPOINT_OK;
 	unsigned long flags;
 
@@ -2715,6 +2720,11 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 	}
 
 	tbv_qp_put(tqp);
+	/*
+	 * FINDINGS.md R2 (open): this final wait is untimed, so a late RDMA-READ
+	 * response in flight can hang teardown; see
+	 * scripts/fixes/02-qp-teardown-bounded.sh.
+	 */
 	wait_for_completion(&tqp->refs_zero);
 	tbv_qp_flush_active_rx(tqp);
 	tbv_qp_flush_reorder(tqp);

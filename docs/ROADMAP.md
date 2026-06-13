@@ -136,3 +136,15 @@ to this file, and check the box here once the PR merges.
 3. Do the work on a branch and open a PR that references the issue; update the
    checkbox and status here in the same PR.
 4. Merge closes the issue and ticks the box.
+
+## Follow-on work: analysis findings
+
+All eight steps above shipped (PRs #3, #5, #7, #9, #11, #13, #15, #17), so their
+automation now lives under
+[`scripts/archive/roadmap/`](../scripts/archive/roadmap/). The next wave of work
+comes from the driver performance/security analysis in
+[`docs/FINDINGS.md`](FINDINGS.md), which catalogues the concrete security (`S*`),
+robustness (`R*`), and testing (`T*`) findings with code citations and a
+prioritized fix list. Each open finding is filed as its own issue + branch +
+draft PR by the [`scripts/fixes/`](../scripts/fixes/) toolkit, the same way these
+roadmap steps were.

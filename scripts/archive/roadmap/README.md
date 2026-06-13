@@ -1,4 +1,13 @@
-# Roadmap automation scripts
+# Roadmap automation scripts (archived)
+
+> **Archived — all eight roadmap steps shipped.** Steps 1–8 were filed and merged
+> via PRs #3, #5, #7, #9, #11, #13, #15, and #17, so this toolkit is kept here for
+> reference only. New work driven by the driver analysis uses
+> [`scripts/fixes/`](../../fixes/) instead; see
+> [`docs/FINDINGS.md`](../../../docs/FINDINGS.md).
+>
+> Paths in the rest of this file are written relative to the original
+> `scripts/roadmap/` location.
 
 These scripts turn each step of [`docs/ROADMAP.md`](../../docs/ROADMAP.md) into a
 **separate GitHub issue + branch + draft PR**, and hand the implementation off to
