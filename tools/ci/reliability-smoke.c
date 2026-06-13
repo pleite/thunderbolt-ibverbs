@@ -293,6 +293,7 @@ static int test_duplicate_retry_does_not_duplicate_completion(void)
 	CHECK(!comp.valid);
 
 	CHECK(send_all(&tx, retry, 2) == 0);
+	/* Deliver the same retried fragment twice to model a duplicated retry. */
 	CHECK(tbv_rel_rx_on_data(&rx, &retry[0], true, &event) == 0);
 	CHECK(tbv_rel_rx_on_data(&rx, &retry[0], true, &event) == 0);
 	CHECK(event.duplicate && !event.completion_valid);
