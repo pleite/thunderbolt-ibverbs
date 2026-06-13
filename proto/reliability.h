@@ -20,14 +20,14 @@ typedef uint64_t tbv_rel_u64;
 #endif
 
 #define TBV_REL_MAX_FRAGS 64u
-/*
- * FINDINGS.md R1 (open): this dedup/ACK window is scanned linearly and is far
- * smaller than the kernel's outstanding-WR limit (TBV_IBDEV_MAX_QP_WR), so it
- * can wrap under heavy retransmission; see
- * scripts/fixes/01-reliability-dedup-window.sh.
- */
-#define TBV_REL_ACK_HISTORY_SIZE 16u
 #define TBV_REL_ORDER_MAX 128u
+/*
+ * ACK/dedup history: one slot per possible outstanding op_id, addressed by
+ * op_id % TBV_REL_ACK_HISTORY_SIZE.  Sized to TBV_REL_ORDER_MAX so that no
+ * two simultaneously outstanding ops share a slot and no duplicate frame is
+ * incorrectly accepted as new.
+ */
+#define TBV_REL_ACK_HISTORY_SIZE TBV_REL_ORDER_MAX
 #define TBV_REL_RETRY_INFINITE ((tbv_rel_u32)~0u)
 #define TBV_REL_VERBS_RNR_RETRY_INFINITE 7u
 
@@ -126,7 +126,6 @@ struct tbv_rel_rx_op {
 	tbv_rel_u32 frame_count;
 	tbv_rel_u32 received_count;
 	tbv_rel_u32 completion_count;
-	tbv_rel_u32 ack_history_next;
 	tbv_rel_u64 received_bitmap;
 	struct tbv_rel_ack_frame cached_ack;
 	struct tbv_rel_rx_ack_history_entry ack_history[TBV_REL_ACK_HISTORY_SIZE];
