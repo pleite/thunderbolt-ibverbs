@@ -16,11 +16,10 @@ let
     native_data = "1";
     apple_data = "0";
     register_verbs = "1";
-    # Tuning-sweep recommended defaults (see bench/results/strix-2p-noiommu-2x40g/tuning.md
-    # and docs/TUNING.md for the rationale).
+    # Tuning-sweep recommended defaults (see bench/results/strix-2p-noiommu-2x40g/tuning.md and docs/TUNING.md).
     zcopy_min_bytes = "4096";            # +17% BW at 1 MiB; no cost below threshold
-    native_fragment_striping = "0";      # enable to "1" on ≥4-rail topologies for ~7% BW gain
-    nhi_interrupt_throttle_ns = "50000"; # +10% BW at 50 µs; set 0 for latency-critical paths
+    native_fragment_striping = "0";      # enable to "1" on >=4-rail topologies for ~7% BW gain
+    nhi_interrupt_throttle_ns = "50000"; # +10% BW at 50 us; set 0 for latency-critical paths
   };
 
   renderModuleArgs = attrs:
