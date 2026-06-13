@@ -53,6 +53,13 @@
 #define TBV_IBDEV_QPN_MAX 0x00ffffff
 #define TBV_APPLE_PRIMARY_QPN TBV_IBDEV_QPN_MIN
 #define TBV_IBDEV_PAGE_SIZE_CAP (SZ_4K | SZ_2M | SZ_1G)
+/*
+ * Memory keys (rkey/lkey) are drawn from a CSPRNG so that a remote peer cannot
+ * guess a valid rkey and perform arbitrary remote DMA.  Each MR consumes two
+ * keys (a separate rkey and lkey), both unique within the device key map; this
+ * bounds how many random draws we attempt before reporting key exhaustion.
+ */
+#define TBV_MR_KEY_MAX_ATTEMPTS 16
 #define TBV_PSN_MASK 0x00ffffffu
 /*
  * Native SEND receives can observe future PSNs when Thunderbolt paths deliver
@@ -618,6 +625,13 @@ struct tbv_gsi_send_ctx {
 };
 
 static DEFINE_IDA(tbv_qpn_ida);
+/*
+ * MR keys are no longer handed out from a sequential atomic_t counter; they are
+ * drawn from a CSPRNG in tbv_mr_insert_random_key() so a remote peer cannot
+ * guess a valid rkey and perform arbitrary remote DMA.  The old global counter
+ * is therefore intentionally gone.
+ */
+
 static int tbv_cq_push(struct tbv_cq *tcq, const struct ib_wc *wc);
 static void tbv_send_ctx_put(struct tbv_send_ctx *send);
 static bool tbv_send_complete(struct tbv_send_ctx *send, int status);
@@ -1160,6 +1174,11 @@ static enum tbv_rx_endpoint_status
 tbv_qp_validate_native_endpoint(struct tbv_qp *tqp,
 				const struct tbv_native_data_header *hdr)
 {
+	/*
+	 * FINDINGS.md S3 (open): endpoint acceptance below is a plaintext QPN
+	 * check only and is not bound to an authenticated session; see
+	 * scripts/fixes/04-peer-authentication.sh.
+	 */
 	enum tbv_rx_endpoint_status status = TBV_RX_ENDPOINT_OK;
 	unsigned long flags;
 
@@ -9234,13 +9253,41 @@ void tbv_ibdev_rx_frame(struct tbv_state *state, struct tbv_path *rx_path,
 	tbv_ibdev_rx_native_frame(state, rx_path, &hdr, payload);
 }
 
+/*
+ * Insert @mr under a freshly drawn random key, retrying on the (astronomically
+ * unlikely) event of a collision with an existing key.  Key 0 is reserved: it
+ * is the implicit local_dma_lkey value, which this driver intentionally does
+ * not honour.  Must be called with owner->verbs_mrs_xa locked, so insertion
+ * uses GFP_ATOMIC (the lock is held with IRQs disabled).
+ */
+static int tbv_mr_insert_random_key(struct tbv_state *owner, struct tbv_mr *mr,
+				    u32 *out_key)
+{
+	unsigned int attempts;
+	u32 key;
+	int ret;
+
+	for (attempts = 0; attempts < TBV_MR_KEY_MAX_ATTEMPTS; attempts++) {
+		key = get_random_u32();
+		if (key == 0)
+			continue;
+		ret = __xa_insert(&owner->verbs_mrs_xa, key, mr, GFP_ATOMIC);
+		if (ret == -EBUSY)
+			continue;
+		if (ret)
+			return ret;
+		*out_key = key;
+		return 0;
+	}
+	return -ENOSPC;
+}
+
 static int tbv_mr_publish(struct tbv_mr *mr, struct ib_pd *pd)
 {
 	struct tbv_state *owner = tbv_ibdev_state(pd->device);
 	unsigned long flags;
-	u32 key;
+	u32 lkey = 0, rkey = 0;
 	int ret;
-	int attempt;
 
 	mr->base.device = pd->device;
 	mr->base.pd = pd;
@@ -9249,28 +9296,21 @@ static int tbv_mr_publish(struct tbv_mr *mr, struct ib_pd *pd)
 	refcount_set(&mr->refs, 1);
 	INIT_WORK(&mr->free_work, tbv_mr_free_work);
 
-	for (attempt = 0; attempt < TBV_MR_KEY_ALLOC_MAX_ATTEMPTS; attempt++) {
-		/* Key 0 is reserved/invalid for verbs MR lookup in this driver. */
-		do {
-			key = get_random_u32();
-		} while (!key);
-		mr->base.lkey = key;
-		mr->base.rkey = key;
-
-		xa_lock_irqsave(&owner->verbs_mrs_xa, flags);
-		ret = __xa_insert(&owner->verbs_mrs_xa, key, mr, GFP_KERNEL);
-		xa_unlock_irqrestore(&owner->verbs_mrs_xa, flags);
-		if (!ret)
-			break;
-		if (ret != -EBUSY)
-			return ret;
+	xa_lock_irqsave(&owner->verbs_mrs_xa, flags);
+	ret = tbv_mr_insert_random_key(owner, mr, &lkey);
+	if (!ret) {
+		ret = tbv_mr_insert_random_key(owner, mr, &rkey);
+		if (ret)
+			__xa_erase(&owner->verbs_mrs_xa, lkey);
 	}
-	if (ret == -EBUSY)
-		pr_warn_ratelimited("failed to allocate unique MR key after %u attempts\n",
-				    TBV_MR_KEY_ALLOC_MAX_ATTEMPTS);
+	xa_unlock_irqrestore(&owner->verbs_mrs_xa, flags);
+	if (ret == -ENOSPC)
+		pr_warn_ratelimited("failed to allocate unique MR key\n");
 	if (ret)
 		return ret;
 
+	mr->base.lkey = lkey;
+	mr->base.rkey = rkey;
 	atomic_inc(&owner->verbs_mrs);
 	return 0;
 }
@@ -9357,6 +9397,8 @@ static int tbv_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
 		xa_lock_irqsave(&mr->owner->verbs_mrs_xa, flags);
 		mr->closing = true;
 		__xa_erase(&mr->owner->verbs_mrs_xa, ibmr->lkey);
+		if (ibmr->rkey != ibmr->lkey)
+			__xa_erase(&mr->owner->verbs_mrs_xa, ibmr->rkey);
 		xa_unlock_irqrestore(&mr->owner->verbs_mrs_xa, flags);
 	}
 

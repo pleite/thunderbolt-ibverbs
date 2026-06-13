@@ -20,6 +20,12 @@ typedef uint64_t tbv_rel_u64;
 #endif
 
 #define TBV_REL_MAX_FRAGS 64u
+/*
+ * FINDINGS.md R1 (open): this dedup/ACK window is scanned linearly and is far
+ * smaller than the kernel's outstanding-WR limit (TBV_IBDEV_MAX_QP_WR), so it
+ * can wrap under heavy retransmission; see
+ * scripts/fixes/01-reliability-dedup-window.sh.
+ */
 #define TBV_REL_ACK_HISTORY_SIZE 16u
 #define TBV_REL_ORDER_MAX 128u
 #define TBV_REL_RETRY_INFINITE ((tbv_rel_u32)~0u)
