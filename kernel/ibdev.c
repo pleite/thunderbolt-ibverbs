@@ -8236,6 +8236,14 @@ static void tbv_kunit_read_resp_queue_close_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, list_empty(&tqp.pending_read_resps));
 	KUNIT_EXPECT_FALSE(test, list_empty(&flush));
 	KUNIT_EXPECT_TRUE(test, queued.closing);
+	KUNIT_EXPECT_PTR_EQ(
+		test,
+		list_first_entry(&flush, struct tbv_read_resp_ctx, node),
+		&queued);
+	list_del_init(&queued.node);
+	refcount_dec(&queued.refs);
+	KUNIT_EXPECT_EQ(test, refcount_read(&queued.refs), 1);
+	KUNIT_EXPECT_TRUE(test, list_empty(&flush));
 
 	KUNIT_EXPECT_FALSE(test, tbv_qp_queue_read_resp(&tqp, &rejected));
 	KUNIT_EXPECT_TRUE(test, list_empty(&rejected.node));
