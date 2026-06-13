@@ -88,7 +88,12 @@ tbv_vllm_smoke.sh \
 ## Status
 
 - Native Linux-to-Linux verbs transport is the main path.
-- Apple-compatible transport exists, but is still experimental.
+- Apple-compatible transport (`mac_compat` profile) works with macOS 12+
+  on Apple Silicon Macs (M1/M2/M3/M4) connected via Thunderbolt 3/4/5.
+  Known limitations: UC only (no RC), single DMA rail per link, no RDMA WRITE
+  with immediate data, IOMMU pass-through not yet validated.
+  See [docs/apple-hardware.md](docs/apple-hardware.md) for the full list and
+  setup instructions.
 - The module builds against stock kernels, but needs Linux 6.14 or newer
   (or this flake's `linux-thunderbolt` kernel) for the maintainer-tree
   Thunderbolt/USB4 subsystem changes it relies on.
@@ -302,6 +307,48 @@ sudo modprobe -r thunderbolt_ibverbs
 
 To make a known-good configuration persistent, put the options in
 `/etc/modprobe.d/thunderbolt-ibverbs.conf`.
+
+## Apple↔Linux Transport (mac_compat)
+
+Connect a Thunderbolt cable between a Linux host and an Apple Silicon Mac
+(M1/M2/M3/M4, macOS 12+). On the Linux host:
+
+```sh
+sudo modprobe thunderbolt_ibverbs \
+  profile=mac_compat \
+  bind_services=1 \
+  allocate_rings=1 \
+  start_rings=1 \
+  enable_tunnels=1 \
+  register_verbs=1
+```
+
+With `profile=mac_compat` the module auto-enables the Apple data path
+(`apple_data=auto` → on) and uses the minimal ThunderboltIP identity to
+negotiate with the macOS peer before the verbs rail comes up.
+
+Check device registration and GIDs:
+
+```sh
+dmesg | grep thunderbolt_ibverbs
+ibv_devices          # should show usb4_rdma0 or usb4_apple0
+rdma link show
+```
+
+From the macOS side use the Apple-patched `mac_tb_rdma_probe` to probe the
+link:
+
+```sh
+# macOS — probe only (no traffic):
+MAC_TB_RDMA_PROBE_RTR=1 mac_tb_rdma_probe rdma_en1 <linux-peer-ip>
+
+# macOS — probe + one UC SEND:
+MAC_TB_RDMA_PROBE_RTR=1 MAC_TB_RDMA_PROBE_SEND=1 \
+  mac_tb_rdma_probe rdma_en1 <linux-peer-ip> <linux-qpn> 7
+```
+
+See [docs/apple-hardware.md](docs/apple-hardware.md) for supported hardware,
+known limitations, and the full interop procedure including `perftest`.
 
 ## Useful Parameters
 
