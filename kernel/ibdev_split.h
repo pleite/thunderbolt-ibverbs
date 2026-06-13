@@ -39,12 +39,6 @@ struct tbv_state;
 struct tbv_path;
 struct tbv_native_data_header;
 
-int tbv_create_cq_impl(struct ib_cq *cq, const struct ib_cq_init_attr *attr,
-			struct uverbs_attr_bundle *attrs);
-int tbv_destroy_cq_impl(struct ib_cq *cq, struct ib_udata *udata);
-int tbv_poll_cq_impl(struct ib_cq *cq, int num_entries, struct ib_wc *wc);
-int tbv_req_notify_cq_impl(struct ib_cq *cq, enum ib_cq_notify_flags flags);
-
 int tbv_create_qp_impl(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 			struct ib_udata *udata);
 int tbv_destroy_qp_impl(struct ib_qp *qp, struct ib_udata *udata);

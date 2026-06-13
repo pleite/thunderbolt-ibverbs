@@ -2142,39 +2142,7 @@ static int tbv_dealloc_pd(struct ib_pd *pd, struct ib_udata *udata)
 	return 0;
 }
 
-int tbv_create_cq_impl(struct ib_cq *cq, const struct ib_cq_init_attr *attr,
-			 struct uverbs_attr_bundle *attrs)
-{
-	struct tbv_cq *tcq = container_of(cq, struct tbv_cq, base);
-
-	if (!attr || attr->cqe <= 0 || attr->cqe > TBV_IBDEV_MAX_CQE)
-		return -EINVAL;
-
-	tcq->entries = kcalloc(attr->cqe, sizeof(*tcq->entries), GFP_KERNEL);
-	if (!tcq->entries)
-		return -ENOMEM;
-
-	spin_lock_init(&tcq->lock);
-	tcq->owner = tbv_ibdev_state(cq->device);
-	tcq->cqe = attr->cqe;
-	if ((u32)atomic_inc_return(&tcq->owner->verbs_cqs) > TBV_IBDEV_MAX_CQ) {
-		atomic_dec(&tcq->owner->verbs_cqs);
-		kfree(tcq->entries);
-		tcq->entries = NULL;
-		return -ENOSPC;
-	}
-	return 0;
-}
-
-int tbv_destroy_cq_impl(struct ib_cq *cq, struct ib_udata *udata)
-{
-	struct tbv_cq *tcq = container_of(cq, struct tbv_cq, base);
-
-	if (tcq->owner)
-		atomic_dec(&tcq->owner->verbs_cqs);
-	kfree(tcq->entries);
-	return 0;
-}
+/* Completion-queue create/destroy verbs moved to ibdev_cq.c (R7 split) */
 
 int tbv_create_qp_impl(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 			 struct ib_udata *udata)
@@ -8641,46 +8609,7 @@ complete_ack:
 	tbv_read_ctx_put(read);
 }
 
-int tbv_poll_cq_impl(struct ib_cq *cq, int num_entries, struct ib_wc *wc)
-{
-	struct tbv_cq *tcq = container_of(cq, struct tbv_cq, base);
-	unsigned long flags;
-	int polled = 0;
-	bool overflowed;
-
-	if (num_entries <= 0 || !wc)
-		return 0;
-
-	spin_lock_irqsave(&tcq->lock, flags);
-	while (polled < num_entries && tcq->count) {
-		wc[polled++] = tcq->entries[tcq->head];
-		tcq->head = (tcq->head + 1) % tcq->cqe;
-		tcq->count--;
-	}
-	overflowed = tcq->overflowed;
-	spin_unlock_irqrestore(&tcq->lock, flags);
-
-	if (!polled && overflowed)
-		return -EIO;
-	return polled;
-}
-
-int tbv_req_notify_cq_impl(struct ib_cq *cq, enum ib_cq_notify_flags flags)
-{
-	struct tbv_cq *tcq = container_of(cq, struct tbv_cq, base);
-	unsigned long irq_flags;
-	int ret;
-
-	spin_lock_irqsave(&tcq->lock, irq_flags);
-	if (tcq->overflowed) {
-		ret = -EIO;
-	} else {
-		tcq->notify_armed = true;
-		ret = tcq->count ? 1 : 0;
-	}
-	spin_unlock_irqrestore(&tcq->lock, irq_flags);
-	return ret;
-}
+/* Completion-queue poll/notify verbs moved to ibdev_cq.c (R7 split) */
 
 static void tbv_rx_handle_mad(struct tbv_state *state, struct tbv_path *rx_path,
 			      const struct tbv_native_data_header *hdr,
