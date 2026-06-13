@@ -57,8 +57,14 @@ mapfile -t nix_patches < <(
 	grep -oP '(?<=rdma-core-patches/)[^"]+\.patch' "$repo_root/flake.nix" | sort
 )
 
+# Build an associative array for O(1) lookups.
+declare -A nix_patch_set=()
+for p in "${nix_patches[@]}"; do
+	nix_patch_set["$p"]=1
+done
+
 for p in "${disk_patches[@]}"; do
-	if printf '%s\n' "${nix_patches[@]}" | grep -qxF "$p"; then
+	if [[ -n "${nix_patch_set[$p]+x}" ]]; then
 		printf '  ok    flake.nix references %s\n' "$p"
 		(( pass++ )) || true
 	else
