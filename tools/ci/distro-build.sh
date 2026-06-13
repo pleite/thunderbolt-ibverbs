@@ -110,7 +110,8 @@ copy_source() {
 build_with_make() {
 	local kver="$1"
 
-	make -C /work/src KVER="$kver" KDIR="/lib/modules/$kver/build" modules
+	make -C /work/src KVER="$kver" KDIR="/lib/modules/$kver/build" \
+		KCFLAGS="-Werror" modules
 	modinfo /work/src/kernel/thunderbolt_ibverbs.ko | sed -n '1,20p'
 	make -C /work/src KVER="$kver" KDIR="/lib/modules/$kver/build" clean
 }

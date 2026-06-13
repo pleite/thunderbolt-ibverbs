@@ -131,10 +131,129 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         run: nix build --no-link .#rdma-core-usb4
 
+  kernel-hygiene:
+    name: kernel static-analysis + memory-safety
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install kernel analysis tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends sparse
+
+      - name: checkpatch on changed kernel/proto files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          checkpatch="/lib/modules/$(uname -r)/build/scripts/checkpatch.pl"
+          if [[ ! -f "$checkpatch" ]]; then
+            echo "checkpatch.pl not found at $checkpatch" >&2
+            exit 1
+          fi
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            git fetch --no-tags origin "${{ github.base_ref }}"
+            base="$(git merge-base HEAD "origin/${{ github.base_ref }}")"
+            range="$base...HEAD"
+          elif [[ -n "${{ github.event.before }}" && "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
+            range="${{ github.event.before }}...${{ github.sha }}"
+          else
+            range="HEAD~1...HEAD"
+          fi
+
+          mapfile -t files < <(git diff --name-only --diff-filter=ACMR "$range" -- 'kernel/*.[ch]' 'proto/*.[ch]')
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "No kernel/proto changes; skipping checkpatch."
+            exit 0
+          fi
+
+          perl "$checkpatch" --no-tree --strict --show-types --terse --file "${files[@]}" || {
+            echo "checkpatch found issues in changed kernel/proto files." >&2
+            exit 1
+          }
+
+      - name: sparse build (warnings as errors)
+        run: |
+          make -C kernel \
+            KVER="$(uname -r)" \
+            KDIR="/lib/modules/$(uname -r)/build" \
+            C=2 CHECK=sparse CF="-Wsparse-error" \
+            modules
+          make -C kernel \
+            KVER="$(uname -r)" \
+            KDIR="/lib/modules/$(uname -r)/build" \
+            clean
+
+      - name: optional smatch build
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v smatch >/dev/null 2>&1; then
+            echo "smatch not available on runner; skipping optional smatch pass."
+            exit 0
+          fi
+          make -C kernel \
+            KVER="$(uname -r)" \
+            KDIR="/lib/modules/$(uname -r)/build" \
+            C=2 CHECK=smatch \
+            modules
+          make -C kernel \
+            KVER="$(uname -r)" \
+            KDIR="/lib/modules/$(uname -r)/build" \
+            clean
+
+      - name: KASAN/KCSAN warning-error build targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          config="/boot/config-$(uname -r)"
+          for sanitizer in KASAN KCSAN; do
+            if [[ ! -r "$config" ]] || ! grep -q "^CONFIG_${sanitizer}=y" "$config"; then
+              echo "Runner kernel is not built with CONFIG_${sanitizer}=y; skipping ${sanitizer} module build target."
+              continue
+            fi
+            make -C kernel \
+              KVER="$(uname -r)" \
+              KDIR="/lib/modules/$(uname -r)/build" \
+              KCFLAGS="-Werror" \
+              KBUILD_MODPOST_WARN=1 \
+              modules
+            make -C kernel \
+              KVER="$(uname -r)" \
+              KDIR="/lib/modules/$(uname -r)/build" \
+              clean
+          done
+
+      - name: optional proto wire parser fuzzing
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v clang >/dev/null 2>&1; then
+            echo "clang unavailable; skipping optional proto fuzzing."
+            exit 0
+          fi
+          if ! clang \
+            -std=c11 -Wall -Wextra -Werror \
+            -fsanitize=fuzzer,address -I. \
+            tools/ci/proto-wire-fuzz.c \
+            -o /tmp/tbv-proto-wire-fuzz \
+            >/tmp/tbv-proto-wire-fuzz-build.log 2>&1; then
+            echo "Skipping optional proto fuzzing (fuzzer toolchain unavailable or compile warnings/errors):"
+            tail -n 20 /tmp/tbv-proto-wire-fuzz-build.log || true
+            exit 0
+          fi
+          /tmp/tbv-proto-wire-fuzz -max_total_time=15
+
   release:
     name: Publish GitHub Release
     if: ${{ startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || inputs.publish) }}
-    needs: [build, nix]
+    needs: [build, nix, kernel-hygiene]
     runs-on: ubuntu-latest
     permissions:
       contents: write
