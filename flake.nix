@@ -111,6 +111,7 @@
               packaging/test-rdma-patches.sh \
               kernel-workflow/regen-upstream-thunderbolt-patches.sh \
               tools/tbv-target-module.sh \
+              tools/ci/check-packaging-sync.sh \
               tools/ci/distro-build.sh \
               tools/ci/distro-install.sh \
               tools/ci/distro-package-rdma.sh \

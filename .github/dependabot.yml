@@ -9,3 +9,12 @@ updates:
         patterns:
           - "*"
         group-by: "dependency-name"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+        group-by: "dependency-name"

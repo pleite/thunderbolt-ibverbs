@@ -26,6 +26,7 @@
 #define TBV_ETH_ALEN 6
 #define TBV_NATIVE_PROTOCOL_KEY "tbverbs"
 #define TBV_NATIVE_MAX_LANES 4
+#define TBV_PEER_ALLOWLIST_MAX 32
 #define TBV_DATA_PDF_FRAME_START 1
 #define TBV_DATA_PDF_FRAME_END 3
 #define TBV_NATIVE_PRTCID 1
@@ -442,6 +443,8 @@ struct tbv_state {
 	struct list_head configured_links;
 	u32 next_peer_id;
 	u32 configured_link_count;
+	u32 peer_allowlist_count;
+	uuid_t peer_allowlist[TBV_PEER_ALLOWLIST_MAX];
 	struct tbv_tbnet_identity tbnet_identity;
 	struct tb_property_dir *native_dirs[TBV_NATIVE_MAX_LANES];
 	u32 native_dir_count;
@@ -458,6 +461,7 @@ struct tbv_state {
 	bool services_registered;
 	bool verbs_registered;
 	bool native_control_registered;
+	bool peer_allowlist_enabled;
 	bool native_control_source_aware;
 	bool native_legacy_multicable_warned;
 	bool apple_rails_wait_tbnet;
