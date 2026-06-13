@@ -214,6 +214,11 @@ int tbv_rel_tx_on_ack(struct tbv_rel_tx_op *tx,
 	}
 }
 
+#define TBV_REL_RETRY_BACKOFF_SHIFT_MAX 20u
+#define TBV_REL_JITTER_PCT_BASE 875u
+#define TBV_REL_JITTER_PCT_SPAN 251u
+#define TBV_REL_RETRY_HASH_GOLDEN_RATIO 2654435761u
+
 tbv_rel_u64 tbv_rel_retry_interval(tbv_rel_u64 ack_timeout,
 				   tbv_rel_u32 retry_budget)
 {
@@ -225,8 +230,9 @@ tbv_rel_u64 tbv_rel_retry_interval(tbv_rel_u64 ack_timeout,
 	if (!ack_timeout)
 		return 0;
 
-	if (shift > 20)
-		shift = 20;
+	/* Cap exponential growth at 2^20 * base to avoid overflow. */
+	if (shift > TBV_REL_RETRY_BACKOFF_SHIFT_MAX)
+		shift = TBV_REL_RETRY_BACKOFF_SHIFT_MAX;
 	if (shift) {
 		if (backoff > (~0ull >> shift))
 			backoff = ~0ull;
@@ -235,16 +241,21 @@ tbv_rel_u64 tbv_rel_retry_interval(tbv_rel_u64 ack_timeout,
 	}
 
 #ifdef __KERNEL__
-	jitter_pct = 875u + (get_random_u32() % 251u);
+	/* Jitter in [87.5%, 112.5%] keeps retries from synchronizing. */
+	jitter_pct = TBV_REL_JITTER_PCT_BASE +
+		     (get_random_u32() % TBV_REL_JITTER_PCT_SPAN);
 #else
 	{
 		tbv_rel_u32 x = (tbv_rel_u32)ack_timeout ^
-				(retry_budget * 2654435761u);
+				(retry_budget *
+				 TBV_REL_RETRY_HASH_GOLDEN_RATIO);
 
+		/* Use a deterministic hash in userspace tests. */
 		x ^= x >> 16;
 		x *= 2246822519u;
 		x ^= x >> 13;
-		jitter_pct = 875u + (x % 251u);
+		jitter_pct = TBV_REL_JITTER_PCT_BASE +
+			     (x % TBV_REL_JITTER_PCT_SPAN);
 	}
 #endif
 	if (backoff > (~0ull / jitter_pct))
