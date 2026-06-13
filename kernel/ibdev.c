@@ -1325,7 +1325,6 @@ static int tbv_qp_reserve_sendq(struct tbv_qp *tqp)
 	struct tbv_peer *peer = tbv_qp_peer(tqp);
 	unsigned long flags;
 	u32 peer_limit;
-	int peer_used = 0;
 	u32 max_wr;
 	int ret = 0;
 
@@ -1338,20 +1337,16 @@ static int tbv_qp_reserve_sendq(struct tbv_qp *tqp)
 	} else if (tqp->sendq_count >= max_wr) {
 		ret = -ENOMEM;
 	} else if (peer_limit && peer) {
-		peer_used = atomic_inc_return(&peer->tx_sendq_reserved);
+		int peer_used = atomic_inc_return(&peer->tx_sendq_reserved);
+
 		if ((u32)peer_used > peer_limit) {
 			atomic_dec(&peer->tx_sendq_reserved);
-			peer_used = 0;
 			ret = -EAGAIN;
 		}
 	}
 
-	if (!ret) {
+	if (!ret)
 		tqp->sendq_count++;
-	} else {
-		if (peer_used > 0)
-			atomic_dec(&peer->tx_sendq_reserved);
-	}
 	spin_unlock_irqrestore(&tqp->lock, flags);
 	return ret;
 }
@@ -1367,8 +1362,7 @@ static void tbv_qp_release_sendq_counted_locked(struct tbv_qp *tqp,
 		tqp->sendq_count = 0;
 	else
 		tqp->sendq_count--;
-	if (peer && !atomic_add_unless(&peer->tx_sendq_reserved, -1, 0))
-		WARN_ON_ONCE(1);
+	WARN_ON_ONCE(peer && !atomic_add_unless(&peer->tx_sendq_reserved, -1, 0));
 	*counted = false;
 }
 
@@ -5543,11 +5537,7 @@ static void tbv_apple_pending_release_total_bytes(struct tbv_state *state,
 
 	do {
 		old = atomic64_read(&state->apple_rx_pending_bytes);
-		if (old <= 0) {
-			atomic64_set(&state->apple_rx_pending_bytes, 0);
-			return;
-		}
-		new = old - len;
+		new = old <= 0 ? 0 : old - len;
 		if (new < 0)
 			new = 0;
 	} while (!atomic64_try_cmpxchg(&state->apple_rx_pending_bytes, &old,
