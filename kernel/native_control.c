@@ -641,10 +641,11 @@ int tbv_native_control_handle_packet(struct tbv_state *state,
 
 	if (info.op == TBV_NATIVE_WIRE_OP_HELLO_ACK) {
 		/*
-		 * Let tb_xdomain_request() match the ACK after observing it.
-		 * XDomain dispatch calls protocol handlers before request
-		 * matching, so consuming the ACK here would make the sender
-		 * time out even though the peer replied correctly.
+		 * Let tb_xdomain_request() match the ACK and let the synchronous
+		 * requester validate/apply it. XDomain dispatch calls protocol
+		 * handlers before request matching, so consuming the ACK here
+		 * would make the sender time out even though the peer replied
+		 * correctly.
 		 */
 		return 0;
 	}
@@ -682,6 +683,7 @@ int tbv_native_control_handle_packet(struct tbv_state *state,
 							       &remote, &local);
 		if (ret) {
 			tb_xdomain_put(xd);
+			peer = NULL;
 			return 1;
 		}
 
