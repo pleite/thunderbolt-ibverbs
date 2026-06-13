@@ -36,8 +36,7 @@ to this file, and check the box here once the PR merges.
 ## Steps
 
 ### 0. Establish the roadmap and docs reference
-- [ ] **Status:** in progress
-- **Motivation:** there is no single place that captures the big picture, so
+- [~] **Motivation:** there is no single place that captures the big picture, so
   planning happens ad-hoc. A referenced plan file lets contributors and agents
   align on direction.
 - **Scope:** add this `docs/ROADMAP.md`, link it from `README.md`, and define the
