@@ -54,6 +54,13 @@
 #define TBV_IBDEV_QPN_MAX 0x00ffffff
 #define TBV_APPLE_PRIMARY_QPN TBV_IBDEV_QPN_MIN
 #define TBV_IBDEV_PAGE_SIZE_CAP (SZ_4K | SZ_2M | SZ_1G)
+/*
+ * Memory keys (rkey/lkey) are drawn from a CSPRNG so that a remote peer cannot
+ * guess a valid rkey and perform arbitrary remote DMA.  Each MR consumes two
+ * keys (a separate rkey and lkey), both unique within the device key map; this
+ * bounds how many random draws we attempt before reporting key exhaustion.
+ */
+#define TBV_MR_KEY_MAX_ATTEMPTS 16
 #define TBV_PSN_MASK 0x00ffffffu
 /*
  * Native SEND receives can observe future PSNs when Thunderbolt paths deliver
@@ -76,6 +83,7 @@
 #define TBV_APPLE_RAW_DESCS_PER_CHUNK 17
 #define TBV_QP_TIMEOUT_DEFAULT_MS 5000
 #define TBV_QP_TIMEOUT_WORK_INTERVAL_MS 1000
+#define TBV_QP_DESTROY_TIMEOUT_MS 5000
 #define TBV_SEND_MAX_RETRIES 7
 #define TBV_SEND_RNR_RETRIES_INFINITE ((u8)~0u)
 #define TBV_READ_RESP_RETRY_MS 100
@@ -407,6 +415,10 @@ struct tbv_qp {
 	 * can use all cables while preserving per-QP FIFO ordering.
 	 */
 	struct tbv_rail *rail;
+	/*
+	 * Lock nesting order for peer/QP state:
+	 * peer->control_lock -> owner->lock -> lock.
+	 */
 	spinlock_t lock;
 	struct mutex rx_lock;
 	wait_queue_head_t credit_wait;
@@ -623,6 +635,13 @@ struct tbv_gsi_send_ctx {
 };
 
 static DEFINE_IDA(tbv_qpn_ida);
+/*
+ * MR keys are no longer handed out from a sequential atomic_t counter; they are
+ * drawn from a CSPRNG in tbv_mr_insert_random_key() so a remote peer cannot
+ * guess a valid rkey and perform arbitrary remote DMA.  The old global counter
+ * is therefore intentionally gone.
+ */
+
 static int tbv_cq_push(struct tbv_cq *tcq, const struct ib_wc *wc);
 static void tbv_send_ctx_put(struct tbv_send_ctx *send);
 static bool tbv_send_complete(struct tbv_send_ctx *send, int status);
@@ -1172,6 +1191,11 @@ static enum tbv_rx_endpoint_status
 tbv_qp_validate_native_endpoint(struct tbv_qp *tqp,
 				const struct tbv_native_data_header *hdr)
 {
+	/*
+	 * FINDINGS.md S3 (open): endpoint acceptance below is a plaintext QPN
+	 * check only and is not bound to an authenticated session; see
+	 * scripts/fixes/04-peer-authentication.sh.
+	 */
 	enum tbv_rx_endpoint_status status = TBV_RX_ENDPOINT_OK;
 	unsigned long flags;
 
@@ -1400,16 +1424,23 @@ static void tbv_qp_queue_read(struct tbv_qp *tqp, struct tbv_read_ctx *read)
 	spin_unlock_irqrestore(&tqp->lock, flags);
 }
 
-static void tbv_qp_queue_read_resp(struct tbv_qp *tqp,
+static bool tbv_qp_queue_read_resp(struct tbv_qp *tqp,
 				   struct tbv_read_resp_ctx *ctx)
 {
 	unsigned long flags;
+	bool queued = false;
 
 	spin_lock_irqsave(&tqp->lock, flags);
-	ctx->queued_jiffies = 0;
-	tbv_read_resp_ctx_get(ctx);
-	list_add_tail(&ctx->node, &tqp->pending_read_resps);
+	if (!tqp->closing) {
+		ctx->queued_jiffies = 0;
+		tbv_read_resp_ctx_get(ctx);
+		list_add_tail(&ctx->node, &tqp->pending_read_resps);
+		queued = true;
+	} else {
+		ctx->closing = true;
+	}
 	spin_unlock_irqrestore(&tqp->lock, flags);
+	return queued;
 }
 
 static void tbv_qp_arm_send_timeout(struct tbv_qp *tqp,
@@ -1750,6 +1781,16 @@ static void tbv_qp_cancel_read_resps(struct tbv_qp *tqp, struct list_head *flush
 	list_for_each_entry(ctx, &tqp->pending_read_resps, node)
 		ctx->closing = true;
 	list_splice_init(&tqp->pending_read_resps, flush);
+	spin_unlock_irqrestore(&tqp->lock, flags);
+}
+
+static void tbv_qp_begin_close(struct tbv_qp *tqp)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&tqp->lock, flags);
+	tqp->closing = true;
+	tqp->timeout_work_armed = false;
 	spin_unlock_irqrestore(&tqp->lock, flags);
 }
 
@@ -2709,9 +2750,7 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 	u32 pending;
 	u32 i;
 
-	spin_lock_irqsave(&tqp->lock, flags);
-	tqp->closing = true;
-	spin_unlock_irqrestore(&tqp->lock, flags);
+	tbv_qp_begin_close(tqp);
 
 	if (tqp->type == IB_QPT_GSI && tqp->rail && tqp->rail->ibdev) {
 		mutex_lock(&tqp->owner->lock);
@@ -2724,9 +2763,6 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 	wake_up_all(&tqp->apple_tx_wait);
 	cancel_work_sync(&tqp->apple_sq_work);
 	cancel_delayed_work_sync(&tqp->timeout_work);
-	spin_lock_irqsave(&tqp->lock, flags);
-	tqp->timeout_work_armed = false;
-	spin_unlock_irqrestore(&tqp->lock, flags);
 
 	tbv_qp_flush_apple_sq(tqp);
 	tbv_qp_flush_sends(tqp, &flush);
@@ -2763,7 +2799,7 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 
 	if (!wait_event_timeout(tqp->refs_wait,
 				refcount_read(&tqp->refs) == 1,
-				msecs_to_jiffies(5000))) {
+				msecs_to_jiffies(TBV_QP_DESTROY_TIMEOUT_MS))) {
 		pr_warn("QP %u destroy timed out with %u refs; leaving it closing for retry\n",
 			qp->qp_num, refcount_read(&tqp->refs));
 		return -ETIMEDOUT;
@@ -2775,8 +2811,6 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 		xa_unlock_irqrestore(&tqp->owner->verbs_qps_xa, flags);
 	}
 
-	tbv_qp_put(tqp);
-	wait_for_completion(&tqp->refs_zero);
 	tbv_qp_flush_active_rx(tqp);
 	tbv_qp_flush_reorder(tqp);
 	tbv_qp_flush_apple_pending(tqp);
@@ -2796,6 +2830,7 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 		atomic_dec(&tqp->owner->verbs_qps);
 	tbv_qp_release_apple_tunnel(tqp);
 	tbv_qp_unbind_rail(tqp);
+	tbv_qp_put(tqp);
 	return 0;
 }
 
@@ -2821,8 +2856,10 @@ static bool tbv_qp_get_apple_send_live(struct tbv_qp *tqp)
 static int tbv_qp_ensure_apple_tunnel(struct tbv_qp *tqp, bool *acquired)
 {
 	struct tbv_rail *rail = tqp->rail;
+	struct tbv_state *owner = tqp->owner;
 	struct tbv_peer *peer;
 	struct tbv_state *state;
+	unsigned long flags;
 	bool counted = false;
 	u32 refs = 0;
 	int ret = 0;
@@ -2836,13 +2873,16 @@ static int tbv_qp_ensure_apple_tunnel(struct tbv_qp *tqp, bool *acquired)
 
 	peer = rail->peer;
 	state = peer ? peer->state : NULL;
-	if (!peer || !state || !peer->xd) {
+	if (!peer || !owner || !state || state != owner || !peer->xd) {
 		tbv_rail_put(rail);
 		return -ENODEV;
 	}
 
 	mutex_lock(&peer->control_lock);
-	mutex_lock(&state->lock);
+	mutex_lock(&owner->lock);
+	lockdep_assert_held(&peer->control_lock);
+	lockdep_assert_held(&owner->lock);
+	spin_lock_irqsave(&tqp->lock, flags);
 	if (tqp->apple_tunnel_active) {
 		ret = 0;
 	} else if (rail->removing) {
@@ -2855,7 +2895,8 @@ static int tbv_qp_ensure_apple_tunnel(struct tbv_qp *tqp, bool *acquired)
 	} else {
 		ret = -ENOTCONN;
 	}
-	mutex_unlock(&state->lock);
+	spin_unlock_irqrestore(&tqp->lock, flags);
+	mutex_unlock(&owner->lock);
 	mutex_unlock(&peer->control_lock);
 
 	if (counted)
@@ -2870,8 +2911,10 @@ static int tbv_qp_ensure_apple_tunnel(struct tbv_qp *tqp, bool *acquired)
 static void tbv_qp_release_apple_tunnel(struct tbv_qp *tqp)
 {
 	struct tbv_rail *rail = tqp->rail;
+	struct tbv_state *owner = tqp->owner;
 	struct tbv_peer *peer;
 	struct tbv_state *state;
+	unsigned long flags;
 	u32 refs = 0;
 	u64 route = 0;
 
@@ -2882,13 +2925,16 @@ static void tbv_qp_release_apple_tunnel(struct tbv_qp *tqp)
 
 	peer = rail->peer;
 	state = peer ? peer->state : NULL;
-	if (!peer || !state || !peer->xd) {
+	if (!peer || !owner || !state || state != owner || !peer->xd) {
 		tbv_rail_put(rail);
 		return;
 	}
 
 	mutex_lock(&peer->control_lock);
-	mutex_lock(&state->lock);
+	mutex_lock(&owner->lock);
+	lockdep_assert_held(&peer->control_lock);
+	lockdep_assert_held(&owner->lock);
+	spin_lock_irqsave(&tqp->lock, flags);
 	if (tqp->apple_tunnel_active) {
 		tqp->apple_tunnel_active = false;
 		if (WARN_ON_ONCE(!rail->apple_tunnel_qps)) {
@@ -2899,7 +2945,8 @@ static void tbv_qp_release_apple_tunnel(struct tbv_qp *tqp)
 		refs = rail->apple_tunnel_qps;
 		route = peer->xd->route;
 	}
-	mutex_unlock(&state->lock);
+	spin_unlock_irqrestore(&tqp->lock, flags);
+	mutex_unlock(&owner->lock);
 	/*
 	 * Apple FA57 frames carry no connection incarnation, and local TX
 	 * completion does not prove the peer has consumed every frame. Treat the
@@ -8285,10 +8332,51 @@ static void tbv_kunit_mr_peer_scope_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, tbv_mr_matches_peer_id(&mr, 8));
 }
 
+static void tbv_kunit_read_resp_queue_close_test(struct kunit *test)
+{
+	struct tbv_qp tqp = {};
+	struct tbv_read_resp_ctx queued = {};
+	struct tbv_read_resp_ctx rejected = {};
+	LIST_HEAD(flush);
+
+	spin_lock_init(&tqp.lock);
+	INIT_LIST_HEAD(&tqp.pending_read_resps);
+	INIT_LIST_HEAD(&queued.node);
+	INIT_LIST_HEAD(&queued.retry_node);
+	INIT_LIST_HEAD(&rejected.node);
+	INIT_LIST_HEAD(&rejected.retry_node);
+	refcount_set(&queued.refs, 1);
+	refcount_set(&rejected.refs, 1);
+
+	KUNIT_EXPECT_TRUE(test, tbv_qp_queue_read_resp(&tqp, &queued));
+	KUNIT_EXPECT_FALSE(test, list_empty(&tqp.pending_read_resps));
+	KUNIT_EXPECT_EQ(test, refcount_read(&queued.refs), 2);
+
+	tbv_qp_begin_close(&tqp);
+	tbv_qp_cancel_read_resps(&tqp, &flush);
+	KUNIT_EXPECT_TRUE(test, list_empty(&tqp.pending_read_resps));
+	KUNIT_EXPECT_FALSE(test, list_empty(&flush));
+	KUNIT_EXPECT_TRUE(test, queued.closing);
+	KUNIT_EXPECT_PTR_EQ(
+		test,
+		list_first_entry(&flush, struct tbv_read_resp_ctx, node),
+		&queued);
+	list_del_init(&queued.node);
+	refcount_dec(&queued.refs);
+	KUNIT_EXPECT_EQ(test, refcount_read(&queued.refs), 1);
+	KUNIT_EXPECT_TRUE(test, list_empty(&flush));
+
+	KUNIT_EXPECT_FALSE(test, tbv_qp_queue_read_resp(&tqp, &rejected));
+	KUNIT_EXPECT_TRUE(test, list_empty(&rejected.node));
+	KUNIT_EXPECT_TRUE(test, rejected.closing);
+	KUNIT_EXPECT_EQ(test, refcount_read(&rejected.refs), 1);
+}
+
 static struct kunit_case tbv_ibdev_security_cases[] = {
 	KUNIT_CASE(tbv_kunit_rdma_write_header_valid_test),
 	KUNIT_CASE(tbv_kunit_rdma_write_header_with_imm_test),
 	KUNIT_CASE(tbv_kunit_mr_peer_scope_test),
+	KUNIT_CASE(tbv_kunit_read_resp_queue_close_test),
 	{}
 };
 
@@ -8714,10 +8802,13 @@ static void tbv_read_req_workfn(struct work_struct *work)
 				goto out_send_status;
 			}
 
-		tbv_qp_queue_read_resp(tqp, resp);
-		ret = tbv_send_read_response_ctx(resp);
-		if (!ret)
-			tbv_qp_note_read_resp_sent(tqp, resp);
+		if (tbv_qp_queue_read_resp(tqp, resp)) {
+			ret = tbv_send_read_response_ctx(resp);
+			if (!ret)
+				tbv_qp_note_read_resp_sent(tqp, resp);
+		} else {
+			ret = -ESHUTDOWN;
+		}
 		if (ret) {
 			if (ret == -ENOMEM) {
 				/*
@@ -9264,13 +9355,41 @@ void tbv_ibdev_rx_frame(struct tbv_state *state, struct tbv_path *rx_path,
 	tbv_ibdev_rx_native_frame(state, rx_path, &hdr, payload);
 }
 
+/*
+ * Insert @mr under a freshly drawn random key, retrying on the (astronomically
+ * unlikely) event of a collision with an existing key.  Key 0 is reserved: it
+ * is the implicit local_dma_lkey value, which this driver intentionally does
+ * not honour.  Must be called with owner->verbs_mrs_xa locked, so insertion
+ * uses GFP_ATOMIC (the lock is held with IRQs disabled).
+ */
+static int tbv_mr_insert_random_key(struct tbv_state *owner, struct tbv_mr *mr,
+				    u32 *out_key)
+{
+	unsigned int attempts;
+	u32 key;
+	int ret;
+
+	for (attempts = 0; attempts < TBV_MR_KEY_MAX_ATTEMPTS; attempts++) {
+		key = get_random_u32();
+		if (key == 0)
+			continue;
+		ret = __xa_insert(&owner->verbs_mrs_xa, key, mr, GFP_ATOMIC);
+		if (ret == -EBUSY)
+			continue;
+		if (ret)
+			return ret;
+		*out_key = key;
+		return 0;
+	}
+	return -ENOSPC;
+}
+
 static int tbv_mr_publish(struct tbv_mr *mr, struct ib_pd *pd)
 {
 	struct tbv_state *owner = tbv_ibdev_state(pd->device);
 	unsigned long flags;
-	u32 key;
+	u32 lkey = 0, rkey = 0;
 	int ret;
-	int attempt;
 
 	mr->base.device = pd->device;
 	mr->base.pd = pd;
@@ -9279,32 +9398,27 @@ static int tbv_mr_publish(struct tbv_mr *mr, struct ib_pd *pd)
 	refcount_set(&mr->refs, 1);
 	INIT_WORK(&mr->free_work, tbv_mr_free_work);
 
-	for (attempt = 0; attempt < TBV_MR_KEY_ALLOC_MAX_ATTEMPTS; attempt++) {
-		/* Key 0 is reserved/invalid for verbs MR lookup in this driver. */
-		do {
-			key = get_random_u32();
-		} while (!key);
-		mr->base.lkey = key;
-		mr->base.rkey = key;
-
-		xa_lock_irqsave(&owner->verbs_mrs_xa, flags);
-		ret = __xa_insert(&owner->verbs_mrs_xa, key, mr, GFP_KERNEL);
-		xa_unlock_irqrestore(&owner->verbs_mrs_xa, flags);
-		if (!ret)
-			break;
-		if (ret != -EBUSY)
-			return ret;
+	xa_lock_irqsave(&owner->verbs_mrs_xa, flags);
+	ret = tbv_mr_insert_random_key(owner, mr, &lkey);
+	if (!ret) {
+		ret = tbv_mr_insert_random_key(owner, mr, &rkey);
+		if (ret)
+			__xa_erase(&owner->verbs_mrs_xa, lkey);
 	}
-	if (ret == -EBUSY)
-		pr_warn_ratelimited("failed to allocate unique MR key after %u attempts\n",
-				    TBV_MR_KEY_ALLOC_MAX_ATTEMPTS);
+	xa_unlock_irqrestore(&owner->verbs_mrs_xa, flags);
+	if (ret == -ENOSPC)
+		pr_warn_ratelimited("failed to allocate unique MR key\n");
 	if (ret)
 		return ret;
 
+	mr->base.lkey = lkey;
+	mr->base.rkey = rkey;
 	if ((u32)atomic_inc_return(&owner->verbs_mrs) > TBV_IBDEV_MAX_MR) {
 		atomic_dec(&owner->verbs_mrs);
 		xa_lock_irqsave(&owner->verbs_mrs_xa, flags);
-		__xa_erase(&owner->verbs_mrs_xa, key);
+		__xa_erase(&owner->verbs_mrs_xa, lkey);
+		if (rkey != lkey)
+			__xa_erase(&owner->verbs_mrs_xa, rkey);
 		xa_unlock_irqrestore(&owner->verbs_mrs_xa, flags);
 		return -ENOSPC;
 	}
@@ -9393,6 +9507,8 @@ static int tbv_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
 		xa_lock_irqsave(&mr->owner->verbs_mrs_xa, flags);
 		mr->closing = true;
 		__xa_erase(&mr->owner->verbs_mrs_xa, ibmr->lkey);
+		if (ibmr->rkey != ibmr->lkey)
+			__xa_erase(&mr->owner->verbs_mrs_xa, ibmr->rkey);
 		xa_unlock_irqrestore(&mr->owner->verbs_mrs_xa, flags);
 	}
 
