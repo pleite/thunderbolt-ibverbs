@@ -17,7 +17,7 @@ int tbv_req_notify_cq(struct ib_cq *cq, enum ib_cq_notify_flags flags);
 struct ib_mr *tbv_get_dma_mr(struct ib_pd *pd, int access);
 struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 			 u64 virt_addr, int access,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+#ifdef TBV_KERNEL_HAS_IB_DMAH
 			 struct ib_dmah *dmah,
 #endif
 			 struct ib_udata *udata);
@@ -44,15 +44,6 @@ int tbv_create_cq_impl(struct ib_cq *cq, const struct ib_cq_init_attr *attr,
 int tbv_destroy_cq_impl(struct ib_cq *cq, struct ib_udata *udata);
 int tbv_poll_cq_impl(struct ib_cq *cq, int num_entries, struct ib_wc *wc);
 int tbv_req_notify_cq_impl(struct ib_cq *cq, enum ib_cq_notify_flags flags);
-
-struct ib_mr *tbv_get_dma_mr_impl(struct ib_pd *pd, int access);
-struct ib_mr *tbv_reg_user_mr_impl(struct ib_pd *pd, u64 start, u64 length,
-				u64 virt_addr, int access,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
-				struct ib_dmah *dmah,
-#endif
-				struct ib_udata *udata);
-int tbv_dereg_mr_impl(struct ib_mr *ibmr, struct ib_udata *udata);
 
 int tbv_create_qp_impl(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 			struct ib_udata *udata);
