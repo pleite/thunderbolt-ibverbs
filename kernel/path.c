@@ -278,6 +278,11 @@ static void tbv_path_queue_delayed_work(struct tbv_path *path,
 {
 	struct tbv_state *state = tbv_path_state(path);
 
+	/*
+	 * Path work is lifecycle-bound to state->workqueue. Dropping queue
+	 * requests once teardown has started avoids scheduling delayed work onto
+	 * global workqueues after module-unload paths.
+	 */
 	if (!state || !state->workqueue)
 		return;
 
@@ -2577,6 +2582,10 @@ void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd)
 		if (path->tx_ring)
 			tb_ring_stop(path->tx_ring);
 		path->state = TBV_PATH_RING_ALLOCATED;
+		/*
+		 * tb_ring_stop() drains callbacks and can race a just-finished
+		 * poll worker that re-arms itself before observing stop state.
+		 */
 		cancel_delayed_work_sync(&path->tx_poll_work);
 		cancel_delayed_work_sync(&path->rx_supp_poll_work);
 	}
