@@ -98,6 +98,9 @@ tbv_vllm_smoke.sh \
   `next` branch with the local kernel patches applied.
 - Debian, Fedora, Arch, and Nix builds are exercised in CI.
 
+For the big-picture plan of where the project is headed — and the issue /
+feature / PR workflow for each step — see [docs/ROADMAP.md](docs/ROADMAP.md).
+
 ## License
 
 The kernel module is licensed under GPL-2.0-only, matching the SPDX tags in the
