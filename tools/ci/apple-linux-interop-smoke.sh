@@ -106,7 +106,7 @@ if [[ ! -f "$ko" ]]; then
 	printf '==> Kernel module not found at %s; attempting build\n' "$ko"
 	kver="$(uname -r)"
 	make -C "$repo_root" KVER="$kver" KDIR="/lib/modules/$kver/build" \
-		modules 2>&1 | tail -n 5
+		KCFLAGS="-Werror" modules 2>&1 | tail -n 5
 fi
 
 [[ -f "$ko" ]] || die "thunderbolt_ibverbs.ko not found; run 'make modules' first"

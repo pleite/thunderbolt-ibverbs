@@ -93,6 +93,87 @@ static int test_lost_middle_fragment_retry_exactly_once(void)
 	return 0;
 }
 
+static int test_lost_ack_replayed_after_retry(void)
+{
+	struct tbv_rel_tx_op tx;
+	struct tbv_rel_rx_op rx;
+	struct tbv_rel_data_frame frame;
+	struct tbv_rel_data_frame retry;
+	struct tbv_rel_rx_event event;
+	struct tbv_rel_completion comp;
+
+	CHECK(tbv_rel_tx_start(&tx, 0x2323, 11, TBV_REL_OP_SEND, 8, 16, 1, 0) ==
+	      0);
+	tbv_rel_rx_init(&rx, 0x2323, 16);
+
+	CHECK(tbv_rel_tx_next_frame(&tx, &frame) == 0);
+	CHECK(tbv_rel_rx_on_data(&rx, &frame, true, &event) == 0);
+	CHECK(event.ack_valid && event.completion_valid);
+	CHECK(event.ack.status == TBV_REL_ACK_OK);
+	CHECK(tx.state == TBV_REL_TX_IN_FLIGHT);
+	CHECK(tx.completion_count == 0);
+
+	CHECK(tbv_rel_tx_on_timeout(&tx, &comp) == 0);
+	CHECK(!comp.valid);
+	CHECK(tx.retry_generation == 1);
+	CHECK(tx.state == TBV_REL_TX_IN_FLIGHT);
+
+	CHECK(tbv_rel_tx_next_frame(&tx, &retry) == 0);
+	CHECK(retry.retry_generation == 1);
+	CHECK(tbv_rel_rx_on_data(&rx, &retry, true, &event) == 0);
+	CHECK(event.duplicate && event.ack_valid);
+	CHECK(!event.completion_valid);
+	CHECK(event.ack.status == TBV_REL_ACK_OK);
+
+	CHECK(tbv_rel_tx_on_ack(&tx, &event.ack, &comp) == 0);
+	CHECK(comp.valid && comp.status == TBV_REL_COMP_OK);
+	CHECK(tx.state == TBV_REL_TX_COMPLETE);
+	CHECK(tx.completion_count == 1);
+	CHECK(rx.completion_count == 1);
+
+	return 0;
+}
+
+static int test_lost_credit_frame_retries_until_recv_ready(void)
+{
+	struct tbv_rel_tx_op tx;
+	struct tbv_rel_rx_op rx;
+	struct tbv_rel_data_frame frame;
+	struct tbv_rel_rx_event event;
+	struct tbv_rel_completion comp;
+
+	CHECK(tbv_rel_tx_start(&tx, 0x2424, 12, TBV_REL_OP_SEND, 8, 16, 2, 2) ==
+	      0);
+	tbv_rel_rx_init(&rx, 0x2424, 16);
+
+	CHECK(tbv_rel_tx_next_frame(&tx, &frame) == 0);
+	CHECK(tbv_rel_rx_on_data(&rx, &frame, false, &event) == 0);
+	CHECK(event.rnr && event.ack_valid);
+	CHECK(event.ack.status == TBV_REL_ACK_RNR);
+
+	CHECK(tbv_rel_tx_on_timeout(&tx, &comp) == 0);
+	CHECK(!comp.valid);
+	CHECK(tx.retry_generation == 1);
+
+	CHECK(tbv_rel_tx_next_frame(&tx, &frame) == 0);
+	CHECK(tbv_rel_rx_on_data(&rx, &frame, false, &event) == 0);
+	CHECK(event.rnr && event.ack_valid);
+	CHECK(tbv_rel_tx_on_ack(&tx, &event.ack, &comp) == 0);
+	CHECK(!comp.valid);
+	CHECK(tx.state == TBV_REL_TX_READY);
+
+	CHECK(tbv_rel_tx_next_frame(&tx, &frame) == 0);
+	CHECK(tbv_rel_rx_on_data(&rx, &frame, true, &event) == 0);
+	CHECK(event.ack_valid && event.completion_valid);
+	CHECK(event.ack.status == TBV_REL_ACK_OK);
+	CHECK(tbv_rel_tx_on_ack(&tx, &event.ack, &comp) == 0);
+	CHECK(comp.valid && comp.status == TBV_REL_COMP_OK);
+	CHECK(tx.completion_count == 1);
+	CHECK(rx.completion_count == 1);
+
+	return 0;
+}
+
 static int test_stale_connection_id_ignored(void)
 {
 	struct tbv_rel_rx_op rx;
@@ -188,6 +269,79 @@ static int test_old_completed_op_retransmit_replays_ack(void)
 	CHECK(event.ack.op_id == 5);
 	CHECK(!event.completion_valid);
 	CHECK(rx.completion_count == 2);
+
+	return 0;
+}
+
+static int test_duplicate_retry_does_not_duplicate_completion(void)
+{
+	struct tbv_rel_tx_op tx;
+	struct tbv_rel_rx_op rx;
+	struct tbv_rel_data_frame first[2];
+	struct tbv_rel_data_frame retry[2];
+	struct tbv_rel_rx_event event;
+	struct tbv_rel_completion comp;
+
+	CHECK(tbv_rel_tx_start(&tx, 0x5858, 13, TBV_REL_OP_SEND, 32, 16, 2, 0) ==
+	      0);
+	tbv_rel_rx_init(&rx, 0x5858, 16);
+
+	CHECK(send_all(&tx, first, 2) == 0);
+	CHECK(tbv_rel_rx_on_data(&rx, &first[0], true, &event) == 0);
+	CHECK(!event.ack_valid && !event.completion_valid);
+	CHECK(tbv_rel_tx_on_timeout(&tx, &comp) == 0);
+	CHECK(!comp.valid);
+
+	CHECK(send_all(&tx, retry, 2) == 0);
+	/* Deliver the same retried fragment twice to model a duplicated retry. */
+	CHECK(tbv_rel_rx_on_data(&rx, &retry[0], true, &event) == 0);
+	CHECK(tbv_rel_rx_on_data(&rx, &retry[0], true, &event) == 0);
+	CHECK(event.duplicate && !event.completion_valid);
+	CHECK(tbv_rel_rx_on_data(&rx, &retry[1], true, &event) == 0);
+	CHECK(event.ack_valid && event.completion_valid);
+	CHECK(event.ack.status == TBV_REL_ACK_OK);
+	CHECK(rx.completion_count == 1);
+
+	CHECK(tbv_rel_tx_on_ack(&tx, &event.ack, &comp) == 0);
+	CHECK(comp.valid && comp.status == TBV_REL_COMP_OK);
+	CHECK(tx.completion_count == 1);
+
+	CHECK(tbv_rel_rx_on_data(&rx, &retry[1], true, &event) == 0);
+	CHECK(event.duplicate && event.ack_valid);
+	CHECK(!event.completion_valid);
+	CHECK(rx.completion_count == 1);
+
+	return 0;
+}
+
+static int test_rnr_exhaustion_completes_once(void)
+{
+	struct tbv_rel_tx_op tx;
+	struct tbv_rel_ack_frame ack = {
+		.conn_id = 0x6767,
+		.op_id = 14,
+		.status = TBV_REL_ACK_RNR,
+	};
+	struct tbv_rel_completion comp;
+
+	CHECK(tbv_rel_tx_start(&tx, ack.conn_id, ack.op_id, TBV_REL_OP_SEND, 8,
+			       16, 1, 1) == 0);
+
+	CHECK(tbv_rel_tx_on_ack(&tx, &ack, &comp) == 0);
+	CHECK(!comp.valid);
+	CHECK(tx.state == TBV_REL_TX_READY);
+	CHECK(tx.rnr_budget == 0);
+	CHECK(tx.completion_count == 0);
+
+	CHECK(tbv_rel_tx_on_ack(&tx, &ack, &comp) == 0);
+	CHECK(comp.valid);
+	CHECK(comp.status == TBV_REL_COMP_RNR_RETRY_EXHAUSTED);
+	CHECK(tx.state == TBV_REL_TX_FAILED);
+	CHECK(tx.completion_count == 1);
+
+	CHECK(tbv_rel_tx_on_ack(&tx, &ack, &comp) == 0);
+	CHECK(!comp.valid);
+	CHECK(tx.completion_count == 1);
 
 	return 0;
 }
@@ -481,6 +635,43 @@ static int read_resp_test_deliver(struct read_resp_test_rx *rx,
 	return 0;
 }
 
+static int test_read_response_lost_data_retries_to_completion(void)
+{
+	struct tbv_rel_tx_op tx;
+	struct tbv_rel_rx_op rx;
+	struct tbv_rel_data_frame first[3];
+	struct tbv_rel_data_frame retry[3];
+	struct tbv_rel_rx_event event;
+	struct tbv_rel_completion comp;
+
+	CHECK(tbv_rel_tx_start(&tx, 0x6868, 15, TBV_REL_OP_RDMA_READ_RESP, 48, 16,
+			       2, 0) == 0);
+	tbv_rel_rx_init(&rx, 0x6868, 16);
+
+	CHECK(send_all(&tx, first, 3) == 0);
+	CHECK(tbv_rel_rx_on_data(&rx, &first[0], true, &event) == 0);
+	CHECK(!event.ack_valid && !event.completion_valid);
+	CHECK(tbv_rel_rx_on_data(&rx, &first[2], true, &event) == 0);
+	CHECK(!event.ack_valid && !event.completion_valid);
+
+	CHECK(tbv_rel_tx_on_timeout(&tx, &comp) == 0);
+	CHECK(!comp.valid);
+	CHECK(send_all(&tx, retry, 3) == 0);
+
+	CHECK(tbv_rel_rx_on_data(&rx, &retry[1], true, &event) == 0);
+	CHECK(event.ack_valid && event.completion_valid);
+	CHECK(event.completion.op_id == tx.op_id);
+	CHECK(event.ack.status == TBV_REL_ACK_OK);
+	CHECK(rx.completion_count == 1);
+
+	CHECK(tbv_rel_tx_on_ack(&tx, &event.ack, &comp) == 0);
+	CHECK(comp.valid && comp.status == TBV_REL_COMP_OK);
+	CHECK(tx.state == TBV_REL_TX_COMPLETE);
+	CHECK(tx.completion_count == 1);
+
+	return 0;
+}
+
 static int test_read_response_retry_uses_stable_snapshot(void)
 {
 	unsigned char live[READ_RESP_TEST_TOTAL];
@@ -645,13 +836,39 @@ static int test_generated_loss_duplicate_reorder_schedules(void)
 	return 0;
 }
 
+static int test_teardown_while_in_flight_flushes_pending_ops(void)
+{
+	struct tbv_rel_order_queue q;
+	struct tbv_rel_completion out[2] = {};
+	tbv_rel_u32 drained;
+
+	CHECK(tbv_rel_order_init(&q, 4) == 0);
+	CHECK(tbv_rel_order_push(&q, 40) == 0);
+	CHECK(tbv_rel_order_push(&q, 41) == 0);
+
+	CHECK(tbv_rel_order_mark(&q, 40, TBV_REL_COMP_OK) == 0);
+	CHECK(tbv_rel_order_flush(&q, TBV_REL_COMP_FLUSHED) == 0);
+	CHECK(tbv_rel_order_drain(&q, out, 2, &drained) == 0);
+	CHECK(drained == 2);
+	CHECK(out[0].valid && out[0].op_id == 40 &&
+	      out[0].status == TBV_REL_COMP_OK);
+	CHECK(out[1].valid && out[1].op_id == 41 &&
+	      out[1].status == TBV_REL_COMP_FLUSHED);
+
+	return 0;
+}
+
 int main(void)
 {
 	CHECK(test_no_success_before_ack() == 0);
 	CHECK(test_lost_middle_fragment_retry_exactly_once() == 0);
+	CHECK(test_lost_ack_replayed_after_retry() == 0);
+	CHECK(test_lost_credit_frame_retries_until_recv_ready() == 0);
 	CHECK(test_stale_connection_id_ignored() == 0);
 	CHECK(test_rnr_is_not_success() == 0);
+	CHECK(test_duplicate_retry_does_not_duplicate_completion() == 0);
 	CHECK(test_old_completed_op_retransmit_replays_ack() == 0);
+	CHECK(test_rnr_exhaustion_completes_once() == 0);
 	CHECK(test_verbs_rnr_retry_7_is_infinite() == 0);
 	CHECK(test_wrap_safe_sequence_helpers() == 0);
 	CHECK(test_retry_interval_uses_retry_budget() == 0);
@@ -660,7 +877,9 @@ int main(void)
 	CHECK(test_ordered_terminal_failure_does_not_overtake() == 0);
 	CHECK(test_ordered_rnr_exhaustion_waits_for_prior_wr() == 0);
 	CHECK(test_ordered_completion_ring_wrap() == 0);
+	CHECK(test_read_response_lost_data_retries_to_completion() == 0);
 	CHECK(test_read_response_retry_uses_stable_snapshot() == 0);
+	CHECK(test_teardown_while_in_flight_flushes_pending_ops() == 0);
 	CHECK(test_generated_loss_duplicate_reorder_schedules() == 0);
 
 	puts("reliability smoke OK");

@@ -7,6 +7,17 @@
 #include "../proto/native_wire.h"
 #include "tbv.h"
 
+#if !TBV_DEBUG_SURFACES_COMPILED
+int tbv_debugfs_init(struct tbv_state *state)
+{
+	return 0;
+}
+
+void tbv_debugfs_exit(struct tbv_state *state)
+{
+}
+#else
+
 static u32 tbv_debugfs_wire_path_flags(const struct tbv_path *path)
 {
 	u32 flags = 0;
@@ -43,14 +54,6 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 	mutex_lock(&state->tbnet_identity.lock);
 	seq_printf(s, "tbnet_identity_state: 0x%lx\n",
 		   state->tbnet_identity.state);
-	seq_printf(s, "tbnet_identity_tbnet: %s\n",
-		   state->tbnet_identity.tbnet_netdev_name[0] ?
-		   state->tbnet_identity.tbnet_netdev_name : "<unset>");
-	seq_printf(s, "tbnet_identity_gid: %s\n",
-		   state->tbnet_identity.gid_netdev_name[0] ?
-		   state->tbnet_identity.gid_netdev_name : "<unset>");
-	seq_printf(s, "tbnet_identity_proxy_ipv4: %pI4\n",
-		   &state->tbnet_identity.proxy_ipv4);
 	seq_printf(s, "tbnet_identity_minimal_e2e: %u\n",
 		   state->tbnet_identity.minimal_e2e);
 	seq_printf(s, "tbnet_identity_minimal_apple_only: %u\n",
@@ -494,17 +497,22 @@ DEFINE_SHOW_ATTRIBUTE(tbv_debugfs_configured_links);
 
 int tbv_debugfs_init(struct tbv_state *state)
 {
+	if (!tbv_debug_surfaces_enabled()) {
+		pr_debug("debugfs surfaces disabled\n");
+		return 0;
+	}
+
 	state->debugfs_dir = debugfs_create_dir(TBV_DRV_NAME, NULL);
 	if (IS_ERR(state->debugfs_dir)) {
 		state->debugfs_dir = NULL;
 		return 0;
 	}
 
-	debugfs_create_file("summary", 0444, state->debugfs_dir, state,
+	debugfs_create_file("summary", 0400, state->debugfs_dir, state,
 			    &tbv_debugfs_summary_fops);
-	debugfs_create_file("peers", 0444, state->debugfs_dir, state,
+	debugfs_create_file("peers", 0400, state->debugfs_dir, state,
 			    &tbv_debugfs_peers_fops);
-	debugfs_create_file("configured_links", 0444, state->debugfs_dir,
+	debugfs_create_file("configured_links", 0400, state->debugfs_dir,
 			    state, &tbv_debugfs_configured_links_fops);
 	return 0;
 }
@@ -514,3 +522,5 @@ void tbv_debugfs_exit(struct tbv_state *state)
 	debugfs_remove_recursive(state->debugfs_dir);
 	state->debugfs_dir = NULL;
 }
+
+#endif
