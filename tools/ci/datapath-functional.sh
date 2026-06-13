@@ -11,6 +11,12 @@ client_ip="198.18.0.2"
 provider_type=""
 server_dev=""
 client_dev=""
+tmp_dir=""
+timeout_seconds="${TBV_CI_TIMEOUT_SECONDS:-60}"
+server_startup_delay="${TBV_CI_SERVER_STARTUP_DELAY:-2}"
+perftest_duration_seconds="${TBV_CI_PERFTEST_DURATION_SECONDS:-3}"
+# Matches sysfs counter file paths whose basenames contain error-like keywords.
+error_counter_regex="${TBV_CI_ERROR_COUNTER_REGEX:-.*/[^/]*(err|error|drop|discard|retry|timeout|fail|bad|invalid)[^/]*$}"
 
 usage() {
 	cat <<'EOF'
@@ -33,12 +39,20 @@ die() {
 cleanup() {
 	ip netns del "$ns_server" >/dev/null 2>&1 || true
 	ip netns del "$ns_client" >/dev/null 2>&1 || true
+	if [[ -n "$tmp_dir" && -d "$tmp_dir" ]]; then
+		rm -rf "$tmp_dir"
+	fi
 }
 trap cleanup EXIT
 
 require_root() {
 	if [[ "$(id -u)" -ne 0 ]]; then
-		exec sudo -E bash "$0" "$@"
+		exec sudo \
+			TBV_CI_TIMEOUT_SECONDS="${TBV_CI_TIMEOUT_SECONDS:-}" \
+			TBV_CI_SERVER_STARTUP_DELAY="${TBV_CI_SERVER_STARTUP_DELAY:-}" \
+			TBV_CI_PERFTEST_DURATION_SECONDS="${TBV_CI_PERFTEST_DURATION_SECONDS:-}" \
+			TBV_CI_ERROR_COUNTER_REGEX="${TBV_CI_ERROR_COUNTER_REGEX:-}" \
+			bash "$0" "$@"
 	fi
 }
 
@@ -46,7 +60,7 @@ have_counter_files() {
 	local dev="$1"
 	find "/sys/class/infiniband/$dev/ports/1/counters" -maxdepth 1 -type f \
 		-regextype posix-extended \
-		-regex '.*/(.*err.*|.*error.*|.*drop.*|.*discard.*|.*retry.*|.*timeout.*|.*fail.*|.*bad.*|.*invalid.*)' \
+		-regex "$error_counter_regex" \
 		-print 2>/dev/null | sort
 }
 
@@ -60,8 +74,11 @@ snapshot_error_counters() {
 	for dev in "$server_dev" "$client_dev"; do
 		while IFS= read -r file; do
 			key="$(basename "$file")"
-			value="$(cat "$file" 2>/dev/null || printf '0')"
-			if [[ ! "$value" =~ ^-?[0-9]+$ ]]; then
+			if ! value="$(<"$file" 2>/dev/null)"; then
+				printf 'WARN: failed reading counter file: %s\n' "$file" >&2
+				value=0
+			fi
+			if [[ ! "$value" =~ ^[0-9]+$ ]]; then
 				value=0
 			fi
 			printf '%s:%s=%s\n' "$dev" "$key" "$value" >>"$out"
@@ -82,6 +99,8 @@ assert_counter_deltas_zero() {
 	while IFS='=' read -r key before_value; do
 		after_value="$(awk -F= -v lookup="$key" '$1 == lookup { print $2; exit }' "$after")"
 		after_value="${after_value:-$before_value}"
+		[[ "$before_value" =~ ^[0-9]+$ ]] || before_value=0
+		[[ "$after_value" =~ ^[0-9]+$ ]] || after_value=0
 		delta=$((after_value - before_value))
 		if ((delta != 0)); then
 			printf 'ERROR: counter moved: %s delta=%+d (before=%s after=%s)\n' \
@@ -136,26 +155,59 @@ run_pair() {
 	local tool="$2"
 	shift 2
 	local -a common_args=("$@")
+	local base="${tool##*/}"
+	local server_log="$tmp_dir/${base}.server.log"
+	local client_log="$tmp_dir/${base}.client.log"
 
 	printf '==> %s\n' "$title"
-	timeout 60 ip netns exec "$ns_server" \
-		"$tool" "${common_args[@]}" -d "$server_dev" >/tmp/tbv-ci-server.log 2>&1 &
+	timeout "$timeout_seconds" ip netns exec "$ns_server" \
+		"$tool" "${common_args[@]}" -d "$server_dev" >"$server_log" 2>&1 &
 	local server_pid="$!"
-	sleep 2
-	timeout 60 ip netns exec "$ns_client" \
-		"$tool" "${common_args[@]}" -d "$client_dev" "$server_ip" >/tmp/tbv-ci-client.log 2>&1
-	wait "$server_pid"
+	sleep "$server_startup_delay"
+	if ! kill -0 "$server_pid" >/dev/null 2>&1; then
+		wait "$server_pid" || true
+		cat "$server_log" >&2 || true
+		die "$title server failed before client started"
+	fi
+
+	local client_status=0
+	local server_status=0
+	timeout "$timeout_seconds" ip netns exec "$ns_client" \
+		"$tool" "${common_args[@]}" -d "$client_dev" "$server_ip" >"$client_log" 2>&1 || client_status=$?
+	wait "$server_pid" || server_status=$?
+
+	if ((client_status != 0 || server_status != 0)); then
+		cat "$server_log" >&2 || true
+		cat "$client_log" >&2 || true
+		die "$title failed (server=$server_status client=$client_status)"
+	fi
 }
 
 run_rping_validate() {
+	local server_log="$tmp_dir/rping.server.log"
+	local client_log="$tmp_dir/rping.client.log"
 	printf '==> rping bit-verify\n'
-	timeout 60 ip netns exec "$ns_server" \
-		rping -s -a "$server_ip" -C 64 -S 4096 -v -V >/tmp/tbv-ci-rping-server.log 2>&1 &
+	timeout "$timeout_seconds" ip netns exec "$ns_server" \
+		rping -s -a "$server_ip" -C 64 -S 4096 -v -V >"$server_log" 2>&1 &
 	local server_pid="$!"
-	sleep 2
-	timeout 60 ip netns exec "$ns_client" \
-		rping -c -a "$server_ip" -C 64 -S 4096 -v -V >/tmp/tbv-ci-rping-client.log 2>&1
-	wait "$server_pid"
+	sleep "$server_startup_delay"
+	if ! kill -0 "$server_pid" >/dev/null 2>&1; then
+		wait "$server_pid" || true
+		cat "$server_log" >&2 || true
+		die "rping server failed before client started"
+	fi
+
+	local client_status=0
+	local server_status=0
+	timeout "$timeout_seconds" ip netns exec "$ns_client" \
+		rping -c -a "$server_ip" -C 64 -S 4096 -v -V >"$client_log" 2>&1 || client_status=$?
+	wait "$server_pid" || server_status=$?
+
+	if ((client_status != 0 || server_status != 0)); then
+		cat "$server_log" >&2 || true
+		cat "$client_log" >&2 || true
+		die "rping bit-verify failed (server=$server_status client=$client_status)"
+	fi
 }
 
 main() {
@@ -177,15 +229,15 @@ main() {
 	setup_rdma_backend
 	printf '==> backend: %s (%s,%s)\n' "$provider_type" "$server_dev" "$client_dev"
 
-	local before
-	local after
-	before="$(mktemp)"
-	after="$(mktemp)"
+	tmp_dir="$(mktemp -d)"
+	local before="$tmp_dir/counters.before"
+	local after="$tmp_dir/counters.after"
+	local -a perftest_common_args=(-R -F --report_gbits -D "$perftest_duration_seconds")
 	snapshot_error_counters "$before"
-	[[ -s "$before" ]] || die "no RDMA error counters found for $server_dev/$client_dev"
+	[[ -s "$before" ]] || die "no RDMA error counters found for $server_dev/$client_dev (check sysfs counters and TBV_CI_ERROR_COUNTER_REGEX)"
 
-	run_pair "ib_write_bw" ib_write_bw -R -F --report_gbits -D 3
-	run_pair "ib_send_bw" ib_send_bw -R -F --report_gbits -D 3
+	run_pair "ib_write_bw" ib_write_bw "${perftest_common_args[@]}"
+	run_pair "ib_send_bw" ib_send_bw "${perftest_common_args[@]}"
 	run_rping_validate
 
 	snapshot_error_counters "$after"
