@@ -12,9 +12,9 @@ and releasing cleanly is ongoing maintenance.
 - Tighten the release-artefact workflow.
 
 ### Acceptance criteria
-- [ ] A release produces working DKMS and provider packages for every supported
+- [x] A release produces working DKMS and provider packages for every supported
       distro from one workflow.
-- [ ] Validated by an install smoke.
+- [x] Validated by an install smoke.
 
 ### Labels
 `packaging`, `ci`, `release`
