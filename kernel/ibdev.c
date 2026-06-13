@@ -2830,6 +2830,8 @@ static void tbv_qp_release_apple_tunnel(struct tbv_qp *tqp)
 	struct tbv_state *state;
 	u32 refs = 0;
 	u64 route = 0;
+	bool disable = false;
+	int disable_ret = 0;
 
 	if (!tbv_qp_uses_apple_transport(tqp))
 		return;
@@ -2854,17 +2856,17 @@ static void tbv_qp_release_apple_tunnel(struct tbv_qp *tqp)
 		}
 		refs = rail->apple_tunnel_qps;
 		route = peer->xd->route;
+		disable = !refs && !rail->removing &&
+			  rail->path.state == TBV_PATH_TUNNEL_ENABLED;
 	}
 	mutex_unlock(&state->lock);
-	/*
-	 * Apple FA57 frames carry no connection incarnation, and local TX
-	 * completion does not prove the peer has consumed every frame. Treat the
-	 * enabled tunnel as a published rail resource; disabling it at last-QP
-	 * close can cut the peer's receive in the middle of a WQE. Rail teardown
-	 * still disables the tunnel through tbv_path_destroy().
-	 */
-	if (!refs)
-		pr_debug("Apple data tunnel left enabled after last QP route=0x%llx qpn=%u\n",
+	if (disable)
+		disable_ret = tbv_path_disable_tunnel(&rail->path, peer->xd);
+	if (disable_ret)
+		pr_warn_ratelimited("Apple data tunnel disable failed route=0x%llx qpn=%u ret=%d\n",
+				    route, tqp->base.qp_num, disable_ret);
+	else if (disable)
+		pr_debug("Apple data tunnel disabled route=0x%llx qpn=%u\n",
 			 route, tqp->base.qp_num);
 	mutex_unlock(&peer->control_lock);
 
@@ -9579,6 +9581,43 @@ int tbv_ibdev_rail_event(struct tbv_state *state, struct tbv_rail *rail,
 	rail->ibdev = dev;
 	mutex_unlock(&state->rail_register_lock);
 	return 0;
+}
+
+void tbv_ibdev_flush_rail_qps(struct tbv_state *state, struct tbv_rail *rail)
+{
+	unsigned long qpn = 0;
+	u32 flushed = 0;
+
+	if (!state || !rail)
+		return;
+
+	for (;;) {
+		struct tbv_qp *tqp = NULL;
+		XA_STATE(xas, &state->verbs_qps_xa, qpn);
+		unsigned long flags;
+		bool found = false;
+
+		xas_lock_irqsave(&xas, flags);
+		xas_for_each(&xas, tqp, ULONG_MAX) {
+			qpn = xas.xa_index + 1;
+			if (tqp->rail != rail || tqp->closing ||
+			    !refcount_inc_not_zero(&tqp->refs))
+				continue;
+			found = true;
+			break;
+		}
+		xas_unlock_irqrestore(&xas, flags);
+		if (!found)
+			break;
+
+		tbv_qp_queue_error(tqp);
+		tbv_qp_put(tqp);
+		flushed++;
+	}
+
+	if (flushed)
+		pr_info("queued flush/error for %u QPs on removing rail peer=%u rail=%u\n",
+			flushed, rail->peer->peer_id, rail->rail_id);
 }
 
 static bool tbv_ibdev_required_netdev_registered(struct tbv_state *state,
