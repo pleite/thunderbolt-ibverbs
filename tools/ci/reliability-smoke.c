@@ -391,10 +391,22 @@ static int test_wrap_safe_sequence_helpers(void)
 
 static int test_retry_interval_uses_retry_budget(void)
 {
-	CHECK(tbv_rel_retry_interval(0, 7) == 0);
-	CHECK(tbv_rel_retry_interval(5000, 0) == 5000);
-	CHECK(tbv_rel_retry_interval(5000, 7) == 5000);
-	CHECK(tbv_rel_retry_interval(5, 7) == 5);
+	tbv_rel_u64 previous_interval = 0;
+	tbv_rel_u32 retry;
+
+	CHECK(tbv_rel_retry_interval(0, 0) == 0);
+	for (retry = 0; retry < 6; retry++) {
+		tbv_rel_u64 base = 5000ull << retry;
+		tbv_rel_u64 interval = tbv_rel_retry_interval(5000, retry);
+		tbv_rel_u64 min = (base * 875u) / 1000u;
+		tbv_rel_u64 max = (base * 1125u) / 1000u;
+
+		CHECK(interval >= min);
+		CHECK(interval <= max);
+		if (retry)
+			CHECK(interval > previous_interval);
+		previous_interval = interval;
+	}
 
 	return 0;
 }

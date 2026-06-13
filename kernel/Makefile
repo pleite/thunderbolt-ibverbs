@@ -12,6 +12,21 @@ thunderbolt_ibverbs-y := main.o profile.o backend.o configfs.o core.o debugfs.o 
 
 ccflags-y := -Wall -Wextra -Wno-unused-parameter -I$(src) -I$(src)/.. -DTBV_DEBUG_SURFACES_COMPILED=$(tbv_debug_surfaces)
 
+# Feature detection: ib_dmah parameter added to reg_user_mr in Linux 6.13.
+# On Debian/Ubuntu the rdma headers live in a *-common sibling of KDIR
+# (e.g. linux-headers-7.0.12+deb14.1-common) rather than in the arch-specific
+# tree that KDIR points to.  Probe both locations so detection works on
+# monolithic and split-header distros alike.
+_tbv_kdir_real   := $(realpath $(KDIR))
+_tbv_kdir_common := $(firstword $(wildcard $(dir $(_tbv_kdir_real))*-common))
+_tbv_ib_verbs_h  := $(firstword $(wildcard \
+    $(KDIR)/include/rdma/ib_verbs.h \
+    $(_tbv_kdir_common)/include/rdma/ib_verbs.h))
+ifneq ($(shell test -n "$(_tbv_ib_verbs_h)" && \
+    grep -q 'struct ib_dmah' "$(_tbv_ib_verbs_h)" 2>/dev/null && echo yes),)
+    ccflags-y += -DTBV_KERNEL_HAS_IB_DMAH
+endif
+
 .PHONY: all clean modules modules_install help
 
 all: modules
