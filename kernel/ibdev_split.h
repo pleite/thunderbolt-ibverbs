@@ -35,10 +35,6 @@ int tbv_post_send(struct ib_qp *qp, const struct ib_send_wr *wr,
 int tbv_post_recv(struct ib_qp *qp, const struct ib_recv_wr *wr,
 		  const struct ib_recv_wr **bad_wr);
 
-struct ib_qp_init_attr;
-struct ib_qp_attr;
-struct ib_cq_init_attr;
-struct uverbs_attr_bundle;
 struct tbv_state;
 struct tbv_path;
 struct tbv_native_data_header;
