@@ -131,10 +131,28 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         run: nix build --no-link .#rdma-core-usb4
 
+  datapath-functional:
+    name: datapath functional
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install datapath test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            iproute2 \
+            perftest \
+            rdmacm-utils \
+            rdma-core
+
+      - name: Run virtual two-node data-path test
+        run: sudo bash tools/ci/datapath-functional.sh
+
   release:
     name: Publish GitHub Release
     if: ${{ startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || inputs.publish) }}
-    needs: [build, nix]
+    needs: [build, nix, datapath-functional]
     runs-on: ubuntu-latest
     permissions:
       contents: write
