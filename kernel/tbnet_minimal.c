@@ -33,6 +33,7 @@
 #include <net/net_namespace.h>
 
 #include "tbv.h"
+#include "tbv_compat.h"
 #include "proto/tbnet.h"
 
 #define TBV_TBNET_MIN_LOGIN_DELAY_MS	4500
@@ -197,7 +198,8 @@ static u32 tbv_tbnet_minimal_frame_len(const struct ring_frame *frame)
 
 static void tbv_tbnet_minimal_generate_mac(struct tbv_tbnet_minimal_session *s)
 {
-	u8 phy_port = tb_phy_port_from_link(TBV_TBNET_L0_PORT_NUM(s->xd->route));
+	u8 phy_port =
+		tbv_compat_phy_port_from_link(TBV_TBNET_L0_PORT_NUM(s->xd->route));
 	u32 hash;
 
 	s->mac[0] = (phy_port << 4) | 0x02;
