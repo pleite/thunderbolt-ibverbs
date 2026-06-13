@@ -95,10 +95,10 @@ const char *tbv_ibdev_roce_netdev_name(void)
 	return roce_netdev;
 }
 
-static uint zcopy_min_bytes;
+static uint zcopy_min_bytes = SZ_4K;
 module_param(zcopy_min_bytes, uint, 0644);
 MODULE_PARM_DESC(zcopy_min_bytes,
-		 "Minimum native bytes before raw zero-copy streaming is requested; retryable native RC WRITE falls back to framed copies");
+		 "Minimum native bytes before raw zero-copy streaming is requested; retryable native RC WRITE falls back to framed copies; 0 disables zero-copy; default 4096 (tuning sweep: bench/results/strix-2p-noiommu-2x40g/tuning.md)");
 
 static uint qp_timeout_ms = TBV_QP_TIMEOUT_DEFAULT_MS;
 module_param(qp_timeout_ms, uint, 0644);
