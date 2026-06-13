@@ -200,7 +200,7 @@ To complete the interop exchange, run on the Apple side:
   MAC_TB_RDMA_PROBE_RTR=1 MAC_TB_RDMA_PROBE_SEND=1 \\
     mac_tb_rdma_probe rdma_en1 ${peer_ip} <linux-qpn> 7
 
-Replace <linux-qpn> with the QPN shown above by rdma link show / u4_pingpong.
+Replace <linux-qpn> with the QPN from your 'rdma link show' or 'u4_pingpong' output on the Linux host.
 EOF
 else
 	printf '==> No Apple peer IP set; skipping live device check\n'

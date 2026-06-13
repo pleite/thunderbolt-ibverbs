@@ -92,8 +92,10 @@ static int test_apple_accepts_roce_v1_gid(void)
 	 * own validate_config hook; the apple hook does not repeat that check.
 	 */
 	struct tbv_id_gid gids[] = {
+		/* device_id=4, port=1, gid_index=0, addr=10.0.4.2 */
 		mk_gid(4, 1, 0, TBV_ID_GID_ROCE_V1, 10, 0, 4, 2),
 	};
+	/* peer at 10.0.5.2, local source 10.0.4.2 (matches GID addr above) */
 	struct tbv_id_route route = mk_route(10, 0, 5, 2, 10, 0, 4, 2);
 	struct tbv_id_nccl_policy nccl;
 	struct tbv_cfg_link link;
