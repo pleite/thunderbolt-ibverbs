@@ -9237,7 +9237,6 @@ static int tbv_mr_publish(struct tbv_mr *mr, struct ib_pd *pd)
 	unsigned long flags;
 	u32 lkey = 0, rkey = 0;
 	int ret;
-	int attempt;
 
 	mr->base.device = pd->device;
 	mr->base.pd = pd;
@@ -9246,25 +9245,16 @@ static int tbv_mr_publish(struct tbv_mr *mr, struct ib_pd *pd)
 	refcount_set(&mr->refs, 1);
 	INIT_WORK(&mr->free_work, tbv_mr_free_work);
 
-	for (attempt = 0; attempt < TBV_MR_KEY_ALLOC_MAX_ATTEMPTS; attempt++) {
-		/* Key 0 is reserved/invalid for verbs MR lookup in this driver. */
-		do {
-			key = get_random_u32();
-		} while (!key);
-		mr->base.lkey = key;
-		mr->base.rkey = key;
-
-		xa_lock_irqsave(&owner->verbs_mrs_xa, flags);
-		ret = __xa_insert(&owner->verbs_mrs_xa, key, mr, GFP_KERNEL);
-		xa_unlock_irqrestore(&owner->verbs_mrs_xa, flags);
-		if (!ret)
-			break;
-		if (ret != -EBUSY)
-			return ret;
+	xa_lock_irqsave(&owner->verbs_mrs_xa, flags);
+	ret = tbv_mr_insert_random_key(owner, mr, &lkey);
+	if (!ret) {
+		ret = tbv_mr_insert_random_key(owner, mr, &rkey);
+		if (ret)
+			__xa_erase(&owner->verbs_mrs_xa, lkey);
 	}
-	if (ret == -EBUSY)
-		pr_warn_ratelimited("failed to allocate unique MR key after %u attempts\n",
-				    TBV_MR_KEY_ALLOC_MAX_ATTEMPTS);
+	xa_unlock_irqrestore(&owner->verbs_mrs_xa, flags);
+	if (ret == -ENOSPC)
+		pr_warn_ratelimited("failed to allocate unique MR key\n");
 	if (ret)
 		return ret;
 
