@@ -163,6 +163,10 @@ def update_symlink(link: Path, target: Path) -> None:
     link.symlink_to(target.resolve())
 
 
+def now_utc_iso() -> str:
+    return dt.datetime.now(dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
 def main() -> int:
     args = parse_args()
     if not args.hosts:
@@ -175,11 +179,9 @@ def main() -> int:
     run_dir = out_root / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    now_utc = lambda: dt.datetime.now(dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
-
     manifest: dict[str, Any] = {
         "run_id": run_id,
-        "started_utc": now_utc(),
+        "started_utc": now_utc_iso(),
         "hosts": args.hosts,
         "iface": args.iface,
         "transport": args.transport,
@@ -255,7 +257,7 @@ def main() -> int:
                 manifest["error"] = "perftest metrics regressed vs baseline"
     manifest["steps"]["regression"] = regression_report
 
-    manifest["finished_utc"] = now_utc()
+    manifest["finished_utc"] = now_utc_iso()
     (run_dir / "regression.json").write_text(json.dumps(regression_report, indent=2, sort_keys=True) + "\n")
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     update_symlink(out_root / "latest", run_dir)
