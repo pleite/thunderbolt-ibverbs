@@ -23,6 +23,11 @@
 
 #include "proto/config.h"
 
+#ifndef TBV_DEBUG_SURFACES_COMPILED
+#define TBV_DEBUG_SURFACES_COMPILED \
+	IS_ENABLED(CONFIG_THUNDERBOLT_IBVERBS_DEBUG_SURFACES)
+#endif
+
 #define TBV_DRV_NAME "thunderbolt_ibverbs"
 #define TBV_ETH_ALEN 6
 #define TBV_NATIVE_PROTOCOL_KEY "tbverbs"
@@ -862,6 +867,7 @@ int tbv_link_activate_config(struct tbv_state *state, const char *name,
 void tbv_link_deactivate_config(struct tbv_state *state, u32 link_id);
 u32 tbv_link_count(struct tbv_state *state);
 void tbv_link_debugfs_show(struct seq_file *s, struct tbv_state *state);
+bool tbv_debug_surfaces_enabled(void);
 int tbv_debugfs_init(struct tbv_state *state);
 void tbv_debugfs_exit(struct tbv_state *state);
 int tbv_configfs_start(struct tbv_state *state);
