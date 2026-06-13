@@ -177,7 +177,7 @@ branch_ahead_count() {
   local branch="$1" ahead
   if ! ahead="$(gh api "repos/$REPO/compare/$BASE_BRANCH...$branch" \
                   --jq '.ahead_by' 2>/dev/null)"; then
-    warn "could not compare $branch against $BASE_BRANCH; assuming not ahead"
+    warn "could not compare $branch against $BASE_BRANCH (check network / gh auth / branch names); assuming not ahead and re-seeding"
     ahead=0
   fi
   case "$ahead" in
