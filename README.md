@@ -100,6 +100,8 @@ tbv_vllm_smoke.sh \
 
 For the big-picture plan of where the project is headed — and the issue /
 feature / PR workflow for each step — see [docs/ROADMAP.md](docs/ROADMAP.md).
+Automation that files an issue + branch + draft PR per roadmap step lives in
+[scripts/roadmap/](scripts/roadmap/).
 
 ## License
 
