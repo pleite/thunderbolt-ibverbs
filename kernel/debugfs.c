@@ -7,7 +7,7 @@
 #include "../proto/native_wire.h"
 #include "tbv.h"
 
-#if !IS_ENABLED(CONFIG_THUNDERBOLT_IBVERBS_DEBUG_SURFACES)
+#if !TBV_DEBUG_SURFACES_COMPILED
 int tbv_debugfs_init(struct tbv_state *state)
 {
 	return 0;

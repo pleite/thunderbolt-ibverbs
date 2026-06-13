@@ -13,7 +13,7 @@
 #include "transport.h"
 #include "trace.h"
 
-#if !IS_ENABLED(CONFIG_THUNDERBOLT_IBVERBS_DEBUG_SURFACES)
+#if !TBV_DEBUG_SURFACES_COMPILED
 int tbv_configfs_start(struct tbv_state *state)
 {
 	return 0;
