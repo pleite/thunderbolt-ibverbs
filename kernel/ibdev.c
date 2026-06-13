@@ -409,6 +409,10 @@ struct tbv_qp {
 	 * can use all cables while preserving per-QP FIFO ordering.
 	 */
 	struct tbv_rail *rail;
+	/*
+	 * Lock nesting order for peer/QP state:
+	 * peer->control_lock -> owner->lock -> lock.
+	 */
 	spinlock_t lock;
 	struct mutex rx_lock;
 	wait_queue_head_t credit_wait;
@@ -2808,8 +2812,10 @@ static bool tbv_qp_get_apple_send_live(struct tbv_qp *tqp)
 static int tbv_qp_ensure_apple_tunnel(struct tbv_qp *tqp, bool *acquired)
 {
 	struct tbv_rail *rail = tqp->rail;
+	struct tbv_state *owner = tqp->owner;
 	struct tbv_peer *peer;
 	struct tbv_state *state;
+	unsigned long flags;
 	bool counted = false;
 	u32 refs = 0;
 	int ret = 0;
@@ -2823,13 +2829,16 @@ static int tbv_qp_ensure_apple_tunnel(struct tbv_qp *tqp, bool *acquired)
 
 	peer = rail->peer;
 	state = peer ? peer->state : NULL;
-	if (!peer || !state || !peer->xd) {
+	if (!peer || !owner || !state || state != owner || !peer->xd) {
 		tbv_rail_put(rail);
 		return -ENODEV;
 	}
 
 	mutex_lock(&peer->control_lock);
-	mutex_lock(&state->lock);
+	mutex_lock(&owner->lock);
+	lockdep_assert_held(&peer->control_lock);
+	lockdep_assert_held(&owner->lock);
+	spin_lock_irqsave(&tqp->lock, flags);
 	if (tqp->apple_tunnel_active) {
 		ret = 0;
 	} else if (rail->removing) {
@@ -2842,7 +2851,8 @@ static int tbv_qp_ensure_apple_tunnel(struct tbv_qp *tqp, bool *acquired)
 	} else {
 		ret = -ENOTCONN;
 	}
-	mutex_unlock(&state->lock);
+	spin_unlock_irqrestore(&tqp->lock, flags);
+	mutex_unlock(&owner->lock);
 	mutex_unlock(&peer->control_lock);
 
 	if (counted)
@@ -2857,8 +2867,10 @@ static int tbv_qp_ensure_apple_tunnel(struct tbv_qp *tqp, bool *acquired)
 static void tbv_qp_release_apple_tunnel(struct tbv_qp *tqp)
 {
 	struct tbv_rail *rail = tqp->rail;
+	struct tbv_state *owner = tqp->owner;
 	struct tbv_peer *peer;
 	struct tbv_state *state;
+	unsigned long flags;
 	u32 refs = 0;
 	u64 route = 0;
 
@@ -2869,13 +2881,16 @@ static void tbv_qp_release_apple_tunnel(struct tbv_qp *tqp)
 
 	peer = rail->peer;
 	state = peer ? peer->state : NULL;
-	if (!peer || !state || !peer->xd) {
+	if (!peer || !owner || !state || state != owner || !peer->xd) {
 		tbv_rail_put(rail);
 		return;
 	}
 
 	mutex_lock(&peer->control_lock);
-	mutex_lock(&state->lock);
+	mutex_lock(&owner->lock);
+	lockdep_assert_held(&peer->control_lock);
+	lockdep_assert_held(&owner->lock);
+	spin_lock_irqsave(&tqp->lock, flags);
 	if (tqp->apple_tunnel_active) {
 		tqp->apple_tunnel_active = false;
 		if (WARN_ON_ONCE(!rail->apple_tunnel_qps)) {
@@ -2886,7 +2901,8 @@ static void tbv_qp_release_apple_tunnel(struct tbv_qp *tqp)
 		refs = rail->apple_tunnel_qps;
 		route = peer->xd->route;
 	}
-	mutex_unlock(&state->lock);
+	spin_unlock_irqrestore(&tqp->lock, flags);
+	mutex_unlock(&owner->lock);
 	/*
 	 * Apple FA57 frames carry no connection incarnation, and local TX
 	 * completion does not prove the peer has consumed every frame. Treat the
