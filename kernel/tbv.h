@@ -22,11 +22,9 @@
 
 #include "proto/config.h"
 
-#if defined(CONFIG_THUNDERBOLT_IBVERBS)
+#ifndef TBV_DEBUG_SURFACES_COMPILED
 #define TBV_DEBUG_SURFACES_COMPILED \
 	IS_ENABLED(CONFIG_THUNDERBOLT_IBVERBS_DEBUG_SURFACES)
-#else
-#define TBV_DEBUG_SURFACES_COMPILED 1
 #endif
 
 #define TBV_DRV_NAME "thunderbolt_ibverbs"

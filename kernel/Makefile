@@ -5,11 +5,12 @@
 KVER ?= $(shell uname -r)
 KDIR ?= /lib/modules/$(KVER)/build
 PWD := $(shell pwd)
+tbv_debug_surfaces ?= 1
 
 obj-m := thunderbolt_ibverbs.o
 thunderbolt_ibverbs-y := main.o profile.o backend.o configfs.o core.o debugfs.o ibdev.o link.o native.o apple.o trace.o native_control.o native_control_legacy.o native_control_xdomain.o path.o peer.o rail.o service.o tbnet_identity.o tbnet_minimal.o tbv_compat.o ../proto/config.o ../proto/identity.o ../proto/reliability.o
 
-ccflags-y := -Wall -Wextra -Wno-unused-parameter -I$(src) -I$(src)/..
+ccflags-y := -Wall -Wextra -Wno-unused-parameter -I$(src) -I$(src)/.. -DTBV_DEBUG_SURFACES_COMPILED=$(tbv_debug_surfaces)
 
 .PHONY: all clean modules modules_install help
 
@@ -41,6 +42,7 @@ help:
 	@echo "  tbnet_identity_minimal_e2e=0|1"
 	@echo "  tbnet_identity_minimal_apple_only=0|1"
 	@echo "  bind_services=0|1"
+	@echo "  tbv_debug_surfaces=0|1"
 	@echo "  allocate_rings=0|1"
 	@echo "  start_rings=0|1"
 	@echo "  negotiate_native=0|1"
