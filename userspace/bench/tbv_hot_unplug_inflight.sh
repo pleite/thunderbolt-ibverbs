@@ -106,6 +106,7 @@ if ! run_remote "$unplug_host" "$unplug_cmd" >"$unplug_log" 2>&1; then
 	exit 1
 fi
 
+# Give ib_send_bw extra time to emit terminal CQ/error output after duration.
 deadline=$((SECONDS + duration + 30))
 while kill -0 "$client_pid" >/dev/null 2>&1; do
 	if ((SECONDS >= deadline)); then

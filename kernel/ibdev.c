@@ -2860,8 +2860,15 @@ static void tbv_qp_release_apple_tunnel(struct tbv_qp *tqp)
 			  rail->path.state == TBV_PATH_TUNNEL_ENABLED;
 	}
 	mutex_unlock(&state->lock);
-	if (disable)
-		disable_ret = tbv_path_disable_tunnel(&rail->path, peer->xd);
+	if (disable) {
+		mutex_lock(&state->lock);
+		disable = !rail->removing &&
+			  rail->path.state == TBV_PATH_TUNNEL_ENABLED;
+		mutex_unlock(&state->lock);
+		if (disable)
+			disable_ret = tbv_path_disable_tunnel(&rail->path,
+							      peer->xd);
+	}
 	if (disable_ret)
 		pr_warn_ratelimited("Apple data tunnel disable failed route=0x%llx qpn=%u ret=%d\n",
 				    route, tqp->base.qp_num, disable_ret);
@@ -9600,8 +9607,13 @@ void tbv_ibdev_flush_rail_qps(struct tbv_state *state, struct tbv_rail *rail)
 		xas_lock_irqsave(&xas, flags);
 		xas_for_each(&xas, tqp, ULONG_MAX) {
 			qpn = xas.xa_index + 1;
-			if (tqp->rail != rail || tqp->closing ||
-			    !refcount_inc_not_zero(&tqp->refs))
+			/*
+			 * Match by rail first; only then pay the cost of
+			 * checking closure/refcount for queueing async flush.
+			 */
+			if (tqp->rail != rail || tqp->closing)
+				continue;
+			if (!refcount_inc_not_zero(&tqp->refs))
 				continue;
 			found = true;
 			break;
