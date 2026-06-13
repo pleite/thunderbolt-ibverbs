@@ -29,6 +29,9 @@ path, ring sizes, and path flags.
 - Header magic/version: `TBV_NATIVE_DATA_MAGIC` (`"TVD1"`) and version `1`.
 - Max operation size: 16 MiB.
 
+`"TVD1"` is the data-plane magic and is intentionally distinct from the control
+handshake magic (`"TBV1"`).
+
 Supported opcodes include SEND/SEND_IMM, RDMA WRITE/WRITE_IMM, RDMA READ
 request/response/ack, credit control, and MAD transport.
 

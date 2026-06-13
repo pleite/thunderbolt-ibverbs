@@ -49,9 +49,9 @@
 | `apple_tx_max_inflight_wr` | uint | `1` | `0644` | Max Apple UC SEND WRs in flight per QP. |
 | `apple_tx_max_inflight_frames` | uint | `64` | `0644` | Max Apple 4 KiB frames posted per SEND group (`0` disables window). |
 | `apple_tx_completion_delay_us` | uint | `0` | `0644` | Delay successful Apple UC SEND completion by microseconds. |
-| `apple_rx_pending_bytes` | uint | `TBV_APPLE_MAX_MSG_SIZE` | `0644` | Max bytes buffered per early Apple UC receive without a posted WQE. |
+| `apple_rx_pending_bytes` | uint | `16MiB` | `0644` | Max bytes buffered per early Apple UC receive without a posted WQE. |
 | `apple_rx_pending_slots` | uint | `4096` | `0644` | Max number of early Apple UC receives buffered per QP. |
-| `apple_rx_pending_total_bytes` | uint | `64 MiB` | `0644` | Max aggregate bytes buffered for early Apple UC receives per QP. |
+| `apple_rx_pending_total_bytes` | uint | `64MiB` | `0644` | Max aggregate bytes buffered across all early Apple UC receives per QP. |
 | `apple_rx_trace` | uint | `0` | `0644` | Print first N Apple RX callbacks with assembly state. |
 
 ## Peer policy (`kernel/peer.c`)
