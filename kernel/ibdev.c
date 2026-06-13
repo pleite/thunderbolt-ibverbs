@@ -104,7 +104,7 @@ module_param(apple_rx_trace, uint, 0644);
 MODULE_PARM_DESC(apple_rx_trace,
 		 "Print the first N Apple RX callbacks with SOF/EOF and assembly state");
 
-static bool tbv_apple_rx_trace_take(void)
+bool tbv_apple_rx_trace_take(void)
 {
 	u32 remaining;
 
@@ -136,7 +136,7 @@ static void tbv_rx_bad_header_context(const struct tbv_path *rx_path,
 		*peer_id = rx_path->rail->peer->peer_id;
 }
 
-static void tbv_rx_bad_header_note(struct tbv_state *state,
+void tbv_rx_bad_header_note(struct tbv_state *state,
 				   struct tbv_path *rx_path,
 				   atomic64_t *reason_counter,
 				   const char *reason,
@@ -167,7 +167,7 @@ static void tbv_rx_bad_header_note(struct tbv_state *state,
 	}
 }
 
-static void tbv_rx_bad_header_parse_note(struct tbv_state *state,
+void tbv_rx_bad_header_parse_note(struct tbv_state *state,
 					 struct tbv_path *rx_path,
 					 const void *data, u32 len, int ret)
 {
@@ -365,7 +365,7 @@ static void tbv_wc_set_recv_wr(struct ib_wc *wc,
 		wc->wr_id = wqe->wr_id;
 }
 
-static u32 tbv_apple_qpn_from_path(const struct tbv_path *path)
+u32 tbv_apple_qpn_from_path(const struct tbv_path *path)
 {
 	if (!path || path->cfg.receive_path < 0)
 		return TBV_APPLE_PRIMARY_QPN;
@@ -507,7 +507,7 @@ void tbv_mr_put(struct tbv_mr *mr)
 			   &mr->free_work);
 }
 
-static struct tbv_qp *tbv_qp_get_by_num(struct tbv_state *state, u32 qpn)
+struct tbv_qp *tbv_qp_get_by_num(struct tbv_state *state, u32 qpn)
 {
 	struct tbv_qp *tqp;
 	XA_STATE(xas, &state->verbs_qps_xa, qpn);
@@ -696,7 +696,7 @@ static void tbv_qp_schedule_timeout_now_locked(struct tbv_qp *tqp)
 	mod_delayed_work(wq, &tqp->timeout_work, 0);
 }
 
-static void tbv_qp_schedule_timeout_now(struct tbv_qp *tqp)
+void tbv_qp_schedule_timeout_now(struct tbv_qp *tqp)
 {
 	unsigned long flags;
 
@@ -714,7 +714,7 @@ static void tbv_qp_schedule_timeout(struct tbv_qp *tqp)
 	spin_unlock_irqrestore(&tqp->lock, flags);
 }
 
-static bool tbv_qp_mark_error(struct tbv_qp *tqp)
+bool tbv_qp_mark_error(struct tbv_qp *tqp)
 {
 	unsigned long flags;
 	bool changed = false;
@@ -769,14 +769,7 @@ bool tbv_qp_allows_post(struct tbv_qp *tqp)
 	return allowed;
 }
 
-enum tbv_rx_endpoint_status {
-	TBV_RX_ENDPOINT_OK,
-	TBV_RX_ENDPOINT_UNCONNECTED,
-	TBV_RX_ENDPOINT_BAD_PEER,
-	TBV_RX_ENDPOINT_QP_ERROR,
-};
-
-static enum tbv_rx_endpoint_status
+enum tbv_rx_endpoint_status
 tbv_qp_validate_native_endpoint(struct tbv_qp *tqp,
 				const struct tbv_native_data_header *hdr)
 {
@@ -804,7 +797,7 @@ tbv_qp_validate_native_endpoint(struct tbv_qp *tqp,
 	return status;
 }
 
-static enum tbv_rx_endpoint_status
+enum tbv_rx_endpoint_status
 tbv_qp_accept_recv_credit(struct tbv_qp *tqp,
 			  const struct tbv_native_data_header *hdr)
 {
@@ -1128,7 +1121,7 @@ static void tbv_qp_drain_ready_sends_locked(struct tbv_qp *tqp,
 	}
 }
 
-static bool tbv_qp_complete_send_ordered(struct tbv_qp *tqp, u32 psn,
+bool tbv_qp_complete_send_ordered(struct tbv_qp *tqp, u32 psn,
 					 int status, struct list_head *complete,
 					 struct tbv_send_ctx **matched_out)
 {
@@ -1229,7 +1222,7 @@ static bool tbv_qp_complete_read_ordered(struct tbv_qp *tqp,
 	return true;
 }
 
-static bool tbv_qp_note_rnr_ack(struct tbv_qp *tqp, u32 psn,
+bool tbv_qp_note_rnr_ack(struct tbv_qp *tqp, u32 psn,
 				struct list_head *complete,
 				struct tbv_send_ctx **matched_out)
 {
@@ -1292,7 +1285,7 @@ static bool tbv_qp_send_retry_pending(struct tbv_qp *tqp,
 	return pending;
 }
 
-static bool tbv_qp_ack_is_late_duplicate(struct tbv_qp *tqp, u32 psn)
+bool tbv_qp_ack_is_late_duplicate(struct tbv_qp *tqp, u32 psn)
 {
 	unsigned long flags;
 	bool late;
@@ -1320,7 +1313,7 @@ static struct tbv_read_ctx *tbv_qp_find_read_get(struct tbv_qp *tqp, u32 psn)
 	return found;
 }
 
-static struct tbv_read_resp_ctx *tbv_qp_take_read_resp(struct tbv_qp *tqp,
+struct tbv_read_resp_ctx *tbv_qp_take_read_resp(struct tbv_qp *tqp,
 						       u32 psn)
 {
 	struct tbv_read_resp_ctx *ctx, *found = NULL;
@@ -1339,7 +1332,7 @@ static struct tbv_read_resp_ctx *tbv_qp_take_read_resp(struct tbv_qp *tqp,
 	return found;
 }
 
-static bool tbv_qp_retry_read_resp(struct tbv_qp *tqp, u32 psn)
+bool tbv_qp_retry_read_resp(struct tbv_qp *tqp, u32 psn)
 {
 	struct tbv_read_resp_ctx *ctx;
 	unsigned long flags;
@@ -2567,7 +2560,7 @@ static void tbv_ibdev_atomic64_max_ms(atomic64_t *counter, u64 value)
 	}
 }
 
-static void tbv_note_matched_send_ack(struct tbv_state *state,
+void tbv_note_matched_send_ack(struct tbv_state *state,
 				      const struct tbv_native_data_header *hdr,
 				      const struct tbv_send_ctx *send)
 {
@@ -4699,7 +4692,7 @@ void tbv_qp_flush_apple_pending(struct tbv_qp *tqp)
 	tqp->apple_pending_active = -1;
 }
 
-static struct tbv_apple_pending_rx *
+struct tbv_apple_pending_rx *
 tbv_apple_pending_active_locked(struct tbv_state *state, struct tbv_qp *tqp)
 {
 	struct tbv_apple_pending_rx *p;
@@ -4723,7 +4716,7 @@ tbv_apple_pending_active_locked(struct tbv_state *state, struct tbv_qp *tqp)
 	return p;
 }
 
-static void tbv_apple_pending_finish_locked(struct tbv_qp *tqp)
+void tbv_apple_pending_finish_locked(struct tbv_qp *tqp)
 {
 	struct tbv_apple_pending_rx *p;
 
@@ -4879,7 +4872,7 @@ static int tbv_apple_rx_wire_user_len(u32 len, u8 eof, u32 *user_len)
 	return 0;
 }
 
-static int tbv_apple_rx_copy_frame_to_buf(struct tbv_qp *tqp,
+int tbv_apple_rx_copy_frame_to_buf(struct tbv_qp *tqp,
 					  struct tbv_apple_pending_rx *p,
 					  const void *payload, u32 len, u8 eof,
 					  u32 *out_user_len)
@@ -4900,129 +4893,7 @@ static int tbv_apple_rx_copy_frame_to_buf(struct tbv_qp *tqp,
 	return 0;
 }
 
-void tbv_ibdev_rx_apple_frame_impl(struct tbv_state *state,
-			      const struct tbv_path *path,
-			      const void *payload, u32 len, u8 sof, u8 eof)
-{
-	struct tbv_apple_pending_rx *pending;
-	struct tbv_qp *tqp;
-	bool starts_message;
-	bool raw_rx;
-	u32 qpn;
-	u32 user_len = 0;
-	int ret;
-
-	if (!state || !state->verbs_registered)
-		return;
-	if (!payload || !len || len > TBV_APPLE_FRAME_SIZE) {
-		atomic64_inc(&state->data_rx_bad_frame);
-		return;
-	}
-	raw_rx = tbv_path_apple_rx_raw_mode();
-
-	qpn = tbv_apple_qpn_from_path(path);
-	if (sof)
-		atomic64_inc(&state->apple_rx_sof);
-	if (eof == 3)
-		atomic64_inc(&state->apple_rx_eof3);
-	else
-		atomic64_inc(&state->apple_rx_eof_other);
-
-	tqp = tbv_qp_get_by_num(state, qpn);
-	if (!tqp) {
-		atomic64_inc(&state->data_rx_no_qp);
-		return;
-	}
-
-	/*
-	 * macOS emits short single-frame SENDs as EOF=3 without SOF. Treat
-	 * those as a complete message start, but keep rejecting idle non-final
-	 * fragments because there is no Apple-side sequence number to recover
-	 * the missing prefix.
-	 */
-	starts_message = sof || raw_rx || eof == TBV_DATA_PDF_FRAME_END;
-
-	/*
-	 * Apple frames carry no QPN; demux is by inbound hop ID only, and
-	 * every Apple path uses the same hop. Make sure this QP is bound to
-	 * the rail the frame actually arrived on so a second Apple peer can
-	 * never feed another peer's QP.
-	 */
-	if (!tqp->rail || tqp->rail != path->rail) {
-		atomic64_inc(&state->apple_rx_rail_mismatch);
-		atomic64_inc(&state->data_rx_no_qp);
-		pr_warn_ratelimited("apple rx frame from unbound rail qpn=%u\n",
-				    qpn);
-		tbv_qp_put(tqp);
-		return;
-	}
-
-	mutex_lock(&tqp->rx_lock);
-	if (tqp->apple_pending_ready_count)
-		tbv_apple_rx_drain_pending_locked(state, tqp);
-	if (tqp->apple_rx_discard) {
-		/*
-		 * Resynchronizing after a dropped message start: swallow
-		 * frames up to the EOF=3 boundary so the tail of a truncated
-		 * message is never delivered as a complete message.
-		 */
-		atomic64_inc(&state->apple_rx_resync_dropped);
-		if (eof == 3)
-			tqp->apple_rx_discard = false;
-		mutex_unlock(&tqp->rx_lock);
-		tbv_qp_put(tqp);
-		return;
-	}
-	if (sof && tqp->apple_pending_active >= 0)
-		atomic64_inc(&state->apple_rx_sof_while_active);
-	if (tqp->apple_pending_active < 0 && !starts_message) {
-		atomic64_inc(&state->apple_rx_no_sof_when_idle);
-		atomic64_inc(&state->data_rx_bad_frame);
-		mutex_unlock(&tqp->rx_lock);
-		tbv_qp_put(tqp);
-		return;
-	}
-
-	pending = tbv_apple_pending_active_locked(state, tqp);
-	if (!pending) {
-		atomic64_inc(&state->data_rx_no_recv);
-		atomic64_inc(&state->data_rx_reorder_dropped);
-		/*
-		 * A message-start frame was dropped. Unless this frame also
-		 * carried the message's EOF=3, the rest of the message is
-		 * still inbound and must be discarded at the boundary, not
-		 * delivered as a fresh (truncated) message.
-		 */
-		if (eof != 3)
-			tqp->apple_rx_discard = true;
-		mutex_unlock(&tqp->rx_lock);
-		tbv_qp_put(tqp);
-		return;
-	}
-
-	if (tbv_apple_rx_trace_take())
-		pr_info("apple rx qpn=%u sof=%u eof=%u len=%u pending_len=%u recv_count=%u pending_active=%d pending_ready=%u\n",
-			qpn, sof, eof, len, pending->delivered,
-			tqp->recv_count, tqp->apple_pending_active,
-			tqp->apple_pending_ready_count);
-
-	ret = tbv_apple_rx_copy_frame_to_buf(tqp, pending, payload, len, eof,
-					     &user_len);
-	if (ret) {
-		atomic64_inc(&state->data_rx_bad_frame);
-		pending->status = (ret == -EMSGSIZE || ret == -ENOSPC) ?
-			IB_WC_LOC_LEN_ERR : IB_WC_LOC_PROT_ERR;
-	}
-
-	if (eof == 3) {
-		tbv_apple_pending_finish_locked(tqp);
-		tbv_apple_rx_drain_pending_locked(state, tqp);
-	} else if (!pending->active) {
-		atomic64_inc(&state->apple_rx_eof_without_active);
-	}
-	mutex_unlock(&tqp->rx_lock);
-	tbv_qp_put(tqp);
-}
+	/* Apple RX frame dispatch moved to ibdev_apple.c (R7 split) */
 
 static int tbv_send_control_frame_on_qp(struct tbv_qp *tqp,
 					struct tbv_path *rx_path,
@@ -5167,7 +5038,7 @@ static void tbv_count_tx_read_ack(struct tbv_state *state, int status)
 	}
 }
 
-static void tbv_count_rx_read_ack(struct tbv_state *state, u32 status)
+void tbv_count_rx_read_ack(struct tbv_state *state, u32 status)
 {
 	switch (status) {
 	case TBV_NATIVE_READ_ACK_OK:
@@ -7019,7 +6890,7 @@ static void tbv_rx_buffer_write_fragment_locked(struct tbv_state *state,
 		tbv_rx_drain_reorder_locked(state, tqp, rx_path);
 }
 
-static void tbv_rx_handle_send_fragment(struct tbv_state *state,
+void tbv_rx_handle_send_fragment(struct tbv_state *state,
 					struct tbv_qp *tqp,
 					const struct tbv_native_data_header *hdr,
 					const void *payload,
@@ -7487,7 +7358,7 @@ static struct kunit_suite tbv_ibdev_security_suite = {
 kunit_test_suite(tbv_ibdev_security_suite);
 #endif
 
-static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
+void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
 					      struct tbv_qp *tqp,
 					      const struct tbv_native_data_header *hdr,
 					      const void *payload,
@@ -7977,7 +7848,7 @@ static void tbv_rx_queue_rdma_read_req_work(struct tbv_state *state,
 		   &work->work);
 }
 
-static void tbv_rx_handle_rdma_read_req(struct tbv_state *state,
+void tbv_rx_handle_rdma_read_req(struct tbv_state *state,
 					struct tbv_qp *tqp,
 					const struct tbv_native_data_header *hdr,
 					struct tbv_path *rx_path)
@@ -8016,7 +7887,7 @@ static void tbv_rx_handle_rdma_read_req(struct tbv_state *state,
 		tbv_rx_queue_rdma_read_req_work(state, tqp, hdr, rx_path);
 }
 
-static void tbv_rx_handle_rdma_read_resp(struct tbv_state *state,
+void tbv_rx_handle_rdma_read_resp(struct tbv_state *state,
 					 struct tbv_qp *tqp,
 					 const struct tbv_native_data_header *hdr,
 					 const void *payload,
@@ -8108,7 +7979,7 @@ complete_ack:
 
 /* Completion-queue poll/notify verbs moved to ibdev_cq.c (R7 split) */
 
-static void tbv_rx_handle_mad(struct tbv_state *state, struct tbv_path *rx_path,
+void tbv_rx_handle_mad(struct tbv_state *state, struct tbv_path *rx_path,
 			      const struct tbv_native_data_header *hdr,
 			      const void *payload)
 {
@@ -8193,228 +8064,7 @@ static void tbv_rx_handle_mad(struct tbv_state *state, struct tbv_path *rx_path,
 	tbv_qp_put(tqp);
 }
 
-void tbv_ibdev_rx_native_frame_impl(struct tbv_state *state,
-			       struct tbv_path *rx_path,
-			       const struct tbv_native_data_header *hdr,
-			       const void *payload)
-{
-	struct tbv_qp *tqp;
-	enum tbv_rx_endpoint_status endpoint_status;
-
-	if (!state || !state->verbs_registered)
-		return;
-
-	switch (hdr->opcode) {
-	case TBV_NATIVE_DATA_OP_SEND_ACK:
-	case TBV_NATIVE_DATA_OP_RDMA_READ_ACK:
-	case TBV_NATIVE_DATA_OP_RECV_CREDIT:
-	case TBV_NATIVE_DATA_OP_RDMA_READ_REQ:
-	case TBV_NATIVE_DATA_OP_RDMA_READ_RESP:
-	case TBV_NATIVE_DATA_OP_SEND:
-	case TBV_NATIVE_DATA_OP_SEND_IMM:
-	case TBV_NATIVE_DATA_OP_RDMA_WRITE:
-	case TBV_NATIVE_DATA_OP_RDMA_WRITE_IMM:
-	case TBV_NATIVE_DATA_OP_MAD:
-		break;
-	default:
-		tbv_rx_bad_header_note(state, rx_path,
-				       &state->data_rx_bad_header_opcode,
-				       "opcode", hdr,
-				       TBV_NATIVE_DATA_HDR_SIZE + hdr->length, 0);
-		return;
-	}
-
-	if (hdr->opcode == TBV_NATIVE_DATA_OP_MAD) {
-		tbv_rx_handle_mad(state, rx_path, hdr, payload);
-		return;
-	}
-
-	tqp = tbv_qp_get_by_num(state, hdr->dest_qp);
-	if (!tqp) {
-		atomic64_inc(&state->data_rx_no_qp);
-		return;
-	}
-
-	if (hdr->opcode == TBV_NATIVE_DATA_OP_RECV_CREDIT) {
-		atomic64_inc(&state->data_rx_ack);
-		if (!hdr->imm_data) {
-			tbv_rx_bad_header_note(state, rx_path,
-					       &state->data_rx_bad_header_recv_credit,
-					       "recv_credit", hdr,
-					       TBV_NATIVE_DATA_HDR_SIZE +
-					       hdr->length, 0);
-			tbv_qp_put(tqp);
-			return;
-		}
-
-		endpoint_status = tbv_qp_accept_recv_credit(tqp, hdr);
-		if (endpoint_status != TBV_RX_ENDPOINT_OK) {
-			if (endpoint_status == TBV_RX_ENDPOINT_QP_ERROR)
-				atomic64_inc(&state->data_rx_qp_error);
-			else
-				atomic64_inc(&state->data_rx_bad_peer);
-			tbv_qp_put(tqp);
-			return;
-		}
-
-		wake_up_all(&tqp->credit_wait);
-		tbv_qp_schedule_timeout_now(tqp);
-		tbv_qp_put(tqp);
-		return;
-	}
-
-	endpoint_status = tbv_qp_validate_native_endpoint(tqp, hdr);
-	if (endpoint_status != TBV_RX_ENDPOINT_OK) {
-		if (endpoint_status == TBV_RX_ENDPOINT_UNCONNECTED)
-			atomic64_inc(&state->data_rx_unconnected_qp);
-		else if (endpoint_status == TBV_RX_ENDPOINT_QP_ERROR)
-			atomic64_inc(&state->data_rx_qp_error);
-		else
-			atomic64_inc(&state->data_rx_bad_peer);
-		tbv_qp_put(tqp);
-		return;
-	}
-
-	if (hdr->opcode == TBV_NATIVE_DATA_OP_SEND_ACK) {
-		LIST_HEAD(acked);
-		struct tbv_send_ctx *matched_send = NULL;
-		int status;
-		bool saw_ack = false;
-		bool completed_ack = false;
-		bool completed_error = false;
-
-		atomic64_inc(&state->data_rx_ack);
-		switch (hdr->imm_data) {
-		case TBV_NATIVE_SEND_ACK_OK:
-			status = 0;
-			saw_ack = tbv_qp_complete_send_ordered(tqp, hdr->psn,
-							       status, &acked,
-							       &matched_send);
-			break;
-		case TBV_NATIVE_SEND_ACK_RNR:
-			status = -EAGAIN;
-			atomic64_inc(&state->data_rx_ack_rnr);
-			saw_ack = tbv_qp_note_rnr_ack(tqp, hdr->psn,
-						      &acked, &matched_send);
-			break;
-		case TBV_NATIVE_SEND_ACK_ERROR:
-			status = -EIO;
-			saw_ack = tbv_qp_complete_send_ordered(tqp, hdr->psn,
-							       status, &acked,
-							       &matched_send);
-			break;
-		default:
-			tbv_rx_bad_header_note(state, rx_path,
-					       &state->data_rx_bad_header_ack,
-					       "send_ack", hdr,
-					       TBV_NATIVE_DATA_HDR_SIZE +
-					       hdr->length, 0);
-			tbv_qp_put(tqp);
-			return;
-		}
-		if (matched_send) {
-			tbv_note_matched_send_ack(state, hdr, matched_send);
-			tbv_send_ctx_put(matched_send);
-		}
-		if (!saw_ack) {
-			if (tbv_qp_ack_is_late_duplicate(tqp, hdr->psn))
-				atomic64_inc(&state->data_rx_late_ack);
-			else
-				atomic64_inc(&state->data_rx_ack_miss);
-		}
-		while (!list_empty(&acked)) {
-			struct tbv_send_ctx *send =
-				list_first_entry(&acked, struct tbv_send_ctx,
-						 node);
-
-			list_del_init(&send->node);
-			completed_ack = true;
-			if (send->completion_status)
-				completed_error = true;
-			if (send->completion_status == -EAGAIN)
-				atomic64_inc(&state->data_wr_rnr_retry_exhausted);
-			tbv_send_complete(send, send->completion_status);
-			tbv_send_ctx_put(send);
-		}
-		if (completed_error && completed_ack)
-			tbv_qp_mark_error(tqp);
-		tbv_qp_put(tqp);
-		return;
-	}
-
-	if (hdr->opcode == TBV_NATIVE_DATA_OP_RDMA_READ_ACK) {
-		struct tbv_read_resp_ctx *ctx;
-
-		atomic64_inc(&state->data_rx_ack);
-		tbv_count_rx_read_ack(state, hdr->imm_data);
-		if (hdr->imm_data == TBV_NATIVE_READ_ACK_RETRY) {
-			tbv_qp_retry_read_resp(tqp, hdr->psn);
-		} else {
-			ctx = tbv_qp_take_read_resp(tqp, hdr->psn);
-			if (ctx)
-				tbv_read_resp_ctx_put(ctx);
-		}
-		tbv_qp_put(tqp);
-		return;
-	}
-
-	if (hdr->opcode == TBV_NATIVE_DATA_OP_RDMA_READ_REQ) {
-		tbv_rx_handle_rdma_read_req(state, tqp, hdr, rx_path);
-		tbv_qp_put(tqp);
-		return;
-	}
-
-	if (hdr->opcode == TBV_NATIVE_DATA_OP_RDMA_READ_RESP) {
-		tbv_rx_handle_rdma_read_resp(state, tqp, hdr, payload, rx_path);
-		tbv_qp_put(tqp);
-		return;
-	}
-
-	atomic64_inc(&state->data_rx_send);
-	if (hdr->opcode == TBV_NATIVE_DATA_OP_SEND)
-		atomic64_inc(&state->data_rx_op_send);
-	else if (hdr->opcode == TBV_NATIVE_DATA_OP_SEND_IMM)
-		atomic64_inc(&state->data_rx_op_send_imm);
-	else if (hdr->opcode == TBV_NATIVE_DATA_OP_RDMA_WRITE_IMM)
-		atomic64_inc(&state->data_rx_op_write_imm);
-	else
-		atomic64_inc(&state->data_rx_op_write);
-
-	if (hdr->opcode == TBV_NATIVE_DATA_OP_SEND ||
-	    hdr->opcode == TBV_NATIVE_DATA_OP_SEND_IMM)
-		tbv_rx_handle_send_fragment(state, tqp, hdr, payload,
-					    rx_path);
-	else
-		tbv_rx_handle_rdma_write_fragment(state, tqp, hdr, payload,
-						  rx_path);
-	tbv_qp_put(tqp);
-}
-
-void tbv_ibdev_rx_frame_impl(struct tbv_state *state, struct tbv_path *rx_path,
-			const void *data, u32 len)
-{
-	struct tbv_native_data_header hdr;
-	const u8 *payload;
-	int ret;
-
-	if (!state || !state->verbs_registered)
-		return;
-
-	ret = tbv_native_data_parse_header(data, len, &hdr);
-	if (ret) {
-		tbv_rx_bad_header_parse_note(state, rx_path, data, len, ret);
-		return;
-	}
-	if (hdr.length > len - TBV_NATIVE_DATA_HDR_SIZE) {
-		tbv_rx_bad_header_note(state, rx_path,
-				       &state->data_rx_bad_header_len,
-				       "frame_len", &hdr, len, 0);
-		return;
-	}
-
-	payload = (const u8 *)data + TBV_NATIVE_DATA_HDR_SIZE;
-	tbv_ibdev_rx_native_frame_impl(state, rx_path, &hdr, payload);
-}
+	/* native RX frame dispatch moved to ibdev_native.c (R7 split) */
 
 /* Memory-region verbs moved to ibdev_mr.c (R7 split) */
 

@@ -534,4 +534,70 @@ void tbv_apple_rx_drain_pending_locked(struct tbv_state *state,
 void tbv_rx_drain_reorder_locked(struct tbv_state *state, struct tbv_qp *tqp,
 				 struct tbv_path *rx_path);
 
+enum tbv_rx_endpoint_status {
+	TBV_RX_ENDPOINT_OK,
+	TBV_RX_ENDPOINT_UNCONNECTED,
+	TBV_RX_ENDPOINT_BAD_PEER,
+	TBV_RX_ENDPOINT_QP_ERROR,
+};
+
+/* ---- native/Apple RX unit cross-references ----
+ * The RX frame dispatchers live in ibdev_native.c / ibdev_apple.c; the
+ * receive-path helpers they call are defined in ibdev.c.
+ */
+void tbv_count_rx_read_ack(struct tbv_state *state, u32 status);
+void tbv_note_matched_send_ack(struct tbv_state *state,
+			       const struct tbv_native_data_header *hdr,
+			       const struct tbv_send_ctx *send);
+bool tbv_qp_ack_is_late_duplicate(struct tbv_qp *tqp, u32 psn);
+bool tbv_qp_complete_send_ordered(struct tbv_qp *tqp, u32 psn, int status,
+				  struct list_head *complete,
+				  struct tbv_send_ctx **matched_out);
+struct tbv_qp *tbv_qp_get_by_num(struct tbv_state *state, u32 qpn);
+bool tbv_qp_mark_error(struct tbv_qp *tqp);
+bool tbv_qp_note_rnr_ack(struct tbv_qp *tqp, u32 psn, struct list_head *complete,
+			 struct tbv_send_ctx **matched_out);
+bool tbv_qp_retry_read_resp(struct tbv_qp *tqp, u32 psn);
+void tbv_qp_schedule_timeout_now(struct tbv_qp *tqp);
+struct tbv_read_resp_ctx *tbv_qp_take_read_resp(struct tbv_qp *tqp, u32 psn);
+void tbv_rx_bad_header_note(struct tbv_state *state, struct tbv_path *rx_path,
+			    atomic64_t *reason_counter, const char *reason,
+			    const struct tbv_native_data_header *hdr,
+			    u32 frame_len, int ret);
+void tbv_rx_bad_header_parse_note(struct tbv_state *state,
+				  struct tbv_path *rx_path, const void *data,
+				  u32 len, int ret);
+void tbv_rx_handle_mad(struct tbv_state *state, struct tbv_path *rx_path,
+		       const struct tbv_native_data_header *hdr,
+		       const void *payload);
+void tbv_rx_handle_rdma_read_req(struct tbv_state *state, struct tbv_qp *tqp,
+				 const struct tbv_native_data_header *hdr,
+				 struct tbv_path *rx_path);
+void tbv_rx_handle_rdma_read_resp(struct tbv_state *state, struct tbv_qp *tqp,
+				  const struct tbv_native_data_header *hdr,
+				  const void *payload, struct tbv_path *rx_path);
+void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
+				       struct tbv_qp *tqp,
+				       const struct tbv_native_data_header *hdr,
+				       const void *payload,
+				       struct tbv_path *rx_path);
+void tbv_rx_handle_send_fragment(struct tbv_state *state, struct tbv_qp *tqp,
+				 const struct tbv_native_data_header *hdr,
+				 const void *payload, struct tbv_path *rx_path);
+enum tbv_rx_endpoint_status
+tbv_qp_accept_recv_credit(struct tbv_qp *tqp,
+			  const struct tbv_native_data_header *hdr);
+enum tbv_rx_endpoint_status
+tbv_qp_validate_native_endpoint(struct tbv_qp *tqp,
+				const struct tbv_native_data_header *hdr);
+void tbv_apple_pending_finish_locked(struct tbv_qp *tqp);
+u32 tbv_apple_qpn_from_path(const struct tbv_path *path);
+int tbv_apple_rx_copy_frame_to_buf(struct tbv_qp *tqp,
+				   struct tbv_apple_pending_rx *p,
+				   const void *payload, u32 len, u8 eof,
+				   u32 *out_user_len);
+bool tbv_apple_rx_trace_take(void);
+struct tbv_apple_pending_rx *
+tbv_apple_pending_active_locked(struct tbv_state *state, struct tbv_qp *tqp);
+
 #endif /* TBV_IBDEV_INTERNAL_H */
