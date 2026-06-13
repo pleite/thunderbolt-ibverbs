@@ -105,9 +105,13 @@ the configured thresholds versus baseline.
 
 ## Documentation
 
+- [Security policy](SECURITY.md) — vulnerability reporting and threat model summary
+- [Contributing guide](CONTRIBUTING.md) — contributor workflow and expectations
+- [Wire protocol spec](proto/WIRE_PROTOCOL.md) — native control/data frame contracts
+- [Module parameter reference](docs/MODULE_PARAMETERS.md) — full `thunderbolt_ibverbs` parameter catalog
 - [Architecture overview](docs/ARCHITECTURE.md) — kernel module ↔ provider ↔ verbs layer diagram and data path description
 - [Troubleshooting guide](docs/TROUBLESHOOTING.md) — symptom-by-symptom checklist
-- [Contributing guide](docs/CONTRIBUTING.md) — build instructions, code style, and PR process
+- [Detailed contributor notes](docs/CONTRIBUTING.md) — build instructions, code style, and PR process
 
 ## Status
 
