@@ -47,33 +47,25 @@ static bool tbv_rel_rx_find_cached_ack(const struct tbv_rel_rx_op *rx,
 				       const struct tbv_rel_data_frame *frame,
 				       struct tbv_rel_ack_frame *ack)
 {
-	tbv_rel_u32 i;
+	const struct tbv_rel_rx_ack_history_entry *entry =
+		&rx->ack_history[frame->op_id % TBV_REL_ACK_HISTORY_SIZE];
 
-	for (i = 0; i < TBV_REL_ACK_HISTORY_SIZE; i++) {
-		const struct tbv_rel_rx_ack_history_entry *entry =
-			&rx->ack_history[i];
-
-		if (!entry->valid || entry->op_id != frame->op_id)
-			continue;
-		if (ack)
-			*ack = entry->ack;
-		return true;
-	}
-
-	return false;
+	if (!entry->valid || entry->op_id != frame->op_id)
+		return false;
+	if (ack)
+		*ack = entry->ack;
+	return true;
 }
 
 static void tbv_rel_rx_store_cached_ack(struct tbv_rel_rx_op *rx,
 					const struct tbv_rel_ack_frame *ack)
 {
 	struct tbv_rel_rx_ack_history_entry *entry =
-		&rx->ack_history[rx->ack_history_next %
-				 TBV_REL_ACK_HISTORY_SIZE];
+		&rx->ack_history[ack->op_id % TBV_REL_ACK_HISTORY_SIZE];
 
 	entry->valid = true;
 	entry->op_id = ack->op_id;
 	entry->ack = *ack;
-	rx->ack_history_next++;
 }
 
 int tbv_rel_tx_start(struct tbv_rel_tx_op *tx, tbv_rel_u64 conn_id,
@@ -216,6 +208,11 @@ int tbv_rel_tx_on_ack(struct tbv_rel_tx_op *tx,
 tbv_rel_u64 tbv_rel_retry_interval(tbv_rel_u64 ack_timeout,
 				   tbv_rel_u32 retry_budget)
 {
+	/*
+	 * FINDINGS.md R6 (open): the retry budget is ignored and the interval is
+	 * fixed (no exponential backoff or jitter), which invites synchronized
+	 * retry collapse; see scripts/fixes/12-reliability-backoff.sh.
+	 */
 	(void)retry_budget;
 
 	return ack_timeout;
