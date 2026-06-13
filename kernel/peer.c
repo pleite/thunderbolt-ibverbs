@@ -65,7 +65,7 @@ bool tbv_peer_auth_is_initiator(const struct tbv_peer *peer)
 		return false;
 
 	return memcmp(peer->xd->local_uuid, peer->xd->remote_uuid,
-		      sizeof(*peer->xd->local_uuid)) < 0;
+		      sizeof(uuid_t)) < 0;
 }
 
 void tbv_peer_auth_reset(struct tbv_peer *peer)

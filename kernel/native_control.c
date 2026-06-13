@@ -98,7 +98,7 @@ static int tbv_native_control_prepare_initiator_hello(struct tbv_state *state,
 	hello->auth_flags = TBV_NATIVE_WIRE_AUTH_REQUIRED;
 	hello->nonce = peer->auth_local_nonce;
 	mutex_unlock(&state->lock);
-	return hello->nonce ? 0 : -EIO;
+	return 0;
 }
 
 static int tbv_native_control_accept_responder_hello(
@@ -118,10 +118,6 @@ static int tbv_native_control_accept_responder_hello(
 	mutex_lock(&state->lock);
 	if (!peer->auth_challenge_valid || peer->auth_remote_nonce != remote->nonce) {
 		local_nonce = get_random_u64();
-		if (!local_nonce) {
-			mutex_unlock(&state->lock);
-			return -EIO;
-		}
 		peer->auth_remote_nonce = remote->nonce;
 		peer->auth_local_nonce = local_nonce;
 		peer->auth_session_id = tbv_native_control_session_id(

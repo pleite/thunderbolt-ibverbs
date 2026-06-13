@@ -229,7 +229,7 @@ static int tbv_parse_peer_auth_acl(struct tbv_state *state, const char *acl)
 			kfree(dup);
 			return -EINVAL;
 		}
-		if (hex2bin((u8 *)&key, hex, sizeof(key))) {
+		if (hex2bin((u8 *)key.key, hex, sizeof(key.key))) {
 			pr_err("peer_auth_acl contains an invalid PSK entry\n");
 			kfree(dup);
 			return -EINVAL;
