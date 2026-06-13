@@ -306,6 +306,7 @@ struct tbv_peer {
 	struct tb_xdomain *xd;
 	struct list_head rails;
 	struct ida rail_ids;
+	atomic_t tx_sendq_reserved;
 	/* Serializes XDomain control and tunnel setup transactions per link. */
 	struct mutex control_lock;
 	u64 auth_local_nonce;
@@ -622,6 +623,7 @@ struct tbv_state {
 	atomic64_t apple_rx_resync_dropped;
 	atomic64_t apple_rx_rail_mismatch;
 	atomic64_t apple_rx_cq_overflow;
+	atomic64_t apple_rx_pending_bytes;
 	atomic64_t data_cq_overflow;
 	atomic64_t native_legacy_ambiguous_limited;
 	struct xarray verbs_mrs_xa;
