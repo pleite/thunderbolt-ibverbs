@@ -448,6 +448,7 @@ struct tbv_qp {
 	u32 rx_rnr_src_qp;
 	u32 rx_rnr_frag_offset;
 	u64 rx_rnr_remote_addr;
+	u64 peer_session_id;
 	struct tbv_rx_message rx_msg;
 	struct tbv_rx_write rx_write;
 	struct list_head rx_reorder;
@@ -861,6 +862,22 @@ static u32 tbv_qp_peer_id(const struct tbv_qp *tqp)
 	return tqp->rail->peer->peer_id;
 }
 
+static bool tbv_qp_native_session_matches(const struct tbv_qp *tqp)
+{
+	const struct tbv_peer *peer;
+	u64 session_id;
+
+	if (!tqp || !tqp->rail)
+		return false;
+
+	peer = tqp->rail->peer;
+	if (!peer || peer->backend != TBV_BACKEND_NATIVE)
+		return true;
+
+	session_id = READ_ONCE(peer->auth_established_session_id);
+	return tqp->peer_session_id && session_id == tqp->peer_session_id;
+}
+
 static struct tbv_mr *tbv_mr_get(struct tbv_state *state, u32 key, u32 peer_id)
 {
 	struct tbv_mr *mr;
@@ -1189,6 +1206,8 @@ tbv_qp_validate_native_endpoint(struct tbv_qp *tqp,
 	spin_lock_irqsave(&tqp->lock, flags);
 	if (tqp->closing || tqp->state == IB_QPS_ERR) {
 		status = TBV_RX_ENDPOINT_QP_ERROR;
+	} else if (!tbv_qp_native_session_matches(tqp)) {
+		status = TBV_RX_ENDPOINT_BAD_PEER;
 	} else if (hdr->dest_qp != tqp->base.qp_num) {
 		status = TBV_RX_ENDPOINT_BAD_PEER;
 	} else if (!tqp->dest_qp_known) {
@@ -1212,6 +1231,8 @@ tbv_qp_accept_recv_credit(struct tbv_qp *tqp,
 	spin_lock_irqsave(&tqp->lock, flags);
 	if (tqp->closing || tqp->state == IB_QPS_ERR) {
 		status = TBV_RX_ENDPOINT_QP_ERROR;
+	} else if (!tbv_qp_native_session_matches(tqp)) {
+		status = TBV_RX_ENDPOINT_BAD_PEER;
 	} else if (hdr->dest_qp != tqp->base.qp_num) {
 		status = TBV_RX_ENDPOINT_BAD_PEER;
 	} else if (tqp->dest_qp_known) {
@@ -2584,6 +2605,9 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 		mutex_unlock(&state->lock);
 		return -ENOTCONN;
 	}
+	if (tqp->backend == TBV_BACKEND_NATIVE && tqp->rail->peer)
+		tqp->peer_session_id =
+			tqp->rail->peer->auth_established_session_id;
 	mutex_unlock(&state->lock);
 	if (init_attr->cap.max_send_wr > TBV_IBDEV_MAX_QP_WR ||
 	    init_attr->cap.max_recv_wr > TBV_IBDEV_MAX_QP_WR ||
@@ -8246,6 +8270,32 @@ static void tbv_kunit_mr_peer_scope_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, tbv_mr_matches_peer_id(&mr, 8));
 }
 
+static void tbv_kunit_qp_native_session_match_test(struct kunit *test)
+{
+	struct tbv_peer peer = {
+		.backend = TBV_BACKEND_NATIVE,
+		.auth_acl_configured = true,
+		.auth_authenticated = true,
+		.auth_session_id = 11,
+		.auth_established_session_id = 11,
+	};
+	struct tbv_rail rail = {
+		.peer = &peer,
+	};
+	struct tbv_qp qp = {
+		.rail = &rail,
+		.peer_session_id = 11,
+	};
+
+	KUNIT_EXPECT_TRUE(test, tbv_qp_native_session_matches(&qp));
+	qp.peer_session_id = 12;
+	KUNIT_EXPECT_FALSE(test, tbv_qp_native_session_matches(&qp));
+	qp.peer_session_id = 11;
+	peer.auth_authenticated = false;
+	peer.auth_established_session_id = 0;
+	KUNIT_EXPECT_FALSE(test, tbv_qp_native_session_matches(&qp));
+}
+
 static void tbv_kunit_read_resp_queue_close_test(struct kunit *test)
 {
 	struct tbv_qp tqp = {};
@@ -8290,6 +8340,7 @@ static struct kunit_case tbv_ibdev_security_cases[] = {
 	KUNIT_CASE(tbv_kunit_rdma_write_header_valid_test),
 	KUNIT_CASE(tbv_kunit_rdma_write_header_with_imm_test),
 	KUNIT_CASE(tbv_kunit_mr_peer_scope_test),
+	KUNIT_CASE(tbv_kunit_qp_native_session_match_test),
 	KUNIT_CASE(tbv_kunit_read_resp_queue_close_test),
 	{}
 };
