@@ -5,6 +5,8 @@
 *** WARNING ***
 
 this is a research driver. It is buggy, it is insecure, it is not for production.
+see [docs/SECURITY.md](docs/SECURITY.md) for the current threat model and
+implemented hardening boundaries.
 for context, narrative, notes and benchmarks see the Hellas blog post:
 https://blog.hellas.ai/blog/thunderbolt-ibverbs/
 
