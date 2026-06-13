@@ -134,6 +134,8 @@ jobs:
   kernel-hygiene:
     name: kernel static-analysis + memory-safety
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -171,14 +173,17 @@ jobs:
             exit 0
           fi
 
-          perl "$checkpatch" --no-tree --strict --show-types --terse --file "${files[@]}"
+          perl "$checkpatch" --no-tree --strict --show-types --terse --file "${files[@]}" || {
+            echo "checkpatch found issues in changed kernel/proto files." >&2
+            exit 1
+          }
 
       - name: sparse build (warnings as errors)
         run: |
           make -C kernel \
             KVER="$(uname -r)" \
             KDIR="/lib/modules/$(uname -r)/build" \
-            C=2 CHECK=sparse CF=-Wsparse-error \
+            C=2 CHECK=sparse CF="-Wsparse-error" \
             modules
           make -C kernel \
             KVER="$(uname -r)" \
@@ -207,13 +212,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          config="/boot/config-$(uname -r)"
           for sanitizer in KASAN KCSAN; do
+            if [[ ! -r "$config" ]] || ! grep -q "^CONFIG_${sanitizer}=y" "$config"; then
+              echo "Runner kernel is not built with CONFIG_${sanitizer}=y; skipping ${sanitizer} module build target."
+              continue
+            fi
             make -C kernel \
               KVER="$(uname -r)" \
               KDIR="/lib/modules/$(uname -r)/build" \
               KCFLAGS="-Werror" \
               KBUILD_MODPOST_WARN=1 \
-              "CONFIG_${sanitizer}=y" \
               modules
             make -C kernel \
               KVER="$(uname -r)" \
@@ -229,35 +238,17 @@ jobs:
             echo "clang unavailable; skipping optional proto fuzzing."
             exit 0
           fi
-          cat > /tmp/tbv-proto-wire-fuzz.c <<'EOF'
-          #include <stddef.h>
-          #include <stdint.h>
-          #include <string.h>
-          #include "proto/native_wire.h"
-
-          int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
-          {
-          	struct tbv_native_wire_hello hello;
-          	struct tbv_native_wire_info info;
-          	uint8_t out[TBV_NATIVE_WIRE_HELLO_MSG_SIZE];
-          	int ret;
-
-          	memset(&hello, 0, sizeof(hello));
-          	memset(&info, 0, sizeof(info));
-          	ret = tbv_native_wire_parse_hello(data, size, &hello, &info);
-          	if (ret == 0) {
-          		(void)tbv_native_wire_build_hello(out, sizeof(out), &hello,
-          						  info.op, info.flags, info.seq,
-          						  info.route, info.xdomain_sequence);
-          	}
-          	return 0;
-          }
-          EOF
-          if ! clang -std=c11 -Wall -Wextra -Werror -fsanitize=fuzzer,address -I. /tmp/tbv-proto-wire-fuzz.c -o /tmp/tbv-proto-wire-fuzz; then
-            echo "libFuzzer toolchain unavailable; skipping optional proto fuzzing."
+          if ! clang \
+            -std=c11 -Wall -Wextra -Werror \
+            -fsanitize=fuzzer,address -I. \
+            tools/ci/proto-wire-fuzz.c \
+            -o /tmp/tbv-proto-wire-fuzz \
+            >/tmp/tbv-proto-wire-fuzz-build.log 2>&1; then
+            echo "Skipping optional proto fuzzing (fuzzer toolchain unavailable or compile warnings/errors):"
+            tail -n 20 /tmp/tbv-proto-wire-fuzz-build.log || true
             exit 0
           fi
-          /tmp/tbv-proto-wire-fuzz -max_total_time=15 -runs=0
+          /tmp/tbv-proto-wire-fuzz -max_total_time=15
 
   release:
     name: Publish GitHub Release
