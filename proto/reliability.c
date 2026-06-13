@@ -435,7 +435,7 @@ int tbv_rel_rx_on_data(struct tbv_rel_rx_op *rx,
 	}
 
 	if (!rx->active && tbv_rel_rx_find_cached_ack(rx, frame,
-						     &event->ack)) {
+						      &event->ack)) {
 		event->duplicate = true;
 		event->ack_valid = true;
 		return 0;
