@@ -26,9 +26,19 @@ on:
         default: ""
         type: string
       baseline_csv:
-        description: "Optional baseline CSV for regression comparison"
+        description: "Committed smoke baseline CSV for regression comparison"
         required: false
-        default: ""
+        default: "bench/perftest-smoke-baseline.csv"
+        type: string
+      bw_drop_pct:
+        description: "Maximum allowed bandwidth drop (%) vs baseline"
+        required: false
+        default: "7.5"
+        type: string
+      lat_rise_pct:
+        description: "Maximum allowed latency rise (%) vs baseline"
+        required: false
+        default: "12.5"
         type: string
       out_root:
         description: "Directory where run artifacts are written"
@@ -48,20 +58,37 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test -n "${{ inputs.baseline_csv }}"
           args=(
             --hosts "${{ inputs.hosts }}"
             --iface "${{ inputs.iface }}"
             --transport "${{ inputs.transport }}"
+            --require-baseline
+            --bw-drop-pct "${{ inputs.bw_drop_pct }}"
+            --lat-rise-pct "${{ inputs.lat_rise_pct }}"
             --out-root "${{ inputs.out_root }}"
           )
           if [[ -n "${{ inputs.wrapper }}" ]]; then
             args+=(--wrapper "${{ inputs.wrapper }}")
           fi
-          if [[ -n "${{ inputs.baseline_csv }}" ]]; then
-            args+=(--baseline-csv "${{ inputs.baseline_csv }}")
-          fi
+          args+=(--baseline-csv "${{ inputs.baseline_csv }}")
 
           nix run .#tbv-regression -- "${args[@]}"
+
+      - name: Summarize and enforce perftest smoke baseline
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          latest_csv="${{ inputs.out_root }}/latest/perftest-smoke.csv"
+          test -f "$latest_csv"
+          test -f "${{ inputs.baseline_csv }}"
+          python3 bench/summarize_perftest.py \
+            --baseline "${{ inputs.baseline_csv }}" \
+            --bw-drop-pct "${{ inputs.bw_drop_pct }}" \
+            --lat-rise-pct "${{ inputs.lat_rise_pct }}" \
+            --require-baseline-match \
+            "$latest_csv"
 
       - name: Upload regression artifacts
         if: always()

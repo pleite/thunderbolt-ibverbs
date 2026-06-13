@@ -87,11 +87,16 @@ What it records per run:
 - `vllm.log`, `perftest.log`
 - `perftest-smoke.csv`, `perftest-smoke.jsonl`
 
-By default it compares against `latest-success/perftest-smoke.csv` (if present)
-and fails if:
+The committed smoke baseline lives at `bench/perftest-smoke-baseline.csv`.
+`tbv-regression` falls back to `latest-success/perftest-smoke.csv` only when no
+explicit baseline is provided. The self-hosted GitHub Actions entrypoint passes
+the committed baseline and requires every smoke row to match it.
+
+The regression gate fails if:
 
 - bandwidth (`bw_avg_gbps`) drops by more than `--bw-drop-pct` (default `7.5`)
 - latency (`lat_typical_us`) rises by more than `--lat-rise-pct` (default `12.5`)
+- any smoke case/direction is missing from the baseline comparison
 
 Override or require baseline explicitly:
 
@@ -104,7 +109,8 @@ nix run .#tbv-regression -- \
 ```
 
 The self-hosted GitHub Actions entrypoint is
-`.github/workflows/regression-self-hosted.yml` (`workflow_dispatch`).
+`.github/workflows/regression-self-hosted.yml` (`workflow_dispatch`); it uses
+the committed baseline by default and exposes the thresholds as workflow inputs.
 
 ## Hot-unplug with in-flight traffic smoke
 
