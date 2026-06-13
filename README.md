@@ -87,6 +87,12 @@ tbv_vllm_smoke.sh \
   --require-rdma auto
 ```
 
+## Documentation
+
+- [Architecture overview](docs/ARCHITECTURE.md) — kernel module ↔ provider ↔ verbs layer diagram and data path description
+- [Troubleshooting guide](docs/TROUBLESHOOTING.md) — symptom-by-symptom checklist
+- [Contributing guide](docs/CONTRIBUTING.md) — build instructions, code style, and PR process
+
 ## Status
 
 - Native Linux-to-Linux verbs transport is the main path.
