@@ -46,14 +46,14 @@ static bool tbv_native_e2e_enabled(const struct tbv_peer *peer)
 int tbv_peer_auth_acl_index(const struct tbv_state *state,
 			    const struct tb_xdomain *xd)
 {
-	u32 i;
+	int i;
 
 	if (!state || !state->peer_auth_acl_enabled || !xd || !xd->remote_uuid)
 		return -ENOENT;
 
 	for (i = 0; i < state->peer_auth_acl_count; i++) {
 		if (uuid_equal(xd->remote_uuid, &state->peer_auth_acl_uuid[i]))
-			return (int)i;
+			return i;
 	}
 
 	return -ENOENT;
