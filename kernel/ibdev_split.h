@@ -39,13 +39,6 @@ struct tbv_state;
 struct tbv_path;
 struct tbv_native_data_header;
 
-int tbv_create_qp_impl(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
-			struct ib_udata *udata);
-int tbv_destroy_qp_impl(struct ib_qp *qp, struct ib_udata *udata);
-int tbv_modify_qp_impl(struct ib_qp *qp, struct ib_qp_attr *attr,
-			int attr_mask, struct ib_udata *udata);
-int tbv_query_qp_impl(struct ib_qp *qp, struct ib_qp_attr *qp_attr,
-			int qp_attr_mask, struct ib_qp_init_attr *qp_init_attr);
 int tbv_post_send_impl(struct ib_qp *qp, const struct ib_send_wr *wr,
 			const struct ib_send_wr **bad_wr);
 int tbv_post_recv_impl(struct ib_qp *qp, const struct ib_recv_wr *wr,

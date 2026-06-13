@@ -14,6 +14,7 @@
 
 #include <linux/atomic.h>
 #include <linux/completion.h>
+#include <linux/idr.h>
 #include <linux/refcount.h>
 #include <linux/spinlock.h>
 #include <linux/scatterlist.h>
@@ -466,5 +467,55 @@ struct tbv_state *tbv_ibdev_state(struct ib_device *ibdev);
 u32 tbv_ibdev_peer_id(struct ib_device *ibdev);
 void tbv_mr_free_work(struct work_struct *work);
 void tbv_mr_put(struct tbv_mr *mr);
+
+
+/* ---- QP unit cross-references ----
+ * QP create/destroy/modify/query live in ibdev_qp.c; the lifecycle and
+ * state-machine helpers they share with the data path are defined in ibdev.c.
+ */
+extern struct ida tbv_qpn_ida;
+extern uint apple_rx_pending_slots;
+extern uint apple_rx_pending_bytes;
+extern uint apple_rx_pending_total_bytes;
+
+int tbv_alloc_qpn(const struct tbv_state *state,
+			 enum tbv_backend_type backend);
+void tbv_apple_sq_work(struct work_struct *work);
+bool tbv_backend_is_apple(enum tbv_backend_type backend);
+void tbv_cancel_read_ctx_packets(struct tbv_read_ctx *read);
+void tbv_cancel_send_ctx_packets(struct tbv_send_ctx *send);
+void tbv_free_qpn(enum tbv_backend_type backend, u32 qpn);
+enum tbv_backend_type tbv_ibdev_backend(struct ib_device *ibdev);
+void tbv_qp_advertise_recv_credits(struct tbv_qp *tqp);
+void tbv_qp_begin_close(struct tbv_qp *tqp);
+void tbv_qp_cancel_read_resps(struct tbv_qp *tqp, struct list_head *flush);
+int tbv_qp_ensure_apple_tunnel(struct tbv_qp *tqp, bool *acquired);
+void tbv_qp_error_work(struct work_struct *work);
+void tbv_qp_flush_active_rx(struct tbv_qp *tqp);
+void tbv_qp_flush_apple_pending(struct tbv_qp *tqp);
+void tbv_qp_flush_apple_sq(struct tbv_qp *tqp);
+void tbv_qp_flush_error(struct tbv_qp *tqp);
+void tbv_qp_flush_reads(struct tbv_qp *tqp, struct list_head *flush);
+void tbv_qp_flush_reorder(struct tbv_qp *tqp);
+void tbv_qp_flush_sends(struct tbv_qp *tqp, struct list_head *flush);
+void tbv_qp_put(struct tbv_qp *tqp);
+void tbv_qp_release_apple_tunnel(struct tbv_qp *tqp);
+bool tbv_qp_state_uses_transport(enum ib_qp_state state);
+void tbv_qp_timeout_work(struct work_struct *work);
+void tbv_qp_unbind_rail(struct tbv_qp *tqp);
+bool tbv_qp_uses_apple_transport(const struct tbv_qp *tqp);
+bool tbv_read_complete(struct tbv_read_ctx *read, int status);
+void tbv_read_ctx_put(struct tbv_read_ctx *read);
+void tbv_read_resp_ctx_put(struct tbv_read_resp_ctx *ctx);
+struct tbv_rail *tbv_select_qp_rail_locked(struct tbv_ibdev *dev,
+					  enum tbv_backend_type backend,
+					  bool gsi, bool *counted);
+bool tbv_send_complete(struct tbv_send_ctx *send, int status);
+void tbv_send_ctx_put(struct tbv_send_ctx *send);
+struct tbv_ibdev *tbv_to_ibdev(struct ib_device *ibdev);
+int tbv_validate_modify_qp_locked(struct tbv_qp *tqp,
+					 struct ib_qp_attr *attr, int attr_mask,
+					 enum ib_qp_state *cur_state,
+					 enum ib_qp_state *next_state);
 
 #endif /* TBV_IBDEV_INTERNAL_H */
