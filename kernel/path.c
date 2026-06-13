@@ -163,7 +163,7 @@ static int tbv_path_configure_ring_throttling(struct tbv_path *path)
 
 	if (!tbv_compat_has_ring_throttling()) {
 		if (interval)
-			pr_warn_once("nhi_interrupt_throttle_ns requires a kernel exporting tb_ring_throttling(); ignoring interval %u ns\n",
+			pr_warn_once("nhi_interrupt_throttle_ns requires kernel Thunderbolt ring throttling support (for example Linux 6.14+); ignoring interval %u ns\n",
 				     interval);
 		return 0;
 	}

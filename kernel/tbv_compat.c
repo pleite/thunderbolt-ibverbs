@@ -12,7 +12,8 @@
 typedef int (*tbv_ring_throttling_fn)(struct tb_ring *ring,
 				      unsigned int interval_nsec);
 
-extern int tb_ring_throttling(struct tb_ring *ring, unsigned int interval_nsec);
+extern int tb_ring_throttling(struct tb_ring *ring, unsigned int interval_nsec)
+	__attribute__((weak));
 
 static tbv_ring_throttling_fn tbv_ring_throttling;
 

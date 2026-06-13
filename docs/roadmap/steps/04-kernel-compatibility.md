@@ -16,11 +16,11 @@ kernels.
 
 ### Kernel/feature compatibility matrix
 
-| Feature | Requirement | Behavior when unavailable |
+| Feature | Minimum kernel / requirement | Behavior when unavailable |
 | --- | --- | --- |
-| Module build/load and ring/path setup | Stock Thunderbolt/USB4 service + ring APIs (tested on current release kernel) | Module does not load if core Thunderbolt symbols are missing |
-| `nhi_interrupt_throttle_ns` ring interrupt throttling | Kernel exports `tb_ring_throttling()` | Parameter is accepted but ignored; default NHI interrupt throttling remains active |
-| Minimal TBnet identity MAC PHY-port derivation | Uses shimmed `(link - 1) / TB_LINKS_PER_PHY_PORT` mapping | No maintainer-tree dependency on `tb_phy_port_from_link()` |
+| Module build/load and ring/path setup | Linux 6.1+ stock kernels with Thunderbolt service/ring APIs (tested on 6.17) | Module does not load if core Thunderbolt symbols are missing |
+| `nhi_interrupt_throttle_ns` ring interrupt throttling | Linux 6.14+ / kernels exporting `tb_ring_throttling()` | Parameter is accepted but ignored; default NHI interrupt throttling remains active |
+| Minimal TBnet identity MAC PHY-port derivation | Linux 6.1+ (shimmed `(link - 1) / TB_LINKS_PER_PHY_PORT`) | No maintainer-tree dependency on `tb_phy_port_from_link()` |
 
 ### Acceptance criteria
 - [ ] A compatibility matrix in docs.
