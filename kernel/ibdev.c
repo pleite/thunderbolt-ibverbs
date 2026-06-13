@@ -84,6 +84,7 @@
 #define TBV_GSI_MAD_META_SGID_OFF 0
 #define TBV_GSI_MAD_META_DGID_OFF 16
 #define TBV_GSI_MAD_META_PKEY_OFF 32
+#define TBV_MR_KEY_ALLOC_MAX_ATTEMPTS 32
 static char *roce_netdev;
 module_param(roce_netdev, charp, 0444);
 MODULE_PARM_DESC(roce_netdev,
@@ -616,8 +617,6 @@ struct tbv_gsi_send_ctx {
 };
 
 static DEFINE_IDA(tbv_qpn_ida);
-static atomic_t tbv_mr_key = ATOMIC_INIT(1);
-
 static int tbv_cq_push(struct tbv_cq *tcq, const struct ib_wc *wc);
 static void tbv_send_ctx_put(struct tbv_send_ctx *send);
 static bool tbv_send_complete(struct tbv_send_ctx *send, int status);
@@ -8128,22 +8127,27 @@ static void tbv_rx_fail_active_write_locked(struct tbv_state *state,
 static bool tbv_rdma_write_header_valid(const struct tbv_native_data_header *hdr,
 					bool with_imm, u32 qp_access_flags)
 {
-	u32 total_len = with_imm ? 0 : hdr->imm_data;
+	bool last = hdr->flags & TBV_NATIVE_DATA_F_LAST;
+	bool header_flags_ok =
+		!(hdr->flags & ~(TBV_NATIVE_DATA_F_LAST |
+				 TBV_NATIVE_DATA_F_SOLICITED));
+	/* For WRITE_WITH_IMM, imm_data is immediate payload, not total length. */
+	u32 total_len_field = with_imm ? 0 : hdr->imm_data;
 	u64 frag_end;
 
-	if ((hdr->flags & ~(TBV_NATIVE_DATA_F_LAST |
-			    TBV_NATIVE_DATA_F_SOLICITED)) ||
+	if (!header_flags_ok ||
 	    check_add_overflow((u64)hdr->frag_offset, (u64)hdr->length,
 			       &frag_end) ||
 	    frag_end > TBV_NATIVE_DATA_MAX_MSG_SIZE ||
 	    !(qp_access_flags & IB_ACCESS_REMOTE_WRITE))
 		return false;
 	if (with_imm)
-		return hdr->length > 0 || (hdr->flags & TBV_NATIVE_DATA_F_LAST);
-	if (!total_len || total_len > TBV_NATIVE_DATA_MAX_MSG_SIZE ||
-	    frag_end > total_len || (!hdr->length && !(hdr->flags & TBV_NATIVE_DATA_F_LAST)))
+		return hdr->length > 0 || last;
+	if (!total_len_field ||
+	    total_len_field > TBV_NATIVE_DATA_MAX_MSG_SIZE ||
+	    frag_end > total_len_field || (!hdr->length && !last))
 		return false;
-	return (bool)(hdr->flags & TBV_NATIVE_DATA_F_LAST) == (frag_end == total_len);
+	return last == (frag_end == total_len_field);
 }
 
 #if IS_ENABLED(CONFIG_KUNIT)
@@ -9189,12 +9193,11 @@ static int tbv_mr_publish(struct tbv_mr *mr, struct ib_pd *pd)
 	refcount_set(&mr->refs, 1);
 	INIT_WORK(&mr->free_work, tbv_mr_free_work);
 
-	for (attempt = 0; attempt < 32; attempt++) {
-		u32 id = atomic_inc_return(&tbv_mr_key);
-
-		key = id ^ get_random_u32();
-		if (!key)
-			key = id ?: 1;
+	for (attempt = 0; attempt < TBV_MR_KEY_ALLOC_MAX_ATTEMPTS; attempt++) {
+		/* Key 0 is reserved/invalid for verbs MR lookup in this driver. */
+		do {
+			key = get_random_u32();
+		} while (!key);
 		mr->base.lkey = key;
 		mr->base.rkey = key;
 
@@ -9206,6 +9209,9 @@ static int tbv_mr_publish(struct tbv_mr *mr, struct ib_pd *pd)
 		if (ret != -EBUSY)
 			return ret;
 	}
+	if (ret == -EBUSY)
+		pr_warn_ratelimited("failed to allocate unique MR key after %u attempts\n",
+				    TBV_MR_KEY_ALLOC_MAX_ATTEMPTS);
 	if (ret)
 		return ret;
 
@@ -9249,12 +9255,13 @@ static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 {
 	struct tbv_mr *mr;
 	int ret;
-	u64 end;
+	u64 start_end;
+	u64 virt_end;
 
 	if (!length)
 		return ERR_PTR(-EINVAL);
-	if (check_add_overflow(start, length, &end) ||
-	    check_add_overflow(virt_addr, length, &end))
+	if (check_add_overflow(start, length, &start_end) ||
+	    check_add_overflow(virt_addr, length, &virt_end))
 		return ERR_PTR(-EINVAL);
 
 	mr = kzalloc(sizeof(*mr), GFP_KERNEL);

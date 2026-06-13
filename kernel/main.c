@@ -141,12 +141,11 @@ static int tbv_parse_peer_allowlist(struct tbv_state *state, const char *allowli
 		u32 i;
 		bool duplicate = false;
 
-		token = skip_spaces(token);
 		strim(token);
 		if (!*token)
 			continue;
 		if (uuid_parse(token, &parsed)) {
-			pr_err("peer_allowlist contains invalid UUID: %s\n", token);
+			pr_err("peer_allowlist contains an invalid UUID entry\n");
 			kfree(dup);
 			return -EINVAL;
 		}

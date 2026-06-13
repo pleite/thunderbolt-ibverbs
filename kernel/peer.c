@@ -56,6 +56,10 @@ static bool tbv_peer_is_allowlisted(const struct tbv_state *state,
 
 	if (!state->peer_allowlist_enabled)
 		return true;
+	/*
+	 * Some source-blind/legacy discovery paths do not provide a stable
+	 * remote UUID. With allow-listing enabled we fail closed in that case.
+	 */
 	if (!xd || !xd->remote_uuid)
 		return false;
 
