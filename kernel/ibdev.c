@@ -995,14 +995,14 @@ tbv_qp_timeout_interval_jiffies_locked(const struct tbv_qp *tqp)
 }
 
 static unsigned long tbv_send_retry_jiffies(unsigned long qp_timeout,
-					    u8 max_retries)
+					    u8 retries)
 {
 	tbv_rel_u64 retry;
 
 	if (!qp_timeout)
 		return 0;
 
-	retry = tbv_rel_retry_interval(qp_timeout, max_retries);
+	retry = tbv_rel_retry_interval(qp_timeout, retries);
 	return retry > MAX_JIFFY_OFFSET ? MAX_JIFFY_OFFSET :
 					  (unsigned long)retry;
 }
@@ -3472,7 +3472,7 @@ static bool tbv_qp_timeout_reap_tx(struct tbv_qp *tqp,
 		u8 max_retries = send->max_retries;
 		unsigned long send_timeout =
 			(send->retryable && max_retries) ?
-				tbv_send_retry_jiffies(timeout, max_retries) :
+				tbv_send_retry_jiffies(timeout, send->retries) :
 				timeout;
 		unsigned long rnr_timeout =
 			tbv_rnr_timer_jiffies(tqp->attr.min_rnr_timer);

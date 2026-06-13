@@ -2,6 +2,7 @@
 #include "reliability.h"
 
 #ifdef __KERNEL__
+#include <linux/random.h>
 #include <linux/string.h>
 #else
 #include <string.h>
@@ -216,9 +217,42 @@ int tbv_rel_tx_on_ack(struct tbv_rel_tx_op *tx,
 tbv_rel_u64 tbv_rel_retry_interval(tbv_rel_u64 ack_timeout,
 				   tbv_rel_u32 retry_budget)
 {
-	(void)retry_budget;
+	tbv_rel_u32 shift = retry_budget;
+	tbv_rel_u64 backoff = ack_timeout;
+	tbv_rel_u64 jittered;
+	tbv_rel_u32 jitter_pct;
 
-	return ack_timeout;
+	if (!ack_timeout)
+		return 0;
+
+	if (shift > 20)
+		shift = 20;
+	if (shift) {
+		if (backoff > (~0ull >> shift))
+			backoff = ~0ull;
+		else
+			backoff <<= shift;
+	}
+
+#ifdef __KERNEL__
+	jitter_pct = 875u + (get_random_u32() % 251u);
+#else
+	{
+		tbv_rel_u32 x = (tbv_rel_u32)ack_timeout ^
+				(retry_budget * 2654435761u);
+
+		x ^= x >> 16;
+		x *= 2246822519u;
+		x ^= x >> 13;
+		jitter_pct = 875u + (x % 251u);
+	}
+#endif
+	if (backoff > (~0ull / jitter_pct))
+		jittered = ~0ull;
+	else
+		jittered = backoff * jitter_pct;
+
+	return jittered / 1000u;
 }
 
 tbv_rel_u64 tbv_rel_ack_timeout_ns(tbv_rel_u8 timeout)
