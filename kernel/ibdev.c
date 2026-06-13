@@ -215,73 +215,54 @@ DEFINE_IDA(tbv_qpn_ida);
  */
 
 static int tbv_cq_push(struct tbv_cq *tcq, const struct ib_wc *wc);
-void tbv_send_ctx_put(struct tbv_send_ctx *send);
-bool tbv_send_complete(struct tbv_send_ctx *send, int status);
 static void tbv_send_tx_done(void *ctx, int status);
 static void tbv_apple_send_tx_done(void *ctx, int status);
-void tbv_apple_sq_work(struct work_struct *work);
-void tbv_qp_flush_apple_sq(struct tbv_qp *tqp);
-void tbv_read_ctx_put(struct tbv_read_ctx *read);
-bool tbv_read_complete(struct tbv_read_ctx *read, int status);
 static void tbv_read_tx_done(void *ctx, int status);
 static void tbv_read_resp_ctx_get(struct tbv_read_resp_ctx *ctx);
-void tbv_read_resp_ctx_put(struct tbv_read_resp_ctx *ctx);
 static int tbv_send_read_response_ctx(struct tbv_read_resp_ctx *ctx);
 static int tbv_umem_page_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
-				   struct page **page_out,
-				   u32 *page_off_out, u32 *len_out);
+					   struct page **page_out,
+					   u32 *page_off_out, u32 *len_out);
 static int tbv_rx_copy_to_wqe(struct tbv_state *state,
 			      const struct tbv_qp *tqp,
 			      const struct tbv_recv_wqe *wqe, u32 offset,
 			      const void *payload, u32 len, u32 *delivered);
-void tbv_qp_flush_reorder(struct tbv_qp *tqp);
-void tbv_qp_flush_active_rx(struct tbv_qp *tqp);
-void tbv_qp_release_apple_tunnel(struct tbv_qp *tqp);
 static void tbv_rx_fail_active_send(struct tbv_state *state, struct tbv_qp *tqp,
-				    struct tbv_path *rx_path,
-				    enum ib_wc_status status);
-static void tbv_rx_fail_active_write_locked(struct tbv_state *state,
-					    struct tbv_qp *tqp,
 					    struct tbv_path *rx_path,
 					    enum ib_wc_status status);
-void tbv_qp_flush_error(struct tbv_qp *tqp);
+static void tbv_rx_fail_active_write_locked(struct tbv_state *state,
+						    struct tbv_qp *tqp,
+						    struct tbv_path *rx_path,
+						    enum ib_wc_status status);
 static void tbv_rx_drop_reorder_msg_locked(struct tbv_state *state,
-					   struct tbv_qp *tqp,
-					   struct tbv_rx_reorder_msg *msg);
-void tbv_rx_drain_reorder_locked(struct tbv_state *state,
-					struct tbv_qp *tqp,
-					struct tbv_path *rx_path);
-void tbv_qp_flush_apple_pending(struct tbv_qp *tqp);
-void tbv_apple_rx_drain_pending_locked(struct tbv_state *state,
-					      struct tbv_qp *tqp);
-void tbv_qp_advertise_recv_credits(struct tbv_qp *tqp);
+						   struct tbv_qp *tqp,
+						   struct tbv_rx_reorder_msg *msg);
 static int tbv_qp_consume_remote_recv_credit(struct tbv_qp *tqp);
 static void tbv_qp_return_remote_recv_credit(struct tbv_qp *tqp);
 static u32 tbv_collect_native_data_paths_for_qp_locked(struct tbv_qp *tqp,
-						       struct tbv_path **paths,
-						       u32 max_paths);
+							       struct tbv_path **paths,
+							       u32 max_paths);
 static void tbv_release_path_refs(struct tbv_path **paths, u32 path_count);
 static int tbv_send_ack(struct tbv_qp *tqp, u32 dest_qp, u32 src_qp,
 			u32 psn, int status);
 static int tbv_send_ack_on_path(struct tbv_qp *tqp,
-				struct tbv_path *rx_path, u32 dest_qp,
-				u32 src_qp, u32 psn, int status);
+					struct tbv_path *rx_path, u32 dest_qp,
+					u32 src_qp, u32 psn, int status);
 static int tbv_send_read_ack_on_path(struct tbv_qp *tqp,
-				     struct tbv_path *rx_path, u32 dest_qp,
-				     u32 src_qp, u32 psn, int status);
+					     struct tbv_path *rx_path, u32 dest_qp,
+					     u32 src_qp, u32 psn, int status);
 static int tbv_send_read_status_on_path(struct tbv_qp *tqp,
-					struct tbv_path *rx_path,
-					u32 dest_qp, u32 src_qp, u32 psn,
-					u32 total_len, int status);
+						struct tbv_path *rx_path,
+						u32 dest_qp, u32 src_qp, u32 psn,
+						u32 total_len, int status);
 static void tbv_rx_queue_rdma_read_req_work(struct tbv_state *state,
-					    struct tbv_qp *tqp,
-					    const struct tbv_native_data_header *hdr,
-					    struct tbv_path *rx_path);
-void tbv_qp_timeout_work(struct work_struct *work);
+						    struct tbv_qp *tqp,
+						    const struct tbv_native_data_header *hdr,
+						    struct tbv_path *rx_path);
 static void tbv_release_send_segments(struct tbv_send_segment *segs,
-				      int nsegs);
+					      int nsegs);
 static int tbv_native_send_ctx_post_frames(struct tbv_send_ctx *ctx,
-					   enum tbv_send_post_reason reason);
+						   enum tbv_send_post_reason reason);
 
 static u32 tbv_psn_next(u32 psn)
 {
