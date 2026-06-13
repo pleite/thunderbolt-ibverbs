@@ -24,6 +24,11 @@
 static void tbv_native_control_work(struct work_struct *work);
 
 struct tbv_native_auth_material {
+	/*
+	 * Canonical SipHash input for native control-plane authentication.
+	 * Both peers hash the same op + nonce/session/UUID tuple to derive the
+	 * per-peer session ID and the HELLO/READY authentication tags.
+	 */
 	u8 op;
 	u8 reserved[7];
 	u64 initiator_nonce;
@@ -87,8 +92,9 @@ static int tbv_native_control_prepare_initiator_hello(struct tbv_state *state,
 		return -EACCES;
 
 	mutex_lock(&state->lock);
-	if (!peer->auth_local_nonce) {
+	if (!peer->auth_local_nonce_valid) {
 		peer->auth_local_nonce = get_random_u64();
+		peer->auth_local_nonce_valid = true;
 		peer->auth_remote_nonce = 0;
 		peer->auth_session_id = 0;
 		peer->auth_challenge_valid = false;
@@ -120,6 +126,7 @@ static int tbv_native_control_accept_responder_hello(
 		local_nonce = get_random_u64();
 		peer->auth_remote_nonce = remote->nonce;
 		peer->auth_local_nonce = local_nonce;
+		peer->auth_local_nonce_valid = true;
 		peer->auth_session_id = tbv_native_control_session_id(
 			peer, remote->nonce, local_nonce);
 		peer->auth_challenge_valid = peer->auth_session_id != 0;
@@ -152,7 +159,7 @@ static int tbv_native_control_verify_hello_ack(struct tbv_state *state,
 		return -EACCES;
 
 	mutex_lock(&state->lock);
-	if (!peer->auth_local_nonce) {
+	if (!peer->auth_local_nonce_valid) {
 		mutex_unlock(&state->lock);
 		return -EACCES;
 	}
@@ -187,7 +194,7 @@ static int tbv_native_control_prepare_initiator_ready(struct tbv_state *state,
 
 	mutex_lock(&state->lock);
 	if (peer->auth_challenge_valid && peer->auth_ack_verified &&
-	    peer->auth_local_nonce && peer->auth_remote_nonce &&
+	    peer->auth_local_nonce_valid && peer->auth_remote_nonce &&
 	    peer->auth_session_id) {
 		hello->auth_flags = TBV_NATIVE_WIRE_AUTH_REQUIRED;
 		hello->nonce = peer->auth_local_nonce;

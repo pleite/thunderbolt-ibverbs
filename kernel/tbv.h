@@ -313,6 +313,7 @@ struct tbv_peer {
 	u64 auth_session_id;
 	u32 auth_acl_index;
 	bool auth_acl_configured;
+	bool auth_local_nonce_valid;
 	bool auth_challenge_valid;
 	bool auth_ack_verified;
 	bool auth_authenticated;

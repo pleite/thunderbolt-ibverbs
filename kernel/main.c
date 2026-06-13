@@ -19,6 +19,8 @@
 #include "tbv.h"
 
 #define TBV_HEX_CHARS_PER_BYTE 2
+#define TBV_PEER_AUTH_PSK_HEX_LEN \
+	(TBV_PEER_AUTH_PSK_LEN * TBV_HEX_CHARS_PER_BYTE)
 
 static char *compat = "auto";
 module_param(compat, charp, 0444);
@@ -222,7 +224,7 @@ static int tbv_parse_peer_auth_acl(struct tbv_state *state, const char *acl)
 		strim(token);
 		strim(hex);
 		if (!*token || !*hex ||
-		    strlen(hex) != TBV_PEER_AUTH_PSK_LEN * TBV_HEX_CHARS_PER_BYTE) {
+		    strlen(hex) != TBV_PEER_AUTH_PSK_HEX_LEN) {
 			pr_err("peer_auth_acl entries must use uuid=32hexpsk\n");
 			kfree(dup);
 			return -EINVAL;

@@ -76,6 +76,7 @@ void tbv_peer_auth_reset(struct tbv_peer *peer)
 	peer->auth_local_nonce = 0;
 	peer->auth_remote_nonce = 0;
 	peer->auth_session_id = 0;
+	peer->auth_local_nonce_valid = false;
 	peer->auth_challenge_valid = false;
 	peer->auth_ack_verified = false;
 	peer->auth_authenticated = false;
@@ -224,7 +225,7 @@ struct tbv_peer *tbv_peer_get_or_create(struct tbv_state *state,
 	if (backend == TBV_BACKEND_NATIVE) {
 		auth_acl_index = tbv_peer_auth_acl_index(state, xd);
 		if (auth_acl_index < 0) {
-			pr_warn_ratelimited("peer rejected by auth ACL backend=%s route=0x%llx link=%u depth=%u remote_uuid=%pUb\n",
+			pr_warn_ratelimited("peer rejected by auth ACL (no matching native PSK entry) backend=%s route=0x%llx link=%u depth=%u remote_uuid=%pUb\n",
 					    tbv_backend_name(backend),
 					    xd ? (unsigned long long)xd->route : 0ULL,
 					    xd ? xd->link : 0,
