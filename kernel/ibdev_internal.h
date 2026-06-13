@@ -518,4 +518,20 @@ int tbv_validate_modify_qp_locked(struct tbv_qp *tqp,
 					 enum ib_qp_state *cur_state,
 					 enum ib_qp_state *next_state);
 
+/* ---- post_send/post_recv unit cross-references ----
+ * tbv_post_send/tbv_post_recv live in ibdev_qp.c; the data-path build and
+ * receive-queue helpers they call are defined in ibdev.c.
+ */
+int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr);
+bool tbv_qp_allows_post(struct tbv_qp *tqp);
+void tbv_recv_wqe_set_wr(struct tbv_qp *tqp, struct tbv_recv_wqe *wqe,
+			 const struct ib_recv_wr *wr);
+bool tbv_qp_accepts_kernel_dma_lkey(const struct tbv_qp *tqp, u32 lkey);
+struct tbv_mr *tbv_mr_get(struct tbv_state *state, u32 key, u32 peer_id);
+u32 tbv_qp_peer_id(const struct tbv_qp *tqp);
+void tbv_apple_rx_drain_pending_locked(struct tbv_state *state,
+				       struct tbv_qp *tqp);
+void tbv_rx_drain_reorder_locked(struct tbv_state *state, struct tbv_qp *tqp,
+				 struct tbv_path *rx_path);
+
 #endif /* TBV_IBDEV_INTERNAL_H */

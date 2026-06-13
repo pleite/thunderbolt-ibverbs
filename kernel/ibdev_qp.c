@@ -401,14 +401,136 @@ int tbv_query_qp(struct ib_qp *qp, struct ib_qp_attr *attr,
 		*init_attr = tqp->init_attr;
 	return 0;
 }
+
 int tbv_post_send(struct ib_qp *qp, const struct ib_send_wr *wr,
-  const struct ib_send_wr **bad_wr)
+			 const struct ib_send_wr **bad_wr)
 {
-return tbv_post_send_impl(qp, wr, bad_wr);
+	struct tbv_qp *tqp = container_of(qp, struct tbv_qp, base);
+	const struct ib_send_wr *cur;
+	int ret;
+
+	for (cur = wr; cur; cur = cur->next) {
+		ret = tbv_post_send_one(tqp, cur);
+		if (ret) {
+			if (bad_wr)
+				*bad_wr = cur;
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+static int tbv_validate_recv_sge(struct tbv_qp *tqp, const struct ib_sge *sge)
+{
+	struct tbv_mr *mr;
+	u64 mr_end;
+	u64 end;
+	int ret = 0;
+
+	if (!sge->length)
+		return 0;
+	if (tbv_qp_accepts_kernel_dma_lkey(tqp, sge->lkey))
+		return ib_virt_dma_to_ptr(sge->addr) ? 0 : -EFAULT;
+	if (check_add_overflow(sge->addr, (u64)sge->length, &end))
+		return -EINVAL;
+
+	mr = tbv_mr_get(tqp->owner, sge->lkey, tbv_qp_peer_id(tqp));
+	if (!mr)
+		return -EINVAL;
+	if (!(mr->access & IB_ACCESS_LOCAL_WRITE)) {
+		ret = -EACCES;
+		goto err_put;
+	}
+	if (check_add_overflow(mr->start, mr->length, &mr_end)) {
+		ret = -EINVAL;
+		goto err_put;
+	}
+	if (sge->addr < mr->start || end > mr_end) {
+		ret = -EFAULT;
+		goto err_put;
+	}
+
+	tbv_mr_put(mr);
+	return 0;
+
+err_put:
+	tbv_mr_put(mr);
+	return ret;
 }
 
 int tbv_post_recv(struct ib_qp *qp, const struct ib_recv_wr *wr,
-  const struct ib_recv_wr **bad_wr)
+			 const struct ib_recv_wr **bad_wr)
 {
-return tbv_post_recv_impl(qp, wr, bad_wr);
+	struct tbv_qp *tqp = container_of(qp, struct tbv_qp, base);
+	unsigned long flags;
+	const struct ib_recv_wr *cur;
+	u32 posted = 0;
+	int ret;
+
+	if (!tbv_qp_allows_post(tqp)) {
+		if (bad_wr)
+			*bad_wr = wr;
+		return -EINVAL;
+	}
+
+	for (cur = wr; cur; cur = cur->next) {
+		const struct ib_sge *sge = NULL;
+
+		if (cur->num_sge > 1) {
+			ret = -EINVAL;
+			goto err_bad;
+		}
+		if (cur->num_sge == 1) {
+			sge = cur->sg_list;
+			if (!sge) {
+				ret = -EINVAL;
+				goto err_bad;
+			}
+			ret = tbv_validate_recv_sge(tqp, sge);
+			if (ret)
+				goto err_bad;
+		}
+
+		spin_lock_irqsave(&tqp->lock, flags);
+		if (tqp->closing || tqp->state == IB_QPS_RESET ||
+		    tqp->state == IB_QPS_ERR) {
+			spin_unlock_irqrestore(&tqp->lock, flags);
+			ret = -EINVAL;
+			goto err_bad;
+		}
+		if (tqp->recv_count == tqp->recvq_size) {
+			spin_unlock_irqrestore(&tqp->lock, flags);
+			ret = -ENOMEM;
+			goto err_bad;
+		}
+
+		tbv_recv_wqe_set_wr(tqp, &tqp->recvq[tqp->recv_tail], cur);
+		tqp->recvq[tqp->recv_tail].addr = sge ? sge->addr : 0;
+		tqp->recvq[tqp->recv_tail].length = sge ? sge->length : 0;
+		tqp->recvq[tqp->recv_tail].lkey = sge ? sge->lkey : 0;
+		tqp->recv_tail = (tqp->recv_tail + 1) % tqp->recvq_size;
+		tqp->recv_count++;
+		posted++;
+		atomic_inc(&tqp->owner->verbs_recv_wqes);
+		spin_unlock_irqrestore(&tqp->lock, flags);
+	}
+
+	if (posted)
+		tbv_qp_advertise_recv_credits(tqp);
+	if (posted) {
+		mutex_lock(&tqp->rx_lock);
+		if (tbv_qp_uses_apple_transport(tqp))
+			tbv_apple_rx_drain_pending_locked(tqp->owner, tqp);
+		tbv_rx_drain_reorder_locked(tqp->owner, tqp, NULL);
+		mutex_unlock(&tqp->rx_lock);
+	}
+	return 0;
+
+err_bad:
+	if (posted)
+		tbv_qp_advertise_recv_credits(tqp);
+	if (bad_wr)
+		*bad_wr = cur;
+	return ret;
 }

@@ -39,11 +39,6 @@ struct tbv_state;
 struct tbv_path;
 struct tbv_native_data_header;
 
-int tbv_post_send_impl(struct ib_qp *qp, const struct ib_send_wr *wr,
-			const struct ib_send_wr **bad_wr);
-int tbv_post_recv_impl(struct ib_qp *qp, const struct ib_recv_wr *wr,
-			const struct ib_recv_wr **bad_wr);
-
 void tbv_ibdev_rx_frame_impl(struct tbv_state *state, struct tbv_path *rx_path,
 			const void *data, u32 len);
 void tbv_ibdev_rx_native_frame_impl(struct tbv_state *state,

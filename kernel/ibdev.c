@@ -248,11 +248,11 @@ void tbv_qp_flush_error(struct tbv_qp *tqp);
 static void tbv_rx_drop_reorder_msg_locked(struct tbv_state *state,
 					   struct tbv_qp *tqp,
 					   struct tbv_rx_reorder_msg *msg);
-static void tbv_rx_drain_reorder_locked(struct tbv_state *state,
+void tbv_rx_drain_reorder_locked(struct tbv_state *state,
 					struct tbv_qp *tqp,
 					struct tbv_path *rx_path);
 void tbv_qp_flush_apple_pending(struct tbv_qp *tqp);
-static void tbv_apple_rx_drain_pending_locked(struct tbv_state *state,
+void tbv_apple_rx_drain_pending_locked(struct tbv_state *state,
 					      struct tbv_qp *tqp);
 void tbv_qp_advertise_recv_credits(struct tbv_qp *tqp);
 static int tbv_qp_consume_remote_recv_credit(struct tbv_qp *tqp);
@@ -318,7 +318,7 @@ static bool tbv_qp_is_kernel_gsi(const struct tbv_qp *tqp)
 	return tqp && tqp->type == IB_QPT_GSI && !tqp->base.uobject;
 }
 
-static bool tbv_qp_accepts_kernel_dma_lkey(const struct tbv_qp *tqp,
+bool tbv_qp_accepts_kernel_dma_lkey(const struct tbv_qp *tqp,
 					   u32 lkey)
 {
 	return tbv_qp_is_kernel_gsi(tqp) &&
@@ -342,7 +342,7 @@ static void *tbv_kernel_dma_sge_ptr(const struct tbv_qp *tqp,
 	return ib_virt_dma_to_ptr(sge->addr);
 }
 
-static void tbv_recv_wqe_set_wr(struct tbv_qp *tqp, struct tbv_recv_wqe *wqe,
+void tbv_recv_wqe_set_wr(struct tbv_qp *tqp, struct tbv_recv_wqe *wqe,
 				const struct ib_recv_wr *wr)
 {
 	if (!wqe || !wr)
@@ -440,7 +440,7 @@ static struct tbv_peer *tbv_qp_peer(const struct tbv_qp *tqp)
 	return tqp->rail->peer;
 }
 
-static u32 tbv_qp_peer_id(const struct tbv_qp *tqp)
+u32 tbv_qp_peer_id(const struct tbv_qp *tqp)
 {
 	struct tbv_peer *peer = tbv_qp_peer(tqp);
 
@@ -463,7 +463,7 @@ static bool tbv_qp_native_session_matches(const struct tbv_qp *tqp)
 	return tqp->peer_session_id && session_id == tqp->peer_session_id;
 }
 
-static struct tbv_mr *tbv_mr_get(struct tbv_state *state, u32 key, u32 peer_id)
+struct tbv_mr *tbv_mr_get(struct tbv_state *state, u32 key, u32 peer_id)
 {
 	struct tbv_mr *mr;
 	XA_STATE(xas, &state->verbs_mrs_xa, key);
@@ -757,7 +757,7 @@ static void tbv_qp_queue_error(struct tbv_qp *tqp)
 		tbv_qp_put(tqp);
 }
 
-static bool tbv_qp_allows_post(struct tbv_qp *tqp)
+bool tbv_qp_allows_post(struct tbv_qp *tqp)
 {
 	unsigned long flags;
 	bool allowed;
@@ -4375,7 +4375,7 @@ err_put_qp:
 	return ret;
 }
 
-static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
+int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 {
 	struct tbv_send_segment segs[TBV_IBDEV_MAX_SGE] = {};
 	struct tbv_send_ctx *ctx;
@@ -4545,138 +4545,7 @@ err_put_qp:
 	return ret;
 }
 
-int tbv_post_send_impl(struct ib_qp *qp, const struct ib_send_wr *wr,
-			 const struct ib_send_wr **bad_wr)
-{
-	struct tbv_qp *tqp = container_of(qp, struct tbv_qp, base);
-	const struct ib_send_wr *cur;
-	int ret;
-
-	for (cur = wr; cur; cur = cur->next) {
-		ret = tbv_post_send_one(tqp, cur);
-		if (ret) {
-			if (bad_wr)
-				*bad_wr = cur;
-			return ret;
-		}
-	}
-
-	return 0;
-}
-
-static int tbv_validate_recv_sge(struct tbv_qp *tqp, const struct ib_sge *sge)
-{
-	struct tbv_mr *mr;
-	u64 mr_end;
-	u64 end;
-	int ret = 0;
-
-	if (!sge->length)
-		return 0;
-	if (tbv_qp_accepts_kernel_dma_lkey(tqp, sge->lkey))
-		return ib_virt_dma_to_ptr(sge->addr) ? 0 : -EFAULT;
-	if (check_add_overflow(sge->addr, (u64)sge->length, &end))
-		return -EINVAL;
-
-	mr = tbv_mr_get(tqp->owner, sge->lkey, tbv_qp_peer_id(tqp));
-	if (!mr)
-		return -EINVAL;
-	if (!(mr->access & IB_ACCESS_LOCAL_WRITE)) {
-		ret = -EACCES;
-		goto err_put;
-	}
-	if (check_add_overflow(mr->start, mr->length, &mr_end)) {
-		ret = -EINVAL;
-		goto err_put;
-	}
-	if (sge->addr < mr->start || end > mr_end) {
-		ret = -EFAULT;
-		goto err_put;
-	}
-
-	tbv_mr_put(mr);
-	return 0;
-
-err_put:
-	tbv_mr_put(mr);
-	return ret;
-}
-
-int tbv_post_recv_impl(struct ib_qp *qp, const struct ib_recv_wr *wr,
-			 const struct ib_recv_wr **bad_wr)
-{
-	struct tbv_qp *tqp = container_of(qp, struct tbv_qp, base);
-	unsigned long flags;
-	const struct ib_recv_wr *cur;
-	u32 posted = 0;
-	int ret;
-
-	if (!tbv_qp_allows_post(tqp)) {
-		if (bad_wr)
-			*bad_wr = wr;
-		return -EINVAL;
-	}
-
-	for (cur = wr; cur; cur = cur->next) {
-		const struct ib_sge *sge = NULL;
-
-		if (cur->num_sge > 1) {
-			ret = -EINVAL;
-			goto err_bad;
-		}
-		if (cur->num_sge == 1) {
-			sge = cur->sg_list;
-			if (!sge) {
-				ret = -EINVAL;
-				goto err_bad;
-			}
-			ret = tbv_validate_recv_sge(tqp, sge);
-			if (ret)
-				goto err_bad;
-		}
-
-		spin_lock_irqsave(&tqp->lock, flags);
-		if (tqp->closing || tqp->state == IB_QPS_RESET ||
-		    tqp->state == IB_QPS_ERR) {
-			spin_unlock_irqrestore(&tqp->lock, flags);
-			ret = -EINVAL;
-			goto err_bad;
-		}
-		if (tqp->recv_count == tqp->recvq_size) {
-			spin_unlock_irqrestore(&tqp->lock, flags);
-			ret = -ENOMEM;
-			goto err_bad;
-		}
-
-		tbv_recv_wqe_set_wr(tqp, &tqp->recvq[tqp->recv_tail], cur);
-		tqp->recvq[tqp->recv_tail].addr = sge ? sge->addr : 0;
-		tqp->recvq[tqp->recv_tail].length = sge ? sge->length : 0;
-		tqp->recvq[tqp->recv_tail].lkey = sge ? sge->lkey : 0;
-		tqp->recv_tail = (tqp->recv_tail + 1) % tqp->recvq_size;
-		tqp->recv_count++;
-		posted++;
-		atomic_inc(&tqp->owner->verbs_recv_wqes);
-		spin_unlock_irqrestore(&tqp->lock, flags);
-	}
-
-	if (posted)
-		tbv_qp_advertise_recv_credits(tqp);
-	if (posted) {
-		mutex_lock(&tqp->rx_lock);
-		if (tbv_qp_uses_apple_transport(tqp))
-			tbv_apple_rx_drain_pending_locked(tqp->owner, tqp);
-		tbv_rx_drain_reorder_locked(tqp->owner, tqp, NULL);
-		mutex_unlock(&tqp->rx_lock);
-	}
-	return 0;
-
-err_bad:
-	if (posted)
-		tbv_qp_advertise_recv_credits(tqp);
-	if (bad_wr)
-		*bad_wr = cur;
-	return ret;
-}
+	/* tbv_post_send / tbv_post_recv moved to ibdev_qp.c (R7 split) */
 
 static bool tbv_qp_pop_recv(struct tbv_qp *tqp, struct tbv_recv_wqe *wqe)
 {
@@ -4894,7 +4763,7 @@ static void tbv_apple_rx_push_wc(struct tbv_qp *tqp,
 	}
 }
 
-static void tbv_apple_rx_drain_pending_locked(struct tbv_state *state,
+void tbv_apple_rx_drain_pending_locked(struct tbv_state *state,
 					      struct tbv_qp *tqp)
 {
 	while (tqp->apple_pending_ready_count) {
@@ -6772,7 +6641,7 @@ static bool tbv_rx_deliver_reorder_read_req_locked(struct tbv_state *state,
 	return true;
 }
 
-static void tbv_rx_drain_reorder_locked(struct tbv_state *state,
+void tbv_rx_drain_reorder_locked(struct tbv_state *state,
 					struct tbv_qp *tqp,
 					struct tbv_path *rx_path)
 {
