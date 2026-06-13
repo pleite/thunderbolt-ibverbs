@@ -54,6 +54,27 @@ static bool tbv_peer_matches(const struct tbv_peer *peer,
 	return peer->backend == backend && peer->xd == xd;
 }
 
+static bool tbv_peer_is_allowlisted(const struct tbv_state *state,
+				    const struct tb_xdomain *xd)
+{
+	u32 i;
+
+	if (!state->peer_allowlist_enabled)
+		return true;
+	/*
+	 * Some source-blind/legacy discovery paths do not provide a stable
+	 * remote UUID. With allow-listing enabled we fail closed in that case.
+	 */
+	if (!xd || !xd->remote_uuid)
+		return false;
+
+	for (i = 0; i < state->peer_allowlist_count; i++) {
+		if (uuid_equal(xd->remote_uuid, &state->peer_allowlist[i]))
+			return true;
+	}
+	return false;
+}
+
 static bool tbv_xdomain_same_remote_host(const struct tb_xdomain *a,
 					 const struct tb_xdomain *b)
 {
@@ -142,6 +163,18 @@ struct tbv_peer *tbv_peer_get_or_create(struct tbv_state *state,
 	mutex_init(&peer->control_lock);
 
 	mutex_lock(&state->lock);
+	if (!tbv_peer_is_allowlisted(state, xd)) {
+		pr_warn_ratelimited("peer rejected by allow-list backend=%s route=0x%llx link=%u depth=%u remote_uuid=%pUb\n",
+				    tbv_backend_name(backend),
+				    xd ? (unsigned long long)xd->route : 0ULL,
+				    xd ? xd->link : 0, xd ? xd->depth : 0,
+				    xd ? xd->remote_uuid : NULL);
+		mutex_unlock(&state->lock);
+		tb_xdomain_put(peer->xd);
+		kfree(peer);
+		return ERR_PTR(-EACCES);
+	}
+
 	list_for_each_entry(pos, &state->peers, node) {
 		if (!tbv_peer_matches(pos, backend, xd))
 			continue;

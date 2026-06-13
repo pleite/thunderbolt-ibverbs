@@ -63,6 +63,49 @@ nix run .#tbv-perftest -- \
 
 Use `--list` or `--dry-run` to inspect the generated cases before running them.
 
+## One-command regression smoke (transport + verbs)
+
+Run the packaged one-command smoke suite:
+
+```sh
+nix run .#tbv-regression -- \
+  --hosts strix-1,strix-2 \
+  --iface eno1 \
+  --transport native \
+  --wrapper /path/to/vllm-env
+```
+
+What it runs:
+
+- `tbv_vllm_smoke.sh` (transport smoke with debugfs counter checks)
+- `tbv-perftest` with a small verbs subset (`--only` filters)
+
+What it records per run:
+
+- `manifest.json` (inputs, status, command lines, artifact paths)
+- `regression.json` (baseline comparison details)
+- `vllm.log`, `perftest.log`
+- `perftest-smoke.csv`, `perftest-smoke.jsonl`
+
+By default it compares against `latest-success/perftest-smoke.csv` (if present)
+and fails if:
+
+- bandwidth (`bw_avg_gbps`) drops by more than `--bw-drop-pct` (default `7.5`)
+- latency (`lat_typical_us`) rises by more than `--lat-rise-pct` (default `12.5`)
+
+Override or require baseline explicitly:
+
+```sh
+nix run .#tbv-regression -- \
+  --hosts strix-1,strix-2 \
+  --wrapper /path/to/vllm-env \
+  --baseline-csv /path/to/baseline.csv \
+  --require-baseline
+```
+
+The self-hosted GitHub Actions entrypoint is
+`.github/workflows/regression-self-hosted.yml` (`workflow_dispatch`).
+
 ## Ad-hoc subsets
 
 Filter cases with one or more `--only` fnmatch patterns:

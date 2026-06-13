@@ -5,6 +5,8 @@
 *** WARNING ***
 
 this is a research driver. It is buggy, it is insecure, it is not for production.
+see [docs/SECURITY.md](docs/SECURITY.md) for the current threat model and
+implemented hardening boundaries.
 for context, narrative, notes and benchmarks see the Hellas blog post:
 https://blog.hellas.ai/blog/thunderbolt-ibverbs/
 
@@ -85,10 +87,37 @@ tbv_vllm_smoke.sh \
   --require-rdma auto
 ```
 
+For one command that runs both transport smoke (`tbv_vllm_smoke.sh`) and a
+perftest verb smoke (`tbv-perftest`) with per-run result recording:
+
+```sh
+nix run .#tbv-regression -- \
+  --hosts 192.168.23.136,192.168.23.192 \
+  --iface eno1 \
+  --transport native \
+  --wrapper /path/to/vllm-env
+```
+
+The run writes `manifest.json`, `regression.json`, per-step logs, and perftest
+CSV/JSONL into `thunderbolt-ibverbs/results/regression/<run-id>/`, then exits
+non-zero if transport/verb smoke fails or if perftest metrics regress beyond
+the configured thresholds versus baseline.
+
+## Documentation
+
+- [Architecture overview](docs/ARCHITECTURE.md) — kernel module ↔ provider ↔ verbs layer diagram and data path description
+- [Troubleshooting guide](docs/TROUBLESHOOTING.md) — symptom-by-symptom checklist
+- [Contributing guide](docs/CONTRIBUTING.md) — build instructions, code style, and PR process
+
 ## Status
 
 - Native Linux-to-Linux verbs transport is the main path.
-- Apple-compatible transport exists, but is still experimental.
+- Apple-compatible transport (`mac_compat` profile) works with macOS 12+
+  on Apple Silicon Macs (M1/M2/M3/M4) connected via Thunderbolt 3/4/5.
+  Known limitations: UC only (no RC), single DMA rail per link, no RDMA WRITE
+  with immediate data, IOMMU pass-through not yet validated.
+  See [docs/apple-hardware.md](docs/apple-hardware.md) for the full list and
+  setup instructions.
 - The module builds against stock kernels, but needs Linux 6.14 or newer
   (or this flake's `linux-thunderbolt` kernel) for the maintainer-tree
   Thunderbolt/USB4 subsystem changes it relies on.
@@ -313,6 +342,48 @@ sudo modprobe -r thunderbolt_ibverbs
 To make a known-good configuration persistent, put the options in
 `/etc/modprobe.d/thunderbolt-ibverbs.conf`.
 
+## Apple↔Linux Transport (mac_compat)
+
+Connect a Thunderbolt cable between a Linux host and an Apple Silicon Mac
+(M1/M2/M3/M4, macOS 12+). On the Linux host:
+
+```sh
+sudo modprobe thunderbolt_ibverbs \
+  profile=mac_compat \
+  bind_services=1 \
+  allocate_rings=1 \
+  start_rings=1 \
+  enable_tunnels=1 \
+  register_verbs=1
+```
+
+With `profile=mac_compat` the module auto-enables the Apple data path
+(`apple_data=auto` → on) and uses the minimal ThunderboltIP identity to
+negotiate with the macOS peer before the verbs rail comes up.
+
+Check device registration and GIDs:
+
+```sh
+dmesg | grep thunderbolt_ibverbs
+ibv_devices          # should show usb4_rdma0 or usb4_apple0
+rdma link show
+```
+
+From the macOS side use the Apple-patched `mac_tb_rdma_probe` to probe the
+link:
+
+```sh
+# macOS — probe only (no traffic):
+MAC_TB_RDMA_PROBE_RTR=1 mac_tb_rdma_probe rdma_en1 <linux-peer-ip>
+
+# macOS — probe + one UC SEND:
+MAC_TB_RDMA_PROBE_RTR=1 MAC_TB_RDMA_PROBE_SEND=1 \
+  mac_tb_rdma_probe rdma_en1 <linux-peer-ip> <linux-qpn> 7
+```
+
+See [docs/apple-hardware.md](docs/apple-hardware.md) for supported hardware,
+known limitations, and the full interop procedure including `perftest`.
+
 ## Useful Parameters
 
 ```text
@@ -320,7 +391,6 @@ profile=linux_perf|mac_compat|mixed
 tbnet=auto|allow|prefer_rdma|block
 lanes=auto|N|MIN-MAX
 register_verbs=0|1
-native_wr_striping=0|1
 native_fragment_striping=0|1
 zcopy_min_bytes=<bytes>
 qp_timeout_ms=<ms>
@@ -328,6 +398,9 @@ nhi_interrupt_throttle_ns=<ns>
 ```
 
 Run `make -C kernel help` for the full parameter list.
+
+For recommended values and the benchmark sweep that produced them, see
+[**`docs/TUNING.md`**](docs/TUNING.md).
 
 ## Nix Thunderbolt Kernel
 

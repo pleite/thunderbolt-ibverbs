@@ -1,0 +1,72 @@
+name: regression-self-hosted
+
+on:
+  workflow_dispatch:
+    inputs:
+      hosts:
+        description: "Two SSH hostnames/IPs (hostA,hostB)"
+        required: true
+        type: string
+      iface:
+        description: "Socket interface for GLOO/NCCL/RCCL"
+        required: false
+        default: "eno1"
+        type: string
+      transport:
+        description: "vLLM smoke transport"
+        required: false
+        default: "native"
+        type: choice
+        options:
+          - native
+          - gda
+      wrapper:
+        description: "Remote vLLM/PyTorch wrapper path"
+        required: false
+        default: ""
+        type: string
+      baseline_csv:
+        description: "Optional baseline CSV for regression comparison"
+        required: false
+        default: ""
+        type: string
+      out_root:
+        description: "Directory where run artifacts are written"
+        required: false
+        default: "thunderbolt-ibverbs/results/regression"
+        type: string
+
+jobs:
+  regression:
+    permissions:
+      contents: read
+    runs-on: [self-hosted, linux]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run two-node regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(
+            --hosts "${{ inputs.hosts }}"
+            --iface "${{ inputs.iface }}"
+            --transport "${{ inputs.transport }}"
+            --out-root "${{ inputs.out_root }}"
+          )
+          if [[ -n "${{ inputs.wrapper }}" ]]; then
+            args+=(--wrapper "${{ inputs.wrapper }}")
+          fi
+          if [[ -n "${{ inputs.baseline_csv }}" ]]; then
+            args+=(--baseline-csv "${{ inputs.baseline_csv }}")
+          fi
+
+          nix run .#tbv-regression -- "${args[@]}"
+
+      - name: Upload regression artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tbv-regression-results
+          path: ${{ inputs.out_root }}
+          if-no-files-found: warn

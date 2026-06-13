@@ -12,6 +12,7 @@
 
 #include <linux/init.h>
 #include <linux/module.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 
 #include "tbv.h"
@@ -97,10 +98,15 @@ module_param(native_data, bool, 0444);
 MODULE_PARM_DESC(native_data,
 		 "Allow native Linux peers to allocate rings and enable data paths");
 
-static bool apple_data;
-module_param(apple_data, bool, 0444);
+/*
+ * apple_data: -1 = auto (true when the resolved profile enables the Apple
+ * transport), 0 = off, positive = on.  Most users should leave this unset;
+ * the profile=mac_compat and profile=mixed selections enable it implicitly.
+ */
+static int apple_data_param = -1;
+module_param_named(apple_data, apple_data_param, int, 0444);
 MODULE_PARM_DESC(apple_data,
-		 "Allow Apple-compatible peers to allocate rings and enable data paths");
+		 "Allow Apple-compatible data paths: -1=auto (from profile), 0=off, 1=on");
 
 static bool native_fragment_striping;
 module_param(native_fragment_striping, bool, 0444);
@@ -112,7 +118,63 @@ module_param(register_verbs, bool, 0444);
 MODULE_PARM_DESC(register_verbs,
 		 "Register a guarded libibverbs device skeleton");
 
+static char *peer_allowlist;
+module_param(peer_allowlist, charp, 0444);
+MODULE_PARM_DESC(peer_allowlist,
+		 "Optional comma-separated remote host UUID allow-list (for example 00112233-4455-6677-8899-aabbccddeeff)");
+
 static struct tbv_state tbv_driver_state;
+
+static int tbv_parse_peer_allowlist(struct tbv_state *state, const char *allowlist)
+{
+	char *dup;
+	char *cursor;
+	char *token;
+
+	state->peer_allowlist_enabled = false;
+	state->peer_allowlist_count = 0;
+	if (!allowlist || !*allowlist)
+		return 0;
+
+	dup = kstrdup(allowlist, GFP_KERNEL);
+	if (!dup)
+		return -ENOMEM;
+
+	cursor = dup;
+	while ((token = strsep(&cursor, ",")) != NULL) {
+		uuid_t parsed;
+		u32 i;
+		bool duplicate = false;
+
+		strim(token);
+		if (!*token)
+			continue;
+		if (uuid_parse(token, &parsed)) {
+			pr_err("peer_allowlist contains an invalid UUID entry\n");
+			kfree(dup);
+			return -EINVAL;
+		}
+		for (i = 0; i < state->peer_allowlist_count; i++) {
+			if (uuid_equal(&state->peer_allowlist[i], &parsed)) {
+				duplicate = true;
+				break;
+			}
+		}
+		if (duplicate)
+			continue;
+		if (state->peer_allowlist_count >= TBV_PEER_ALLOWLIST_MAX) {
+			pr_err("peer_allowlist supports at most %u UUIDs\n",
+			       TBV_PEER_ALLOWLIST_MAX);
+			kfree(dup);
+			return -E2BIG;
+		}
+		state->peer_allowlist[state->peer_allowlist_count++] = parsed;
+	}
+
+	kfree(dup);
+	state->peer_allowlist_enabled = state->peer_allowlist_count > 0;
+	return 0;
+}
 
 static int __init tbv_init(void)
 {
@@ -121,6 +183,7 @@ static int __init tbv_init(void)
 	struct tbv_tbnet_identity_config identity_cfg;
 	struct tbv_service_config service_cfg;
 	struct tbv_config cfg;
+	bool apple_data;
 	int ret;
 
 	ret = tbv_config_parse(&cfg, compat, profile, tbnet,
@@ -131,6 +194,14 @@ static int __init tbv_init(void)
 	ret = tbv_config_resolve(&resolved, &cfg);
 	if (ret)
 		return ret;
+
+	/*
+	 * Resolve apple_data: when the caller did not override it (-1), derive
+	 * the value from the profile so that profile=mac_compat and
+	 * profile=mixed enable Apple data paths automatically.
+	 */
+	apple_data = (apple_data_param >= 0) ? (apple_data_param != 0)
+					     : resolved.apple_enabled;
 
 	ret = tbv_tbnet_identity_check_config(&resolved);
 	if (ret)
@@ -173,6 +244,11 @@ static int __init tbv_init(void)
 	tbv_driver_state.native_fragment_striping = native_fragment_striping;
 	tbv_driver_state.native_data = native_data;
 	tbv_driver_state.apple_data = apple_data;
+	ret = tbv_parse_peer_allowlist(&tbv_driver_state, peer_allowlist);
+	if (ret) {
+		tbv_core_exit(&tbv_driver_state);
+		goto err_path_symbols;
+	}
 
 	service_cfg.native_prtcstns = native_prtcstns;
 	service_cfg.apple_prtcstns = apple_prtcstns;
@@ -204,7 +280,7 @@ static int __init tbv_init(void)
 		snprintf(lanes_desc, sizeof(lanes_desc), "%u-%u",
 			 cfg.lanes_min, cfg.lanes_max);
 
-	pr_info("loaded compat=%s profile=%s resolved_profile=%s tbnet=%s tbnet_identity=%s tbnet_identity_minimal_e2e=%u tbnet_identity_minimal_apple_only=%u lanes=%s native_control=%s native_data=%u apple_data=%u native_fragment_striping=%u\n",
+	pr_info("loaded compat=%s profile=%s resolved_profile=%s tbnet=%s tbnet_identity=%s tbnet_identity_minimal_e2e=%u tbnet_identity_minimal_apple_only=%u lanes=%s native_control=%s native_data=%u apple_data=%u native_fragment_striping=%u peer_allowlist=%u\n",
 		tbv_compat_name(cfg.compat),
 		tbv_profile_name(cfg.profile),
 		tbv_profile_name(resolved.profile),
@@ -216,7 +292,8 @@ static int __init tbv_init(void)
 		tbv_native_control_mode_name(&tbv_driver_state),
 		native_data,
 		apple_data,
-		native_fragment_striping);
+		native_fragment_striping,
+		tbv_driver_state.peer_allowlist_count);
 
 	return 0;
 

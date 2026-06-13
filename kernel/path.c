@@ -10,6 +10,7 @@
 
 #include "../proto/native_data.h"
 #include "tbv.h"
+#include "tbv_compat.h"
 
 #define TBV_NATIVE_RING_SIZE 1024
 /* Apple-originated bursts can exhaust a 256-entry RX ring before credits
@@ -34,35 +35,19 @@
 #define TBV_DATA_QUEUE_MULTIPLIER 64
 #define TBV_DATA_PACKET_POOL_LIMIT 1024
 
-typedef int (*tbv_ring_throttling_fn)(struct tb_ring *ring,
-				      unsigned int interval_nsec);
-
-extern int tb_ring_throttling(struct tb_ring *ring,
-			      unsigned int interval_nsec);
-
 static uint nhi_interrupt_throttle_ns;
 module_param(nhi_interrupt_throttle_ns, uint, 0644);
 MODULE_PARM_DESC(nhi_interrupt_throttle_ns,
 		 "NHI interrupt throttling interval for TBV data rings in ns; 0 disables ring throttling");
 
-static tbv_ring_throttling_fn tbv_ring_throttling;
-
 void tbv_path_init_optional_symbols(void)
 {
-	tbv_ring_throttling = symbol_get(tb_ring_throttling);
-	if (tbv_ring_throttling)
-		pr_info("using optional tb_ring_throttling() helper\n");
-	else
-		pr_info("optional tb_ring_throttling() helper unavailable; using stock NHI interrupt throttling\n");
+	tbv_compat_init();
 }
 
 void tbv_path_exit_optional_symbols(void)
 {
-	if (!tbv_ring_throttling)
-		return;
-
-	symbol_put(tb_ring_throttling);
-	tbv_ring_throttling = NULL;
+	tbv_compat_exit();
 }
 
 static bool apple_tx_raw_mode;
@@ -176,21 +161,21 @@ static int tbv_path_configure_ring_throttling(struct tbv_path *path)
 	u32 interval = READ_ONCE(nhi_interrupt_throttle_ns);
 	int ret;
 
-	if (!tbv_ring_throttling) {
+	if (!tbv_compat_has_ring_throttling()) {
 		if (interval)
-			pr_warn_once("nhi_interrupt_throttle_ns requires a kernel exporting tb_ring_throttling(); ignoring interval %u ns\n",
+			pr_warn_once("nhi_interrupt_throttle_ns requires kernel Thunderbolt ring throttling support (for example Linux 6.14+); ignoring interval %u ns\n",
 				     interval);
 		return 0;
 	}
 
-	ret = tbv_ring_throttling(path->tx_ring, interval);
+	ret = tbv_compat_ring_throttling(path->tx_ring, interval);
 	if (ret) {
 		pr_warn("TX ring throttling interval %u ns failed ret=%d\n",
 			interval, ret);
 		return ret;
 	}
 
-	ret = tbv_ring_throttling(path->rx_ring, interval);
+	ret = tbv_compat_ring_throttling(path->rx_ring, interval);
 	if (ret) {
 		pr_warn("RX ring throttling interval %u ns failed ret=%d\n",
 			interval, ret);
@@ -278,10 +263,15 @@ static void tbv_path_queue_delayed_work(struct tbv_path *path,
 {
 	struct tbv_state *state = tbv_path_state(path);
 
-	if (state && state->workqueue)
-		queue_delayed_work(state->workqueue, work, delay);
-	else
-		schedule_delayed_work(work, delay);
+	/*
+	 * Path work is lifecycle-bound to state->workqueue. Dropping queue
+	 * requests once teardown has started avoids scheduling delayed work onto
+	 * global workqueues after module-unload paths.
+	 */
+	if (!state || !state->workqueue)
+		return;
+
+	queue_delayed_work(state->workqueue, work, delay);
 }
 
 static void tbv_path_queue_tx_poll(struct tbv_path *path, unsigned long delay)
@@ -1302,6 +1292,9 @@ int tbv_path_start_rings(struct tbv_path *path)
 		if (ret) {
 			pr_warn("post RX frame %u/%u failed ret=%d\n", i,
 				path->rx_frame_count, ret);
+			tb_ring_stop(path->rx_ring);
+			tb_ring_stop(path->tx_ring);
+			path->state = TBV_PATH_RING_ALLOCATED;
 			return ret;
 		}
 	}
@@ -2551,6 +2544,8 @@ void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd)
 	bool rings_started = tunnel_enabled ||
 			     path->state == TBV_PATH_RING_STARTED;
 
+	path->tx_poll_enabled = false;
+	path->rx_supp_poll_enabled = false;
 	cancel_delayed_work_sync(&path->tx_poll_work);
 	cancel_delayed_work_sync(&path->rx_supp_poll_work);
 
@@ -2572,6 +2567,12 @@ void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd)
 		if (path->tx_ring)
 			tb_ring_stop(path->tx_ring);
 		path->state = TBV_PATH_RING_ALLOCATED;
+		/*
+		 * tb_ring_stop() drains callbacks and can race a just-finished
+		 * poll worker that re-arms itself before observing stop state.
+		 */
+		cancel_delayed_work_sync(&path->tx_poll_work);
+		cancel_delayed_work_sync(&path->rx_supp_poll_work);
 	}
 	if (!tunnel_enabled && path->remote_transmit_path >= 0) {
 		tb_xdomain_release_in_hopid(xd, path->remote_transmit_path);

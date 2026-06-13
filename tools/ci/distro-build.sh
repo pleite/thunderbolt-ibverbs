@@ -141,7 +141,9 @@ build_userspace_smoke() {
 build_with_dkms() {
 	local kver="$1"
 	local pkg="thunderbolt-ibverbs"
-	local ver="0.3.0"
+	local ver
+	ver="$(awk -F'"' '/^PACKAGE_VERSION=/ { print $2; exit }' /work/src/dkms.conf)"
+	[[ -n "$ver" ]] || { printf 'error: could not read PACKAGE_VERSION from dkms.conf\n' >&2; exit 1; }
 	local dkms_src="/usr/src/$pkg-$ver"
 	local built
 

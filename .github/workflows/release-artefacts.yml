@@ -106,10 +106,35 @@ jobs:
           path: ${{ matrix.upload_glob }}
           if-no-files-found: error
 
+  nix:
+    name: nix checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            accept-flake-config = true
+
+      - name: Packaging sync check
+        run: bash tools/ci/check-packaging-sync.sh
+
+      - name: Nix script-syntax check
+        run: nix build --no-link .#checks.x86_64-linux.script-syntax
+
+      - name: Nix proto-smoke
+        run: nix build --no-link .#checks.x86_64-linux.proto-smoke
+
+      - name: Nix rdma-core-usb4 provider build
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        run: nix build --no-link .#rdma-core-usb4
+
   release:
     name: Publish GitHub Release
     if: ${{ startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || inputs.publish) }}
-    needs: build
+    needs: [build, nix]
     runs-on: ubuntu-latest
     permissions:
       contents: write
