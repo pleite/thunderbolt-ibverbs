@@ -82,6 +82,7 @@
 #define TBV_APPLE_RAW_DESCS_PER_CHUNK 17
 #define TBV_QP_TIMEOUT_DEFAULT_MS 5000
 #define TBV_QP_TIMEOUT_WORK_INTERVAL_MS 1000
+#define TBV_QP_DESTROY_TIMEOUT_MS 5000
 #define TBV_SEND_MAX_RETRIES 7
 #define TBV_SEND_RNR_RETRIES_INFINITE ((u8)~0u)
 #define TBV_READ_RESP_RETRY_MS 100
@@ -1392,16 +1393,23 @@ static void tbv_qp_queue_read(struct tbv_qp *tqp, struct tbv_read_ctx *read)
 	spin_unlock_irqrestore(&tqp->lock, flags);
 }
 
-static void tbv_qp_queue_read_resp(struct tbv_qp *tqp,
+static bool tbv_qp_queue_read_resp(struct tbv_qp *tqp,
 				   struct tbv_read_resp_ctx *ctx)
 {
 	unsigned long flags;
+	bool queued = false;
 
 	spin_lock_irqsave(&tqp->lock, flags);
-	ctx->queued_jiffies = 0;
-	tbv_read_resp_ctx_get(ctx);
-	list_add_tail(&ctx->node, &tqp->pending_read_resps);
+	if (!tqp->closing) {
+		ctx->queued_jiffies = 0;
+		tbv_read_resp_ctx_get(ctx);
+		list_add_tail(&ctx->node, &tqp->pending_read_resps);
+		queued = true;
+	} else {
+		ctx->closing = true;
+	}
 	spin_unlock_irqrestore(&tqp->lock, flags);
+	return queued;
 }
 
 static void tbv_qp_arm_send_timeout(struct tbv_qp *tqp,
@@ -1742,6 +1750,16 @@ static void tbv_qp_cancel_read_resps(struct tbv_qp *tqp, struct list_head *flush
 	list_for_each_entry(ctx, &tqp->pending_read_resps, node)
 		ctx->closing = true;
 	list_splice_init(&tqp->pending_read_resps, flush);
+	spin_unlock_irqrestore(&tqp->lock, flags);
+}
+
+static void tbv_qp_begin_close(struct tbv_qp *tqp)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&tqp->lock, flags);
+	tqp->closing = true;
+	tqp->timeout_work_armed = false;
 	spin_unlock_irqrestore(&tqp->lock, flags);
 }
 
@@ -2684,9 +2702,7 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 	u32 pending;
 	u32 i;
 
-	spin_lock_irqsave(&tqp->lock, flags);
-	tqp->closing = true;
-	spin_unlock_irqrestore(&tqp->lock, flags);
+	tbv_qp_begin_close(tqp);
 
 	if (tqp->type == IB_QPT_GSI && tqp->rail && tqp->rail->ibdev) {
 		mutex_lock(&tqp->owner->lock);
@@ -2699,9 +2715,6 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 	wake_up_all(&tqp->apple_tx_wait);
 	cancel_work_sync(&tqp->apple_sq_work);
 	cancel_delayed_work_sync(&tqp->timeout_work);
-	spin_lock_irqsave(&tqp->lock, flags);
-	tqp->timeout_work_armed = false;
-	spin_unlock_irqrestore(&tqp->lock, flags);
 
 	tbv_qp_flush_apple_sq(tqp);
 	tbv_qp_flush_sends(tqp, &flush);
@@ -2738,7 +2751,7 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 
 	if (!wait_event_timeout(tqp->refs_wait,
 				refcount_read(&tqp->refs) == 1,
-				msecs_to_jiffies(5000))) {
+				msecs_to_jiffies(TBV_QP_DESTROY_TIMEOUT_MS))) {
 		pr_warn("QP %u destroy timed out with %u refs; leaving it closing for retry\n",
 			qp->qp_num, refcount_read(&tqp->refs));
 		return -ETIMEDOUT;
@@ -2750,13 +2763,6 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 		xa_unlock_irqrestore(&tqp->owner->verbs_qps_xa, flags);
 	}
 
-	tbv_qp_put(tqp);
-	/*
-	 * FINDINGS.md R2 (open): this final wait is untimed, so a late RDMA-READ
-	 * response in flight can hang teardown; see
-	 * scripts/fixes/02-qp-teardown-bounded.sh.
-	 */
-	wait_for_completion(&tqp->refs_zero);
 	tbv_qp_flush_active_rx(tqp);
 	tbv_qp_flush_reorder(tqp);
 	tbv_qp_flush_apple_pending(tqp);
@@ -2776,6 +2782,7 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 		atomic_dec(&tqp->owner->verbs_qps);
 	tbv_qp_release_apple_tunnel(tqp);
 	tbv_qp_unbind_rail(tqp);
+	tbv_qp_put(tqp);
 	return 0;
 }
 
@@ -8223,10 +8230,51 @@ static void tbv_kunit_mr_peer_scope_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, tbv_mr_matches_peer_id(&mr, 8));
 }
 
+static void tbv_kunit_read_resp_queue_close_test(struct kunit *test)
+{
+	struct tbv_qp tqp = {};
+	struct tbv_read_resp_ctx queued = {};
+	struct tbv_read_resp_ctx rejected = {};
+	LIST_HEAD(flush);
+
+	spin_lock_init(&tqp.lock);
+	INIT_LIST_HEAD(&tqp.pending_read_resps);
+	INIT_LIST_HEAD(&queued.node);
+	INIT_LIST_HEAD(&queued.retry_node);
+	INIT_LIST_HEAD(&rejected.node);
+	INIT_LIST_HEAD(&rejected.retry_node);
+	refcount_set(&queued.refs, 1);
+	refcount_set(&rejected.refs, 1);
+
+	KUNIT_EXPECT_TRUE(test, tbv_qp_queue_read_resp(&tqp, &queued));
+	KUNIT_EXPECT_FALSE(test, list_empty(&tqp.pending_read_resps));
+	KUNIT_EXPECT_EQ(test, refcount_read(&queued.refs), 2);
+
+	tbv_qp_begin_close(&tqp);
+	tbv_qp_cancel_read_resps(&tqp, &flush);
+	KUNIT_EXPECT_TRUE(test, list_empty(&tqp.pending_read_resps));
+	KUNIT_EXPECT_FALSE(test, list_empty(&flush));
+	KUNIT_EXPECT_TRUE(test, queued.closing);
+	KUNIT_EXPECT_PTR_EQ(
+		test,
+		list_first_entry(&flush, struct tbv_read_resp_ctx, node),
+		&queued);
+	list_del_init(&queued.node);
+	refcount_dec(&queued.refs);
+	KUNIT_EXPECT_EQ(test, refcount_read(&queued.refs), 1);
+	KUNIT_EXPECT_TRUE(test, list_empty(&flush));
+
+	KUNIT_EXPECT_FALSE(test, tbv_qp_queue_read_resp(&tqp, &rejected));
+	KUNIT_EXPECT_TRUE(test, list_empty(&rejected.node));
+	KUNIT_EXPECT_TRUE(test, rejected.closing);
+	KUNIT_EXPECT_EQ(test, refcount_read(&rejected.refs), 1);
+}
+
 static struct kunit_case tbv_ibdev_security_cases[] = {
 	KUNIT_CASE(tbv_kunit_rdma_write_header_valid_test),
 	KUNIT_CASE(tbv_kunit_rdma_write_header_with_imm_test),
 	KUNIT_CASE(tbv_kunit_mr_peer_scope_test),
+	KUNIT_CASE(tbv_kunit_read_resp_queue_close_test),
 	{}
 };
 
@@ -8652,10 +8700,13 @@ static void tbv_read_req_workfn(struct work_struct *work)
 				goto out_send_status;
 			}
 
-		tbv_qp_queue_read_resp(tqp, resp);
-		ret = tbv_send_read_response_ctx(resp);
-		if (!ret)
-			tbv_qp_note_read_resp_sent(tqp, resp);
+		if (tbv_qp_queue_read_resp(tqp, resp)) {
+			ret = tbv_send_read_response_ctx(resp);
+			if (!ret)
+				tbv_qp_note_read_resp_sent(tqp, resp);
+		} else {
+			ret = -ESHUTDOWN;
+		}
 		if (ret) {
 			if (ret == -ENOMEM) {
 				/*
