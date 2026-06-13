@@ -217,7 +217,8 @@ jobs:
 
           # Run in patch mode (not --file) so only added/modified lines are
           # checked; this avoids failing on pre-existing whole-file findings.
-          printf '%s\n' "$diff" | perl "$checkpatch" --no-tree --strict --show-types - || {
+          # A here-string feeds the diff verbatim (no escape processing).
+          perl "$checkpatch" --no-tree --strict --show-types - <<<"$diff" || {
             echo "checkpatch found issues in changed kernel/proto lines." >&2
             exit 1
           }
