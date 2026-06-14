@@ -112,6 +112,7 @@ the configured thresholds versus baseline.
 - [Architecture overview](docs/ARCHITECTURE.md) — kernel module ↔ provider ↔ verbs layer diagram and data path description
 - [Troubleshooting guide](docs/TROUBLESHOOTING.md) — symptom-by-symptom checklist
 - [Detailed contributor notes](docs/CONTRIBUTING.md) — build instructions, code style, and PR process
+- [Strix Halo vLLM toolbox integration](docs/vllm-toolbox-integration.md) — using the kyuz0 RCCL toolbox over thunderbolt-ibverbs
 
 ## Status
 
