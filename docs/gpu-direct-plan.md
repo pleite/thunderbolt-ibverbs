@@ -828,7 +828,7 @@ so it can be filed with the body below and linked back to this document.
 
 ### GDP-1 · Phase 1: Kernel `reg_user_mr_dmabuf` op
 
-- [ ] **Motivation:** `ibv_reg_dmabuf_mr()` currently returns `EOPNOTSUPP` because
+- [x] **Motivation:** `ibv_reg_dmabuf_mr()` currently returns `EOPNOTSUPP` because
   `tbv_ibdev_ops` has no `.reg_user_mr_dmabuf` handler (`kernel/ibdev.c:8086`).
   RCCL, rocSHMEM, and any GPU-aware RDMA consumer cannot register GPU buffers as
   RDMA MRs until this is fixed. This is the minimal kernel change to unblock all

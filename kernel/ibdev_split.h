@@ -23,6 +23,15 @@ struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 			 struct ib_udata *udata);
 int tbv_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata);
 
+#ifdef CONFIG_TBV_GPU_DIRECT
+struct ib_mr *tbv_reg_dmabuf_mr(struct ib_pd *pd, u64 offset, u64 length,
+				u64 virt_addr, int fd, int access,
+#ifdef TBV_KERNEL_HAS_IB_DMAH
+				struct ib_dmah *dmah,
+#endif
+				struct uverbs_attr_bundle *attrs);
+#endif
+
 int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 		  struct ib_udata *udata);
 int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata);

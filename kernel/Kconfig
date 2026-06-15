@@ -19,3 +19,18 @@ config THUNDERBOLT_IBVERBS_DEBUG_SURFACES
 	  Build the debugfs and configfs control/diagnostic surfaces.
 	  Disable this for production builds that must compile these
 	  interfaces out entirely.
+
+config TBV_GPU_DIRECT
+	bool "Enable thunderbolt-ibverbs GPU-direct (dma-buf) memory regions"
+	depends on THUNDERBOLT_IBVERBS && DMA_SHARED_BUFFER
+	default n
+	help
+	  Compile in the gated reg_user_mr_dmabuf verb so that GPU buffers
+	  exported as dma-buf file descriptors (for example ROCm allocations
+	  on unified-memory APUs) can be registered as RDMA memory regions.
+
+	  This is the build-time half of the GPU-direct optionality controls
+	  described in docs/gpu-direct-plan.md. When disabled (the default),
+	  ibv_reg_dmabuf_mr() returns EOPNOTSUPP and behavior is identical to
+	  the host-copy-only releases. Activation is additionally gated at load
+	  time by the gpu_direct=auto|on|off module parameter.

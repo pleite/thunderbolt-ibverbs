@@ -28,6 +28,7 @@
 | `native_fragment_striping` | bool | `0` | `0444` | Stripe native SEND fragments across active rails. |
 | `register_verbs` | bool | `0` | `0444` | Register guarded libibverbs device skeleton. |
 | `peer_allowlist` | string | empty | `0444` | Optional comma-separated remote UUID allow-list. |
+| `gpu_direct` | string | `auto` | `0444` | GPU-direct dma-buf memory regions: `auto`, `on`, `off`. Only present when the module is built with `tbv_gpu_direct=1` (`CONFIG_TBV_GPU_DIRECT`); otherwise `ibv_reg_dmabuf_mr()` returns `EOPNOTSUPP`. |
 
 ## Transport and ring tuning (`kernel/path.c`)
 

@@ -111,6 +111,17 @@ enum tbv_path_state {
 	TBV_PATH_STOPPED,
 };
 
+/*
+ * Load-time GPU-direct (dma-buf MR) policy, selected by the gpu_direct module
+ * parameter.  Only consulted when the feature is compiled in
+ * (CONFIG_TBV_GPU_DIRECT); see docs/gpu-direct-plan.md Phase 1.
+ */
+enum tbv_gpu_direct_mode {
+	TBV_GPU_DIRECT_OFF,
+	TBV_GPU_DIRECT_AUTO,
+	TBV_GPU_DIRECT_ON,
+};
+
 struct tbv_config {
 	enum tbv_compat_mode compat;
 	enum tbv_profile profile;
@@ -868,6 +879,13 @@ void tbv_link_deactivate_config(struct tbv_state *state, u32 link_id);
 u32 tbv_link_count(struct tbv_state *state);
 void tbv_link_debugfs_show(struct seq_file *s, struct tbv_state *state);
 bool tbv_debug_surfaces_enabled(void);
+
+/*
+ * Resolved load-time GPU-direct policy (gpu_direct module parameter).  Returns
+ * TBV_GPU_DIRECT_OFF when the feature is compiled out so callers behave as the
+ * host-copy-only releases do.
+ */
+enum tbv_gpu_direct_mode tbv_gpu_direct_mode(void);
 int tbv_debugfs_init(struct tbv_state *state);
 void tbv_debugfs_exit(struct tbv_state *state);
 int tbv_configfs_start(struct tbv_state *state);

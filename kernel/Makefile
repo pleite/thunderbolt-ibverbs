@@ -6,6 +6,9 @@ KVER ?= $(shell uname -r)
 KDIR ?= /lib/modules/$(KVER)/build
 PWD := $(shell pwd)
 tbv_debug_surfaces ?= 1
+# GPU-direct (dma-buf MR) build-time gate.  Off by default so out-of-box
+# behavior stays on the host-copy path (see docs/gpu-direct-plan.md Phase 1).
+tbv_gpu_direct ?= 0
 
 obj-m := thunderbolt_ibverbs.o
 thunderbolt_ibverbs-y := main.o profile.o backend.o configfs.o core.o debugfs.o ibdev.o ibdev_native.o ibdev_apple.o ibdev_cq.o ibdev_mr.o ibdev_qp.o link.o native.o apple.o trace.o native_control.o native_control_legacy.o native_control_xdomain.o path.o peer.o rail.o service.o tbnet_identity.o tbnet_minimal.o tbv_compat.o ../proto/config.o ../proto/identity.o ../proto/reliability.o
@@ -25,6 +28,22 @@ _tbv_ib_verbs_h  := $(firstword $(wildcard \
 ifneq ($(shell test -n "$(_tbv_ib_verbs_h)" && \
     grep -q 'struct ib_dmah' "$(_tbv_ib_verbs_h)" 2>/dev/null && echo yes),)
     ccflags-y += -DTBV_KERNEL_HAS_IB_DMAH
+endif
+
+# GPU-direct: compile in the gated reg_user_mr_dmabuf op when requested.
+ifeq ($(tbv_gpu_direct),1)
+    ccflags-y += -DCONFIG_TBV_GPU_DIRECT
+endif
+
+# Older kernels declare the dma-buf umem helpers in a dedicated header; newer
+# trees fold them into <rdma/ib_umem.h>.  Include the dedicated header only when
+# it is present.  Probe both the arch-specific and *-common header locations,
+# mirroring the ib_verbs.h probe above.
+_tbv_ib_umem_dmabuf_h := $(firstword $(wildcard \
+    $(KDIR)/include/rdma/ib_umem_dmabuf.h \
+    $(_tbv_kdir_common)/include/rdma/ib_umem_dmabuf.h))
+ifneq ($(_tbv_ib_umem_dmabuf_h),)
+    ccflags-y += -DTBV_KERNEL_HAS_IB_UMEM_DMABUF_H
 endif
 
 .PHONY: all clean modules modules_install help
@@ -58,6 +77,7 @@ help:
 	@echo "  tbnet_identity_minimal_apple_only=0|1"
 	@echo "  bind_services=0|1"
 	@echo "  tbv_debug_surfaces=0|1"
+	@echo "  tbv_gpu_direct=0|1"
 	@echo "  allocate_rings=0|1"
 	@echo "  start_rings=0|1"
 	@echo "  negotiate_native=0|1"
@@ -67,6 +87,7 @@ help:
 	@echo "  apple_prtcstns=<u32>"
 	@echo "  peer_allowlist=<uuid[,uuid...]>"
 	@echo "  peer_auth_acl=<uuid=32hexpsk[,uuid=32hexpsk...]>"
+	@echo "  gpu_direct=auto|on|off"
 	@echo "  apple_tx_max_inflight_wr=<N>"
 	@echo "  apple_tx_max_inflight_frames=<N>"
 	@echo "  apple_rx_pending_bytes=<bytes>"
