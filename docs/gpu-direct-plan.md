@@ -487,7 +487,7 @@ parameter table), and README `modprobe` examples.
 - If build-time support is compiled in **and** required kernel/`amdgpu` dmabuf
   support is present, activate the dma-buf MR op.
 - Otherwise, keep host-copy as the active behavior and emit one single-line
-  info log with the reason (e.g., `gpu_direct=auto fallback: dmabuf support not available`).
+  info log with the reason (e.g., "gpu_direct=auto fallback: dmabuf support not available").
 
 `on` semantics:
 
@@ -530,7 +530,7 @@ path unless the user opts in.
 | on | on | present | Direct-GPU dmabuf MR active; host-copy still available for non-dmabuf MRs | success | One-line info: gpu_direct enabled |
 
 **Citations for control-point patterns:** `kernel/Kconfig:3–20`,
-`kernel/Makefile:8–28`, `docs/MODULE_PARAMETERS.md:8–31`,
+`kernel/Makefile:15–28`, `docs/MODULE_PARAMETERS.md:8–31`,
 `docs/ARCHITECTURE.md:81–96`, `README.md:304–323`, `kernel/main.c:29–31`,
 `kernel/main.c:91–93`, `kernel/main.c:121–123`.
 
@@ -554,7 +554,7 @@ users (host-copy remains default behavior).
 | `kernel/ibdev.c:8086` | Add `.reg_user_mr_dmabuf = tbv_reg_dmabuf_mr` to `tbv_ibdev_ops` |
 | `kernel/ibdev_split.h` | Export `tbv_reg_dmabuf_mr` prototype |
 | `kernel/Kconfig` | Add proposed `CONFIG_TBV_GPU_DIRECT` build toggle (non-binding name) |
-| `kernel/Makefile` | Add proposed `tbv_gpu_direct` compile define plumbing (non-binding name), modeled after `TBV_KERNEL_HAS_IB_DMAH` pattern |
+| `kernel/Makefile` | Add proposed `tbv_gpu_direct` make-variable plumbing for `ccflags-y` (non-binding name), modeled after `TBV_KERNEL_HAS_IB_DMAH` pattern |
 | `kernel/main.c` + docs | Add proposed `gpu_direct=auto|on|off` module parameter gate (non-binding name), defaulting to host-copy behavior |
 
 **Pseudocode sketch (inert — no behavior change in this PR):**
@@ -666,7 +666,7 @@ MRs only when `gpu_direct` is explicitly enabled.
 | `kernel/ibdev_internal.h` | Add notifier field to `struct tbv_mr` |
 | `kernel/ibdev.c:3619` | Evaluate whether to lift the `tbv_page_zcopy_safe` zone-device guard for pinned dmabuf MRs, but only under explicit GPU-direct enablement |
 | `bench/perftest-smoke-baseline.csv` | Re-baseline if dmabuf zcopy changes throughput |
-| `docs/vllm-toolbox-integration.md` | Flip `NCCL_NET_GDR_LEVEL` default and remove host-staging caveat |
+| `docs/vllm-toolbox-integration.md` | Keep dual-mode docs; add Phase 4 guidance for move-notify/zcopy under explicit GPU-direct opt-in while preserving host-staging guidance |
 
 **Acceptance criteria:**
 - `ibv_reg_dmabuf_mr` with a moveable allocation does not crash on invalidation.
@@ -737,7 +737,7 @@ The implementation must forward `access` faithfully from the uverbs request.
 | 1 | `kernel/ibdev.c` | 8086 | Add `.reg_user_mr_dmabuf = tbv_reg_dmabuf_mr` |
 | 1 | `kernel/ibdev_split.h` | (prototype section) | Export `tbv_reg_dmabuf_mr` |
 | 1 | `kernel/Kconfig` | 3–20 (+new symbol) | Add `CONFIG_TBV_GPU_DIRECT` gate (proposed name) |
-| 1 | `kernel/Makefile` | 13–28 (+new define) | Wire compile-time gate (proposed `tbv_gpu_direct`) following existing feature-detect style |
+| 1 | `kernel/Makefile` | 15–28 (+new make variable) | Wire compile-time gate (proposed `tbv_gpu_direct`) following existing feature-detect style |
 | 1 | `kernel/main.c` | module-parameter block | Add `gpu_direct=auto|on|off` gate (proposed name) |
 | 1 | `docs/MODULE_PARAMETERS.md` / `docs/ARCHITECTURE.md` / `README.md` | parameter + modprobe sections | Document load-time switch and safe default |
 | 2 | `kernel/ibdev.c` | 3336 | `tbv_copy_send_range`: dmabuf umem branch |
