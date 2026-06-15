@@ -25,7 +25,9 @@ complication.
 
 This document investigates exactly where the current implementation fails, what
 the GPU-direct path would look like, and how to build it in four focused phases
-targeting the Strix Halo unified-memory case.
+targeting the Strix Halo unified-memory case. The revised design keeps host-copy
+and GPU-direct as coexisting modes: host-copy remains the default/supported path
+and GPU-direct (`dma-buf` MR) is an explicit opt-in with defined fallback.
 
 ### Non-goals (v1)
 
@@ -34,6 +36,8 @@ targeting the Strix Halo unified-memory case.
 - NVIDIA GPUDirect / `nv_peer_mem` — not tested on this hardware.
 - Dynamic / move-notified dmabuf (ODP-equivalent for GPU memory) — Phase 4 only.
 - Upstream kernel or rdma-core driver-ID registration — tracked separately.
+- Replacing the current host-copy path as the only mode; host-copy remains
+  supported and is the out-of-box default until a user explicitly opts in.
 
 ---
 
@@ -373,13 +377,15 @@ ROCSHMEM_GDA_USB4_A2A_CHUNK_BYTES=...
 ```
 
 The `--transport gda` mode is exposed in `.github/workflows/regression-self-hosted.yml:15–22`
-and the README. This is a *userspace and CI contract only*: it describes how
-RCCL/rocSHMEM should be configured once a functional dmabuf MR path exists. It
-has no kernel backing today.
+and the README. This is a userspace contract that must remain robust when
+GPU-direct is unavailable: `--transport gda` should capability-probe
+(`ibv_reg_dmabuf_mr`) and fall back to host-staging behavior rather than
+hard-failing when dmabuf MR support is not active.
 
-The key gap: `ROCSHMEM_GDA_ENABLE_DMABUF=1` causes rocSHMEM to call
+The key gap today: `ROCSHMEM_GDA_ENABLE_DMABUF=1` causes rocSHMEM to call
 `ibv_reg_dmabuf_mr()` for GPU buffers. That call currently returns `EOPNOTSUPP`
-(§2), so any run with `--transport gda` will fail at the RDMA registration step.
+(§2). Under this revised design, that error is the intended probe signal and
+must drive host-copy fallback unless GPU-direct has been explicitly activated.
 
 `docs/vllm-toolbox-integration.md:275` documents the current workaround:
 
@@ -387,8 +393,9 @@ The key gap: `ROCSHMEM_GDA_ENABLE_DMABUF=1` causes rocSHMEM to call
 # NCCL_IB_GID_INDEX=1 and NCCL_NET_GDR_LEVEL=0 are already set by the toolbox
 ```
 
-`NCCL_NET_GDR_LEVEL=0` disables GPUDirect RDMA in NCCL; it must be flipped to
-≥ 1 once kernel dmabuf MR support lands (Phase 3/4).
+`NCCL_NET_GDR_LEVEL=0` keeps host-staging mode in NCCL. This remains the safe
+default. A GPU-direct configuration (`NCCL_NET_GDR_LEVEL ≥ 1`) is documented as
+an opt-in once kernel dmabuf MR support is present and enabled.
 
 ---
 
@@ -413,7 +420,9 @@ attr->kernel_cap_flags = IBK_LOCAL_DMA_LKEY;
 No dmabuf-specific capability flag is defined in the RDMA core ABI today.
 NCCL/RCCL probe dmabuf support by calling `ibv_reg_dmabuf_mr()` directly and
 checking whether it returns `EOPNOTSUPP`; there is no separate feature bit to
-advertise. No `query_device` change is needed for dmabuf probing per se.
+advertise. With GPU-direct compiled out or load-time disabled, advertising and
+runtime behavior remain identical to today and `EOPNOTSUPP` is the intended
+probe signal. No `query_device` change is needed for dmabuf probing per se.
 
 ### 7.3 `IBV_ACCESS_RELAXED_ORDERING`
 
@@ -431,13 +440,109 @@ should not change.
 
 ---
 
-## 8. Phased implementation plan
+## 8. Optionality and fallback design
 
-### Phase 1 — Kernel `reg_user_mr_dmabuf` (MR registration only)
+This design revision makes GPU-direct optional at three independent control
+points. The names below are **proposed (non-binding)** and can be finalized
+during implementation.
 
-**Goal:** make `ibv_reg_dmabuf_mr()` succeed and return a valid MR. No data-path
-change yet — any attempt to use the MR for SEND/WRITE/READ should still take the
-existing copy path and would need Phase 2 to work end-to-end.
+### 8.1 Build-time control (compile dmabuf MR support in/out)
+
+Proposed toggle:
+
+- Kconfig: `CONFIG_TBV_GPU_DIRECT`
+- Out-of-tree make variable: `tbv_gpu_direct=0|1` (feeding `ccflags-y`)
+- Proposed default: `CONFIG_TBV_GPU_DIRECT=n` / `tbv_gpu_direct=0` so out-of-box
+  behavior stays on the current host-copy path.
+
+Model/reference patterns:
+
+- Existing Kconfig feature gating in `kernel/Kconfig` (`THUNDERBOLT_IBVERBS`,
+  `THUNDERBOLT_IBVERBS_DEBUG_SURFACES`) shows how optional surfaces are compiled
+  in/out.
+- Existing Makefile feature detection for
+  `TBV_KERNEL_HAS_IB_DMAH` (`kernel/Makefile:15–28`) shows the established
+  compile-time probe/define pattern used by this tree.
+
+Required behavior when compiled out:
+
+- `.reg_user_mr_dmabuf` is not registered in `tbv_ibdev_ops`.
+- `ibv_reg_dmabuf_mr()` returns `-EOPNOTSUPP` via uverbs (same contract as
+  today).
+- All host-copy behavior is byte-for-byte identical to current releases.
+
+### 8.2 Load-time control (module parameter gate)
+
+Proposed module parameter:
+
+- `gpu_direct=auto|on|off` (default `auto`)
+
+This follows the existing module-parameter style and load-time policy gates used
+throughout the driver (`profile=`, `register_verbs=`, `negotiate_native=`), as
+documented in `docs/MODULE_PARAMETERS.md`, `docs/ARCHITECTURE.md` (module
+parameter table), and README `modprobe` examples.
+
+`auto` semantics:
+
+- If build-time support is compiled in **and** required kernel/`amdgpu` dmabuf
+  support is present, activate the dma-buf MR op.
+- Otherwise, keep host-copy as the active behavior and emit one single-line
+  info log with the reason (e.g., "gpu_direct=auto fallback: amdgpu dmabuf interface unavailable").
+
+`on` semantics:
+
+- Request dma-buf MR support.
+- If prerequisites are missing, return `EOPNOTSUPP` for dmabuf registration
+  calls and log one single-line reason.
+
+`off` semantics:
+
+- Force current behavior regardless of kernel/GPU capability.
+- `ibv_reg_dmabuf_mr()` returns `EOPNOTSUPP`; host-copy remains active.
+
+### 8.3 Per-MR/runtime behavior and consumer probe contract
+
+Even with build/load controls, per-call runtime behavior remains explicit:
+
+- `ibv_reg_dmabuf_mr()` is the capability probe used by GPU-aware consumers.
+- `EOPNOTSUPP` remains the canonical "feature unavailable here" signal.
+- RCCL/NCCL and rocSHMEM GDA paths can branch cleanly:
+  - probe succeeds → use direct-GPU dmabuf MR path;
+  - probe returns `EOPNOTSUPP` → keep/choose host-copy staging path.
+
+This preserves compatibility with existing consumer probing logic and avoids
+hard-fail behavior when GPU-direct is unavailable.
+
+### 8.4 Fallback matrix (build × load-time param × runtime support)
+
+Safe default is explicit: out-of-the-box behavior remains today's host-copy
+path unless the user opts in.
+
+| Build (`CONFIG_TBV_GPU_DIRECT`) | `gpu_direct` param | dmabuf runtime support present (`amdgpu`/kernel) | Resulting behavior | `ibv_reg_dmabuf_mr()` | Logging |
+|---|---|---|---|---|---|
+| off | auto | absent/present | Host-copy only (identical to today) | `EOPNOTSUPP` | Optional one-line init note: compiled out |
+| off | on | absent/present | Host-copy only (cannot activate direct path) | `EOPNOTSUPP` | One-line reason: requested on but compiled out |
+| off | off | absent/present | Host-copy only (identical to today) | `EOPNOTSUPP` | Optional one-line init note: disabled |
+| on | off | absent/present | Host-copy only (forced off) | `EOPNOTSUPP` | One-line reason: disabled by module param |
+| on | auto | absent | Host-copy fallback | `EOPNOTSUPP` | One-line reason: auto fallback (support missing) |
+| on | auto | present | Direct-GPU dmabuf MR active; host-copy still available for non-dmabuf MRs | success | One-line info: gpu_direct auto-enabled |
+| on | on | absent | Host-copy fallback (direct requested but unavailable) | `EOPNOTSUPP` | One-line reason: requested on, support missing |
+| on | on | present | Direct-GPU dmabuf MR active; host-copy still available for non-dmabuf MRs | success | One-line info: gpu_direct enabled |
+
+**Citations for control-point patterns:** `kernel/Kconfig:3–20`,
+`kernel/Makefile:15–28`, `docs/MODULE_PARAMETERS.md:8–31`,
+`docs/ARCHITECTURE.md:81–96`, `README.md:304–323`, `kernel/main.c:29–31`,
+`kernel/main.c:91–93`, `kernel/main.c:121–123`.
+
+---
+
+## 9. Phased implementation plan
+
+### Phase 1 — Kernel `reg_user_mr_dmabuf` + build/load-time gates
+
+**Goal:** introduce the optionality controls with safe defaults and wire a
+gated `reg_user_mr_dmabuf` op. Merging this phase must be a no-op for existing
+users (host-copy remains default behavior).
 
 **Files / functions touched:**
 
@@ -448,6 +553,9 @@ existing copy path and would need Phase 2 to work end-to-end.
 | `kernel/ibdev_mr.c:163` | In `tbv_dereg_mr`: release `umem_dmabuf` when `mr->dmabuf_mr` |
 | `kernel/ibdev.c:8086` | Add `.reg_user_mr_dmabuf = tbv_reg_dmabuf_mr` to `tbv_ibdev_ops` |
 | `kernel/ibdev_split.h` | Export `tbv_reg_dmabuf_mr` prototype |
+| `kernel/Kconfig` | Add proposed `CONFIG_TBV_GPU_DIRECT` build toggle (non-binding name) |
+| `kernel/Makefile` | Add proposed `tbv_gpu_direct` make-variable plumbing for `ccflags-y` (non-binding name), modeled after `TBV_KERNEL_HAS_IB_DMAH` pattern |
+| `kernel/main.c` + docs | Add proposed `gpu_direct=auto|on|off` module parameter gate (non-binding name), defaulting to host-copy behavior |
 
 **Pseudocode sketch (inert — no behavior change in this PR):**
 
@@ -466,14 +574,19 @@ existing copy path and would need Phase 2 to work end-to-end.
 ```
 
 **Acceptance criteria:**
-- `ibv_reg_dmabuf_mr()` returns a non-NULL MR without error.
-- `ibv_dereg_mr()` on a dmabuf MR succeeds without leak.
-- `ib_umem_dmabuf_get_pinned` is called with the correct dmabuf fd.
+- With `CONFIG_TBV_GPU_DIRECT` off **or** `gpu_direct=off`, behavior is
+  byte-for-byte identical to today and `ibv_reg_dmabuf_mr()` returns
+  `EOPNOTSUPP`.
+- With build support on and `gpu_direct=auto`, dmabuf registration only
+  activates when runtime support is present; otherwise it cleanly returns
+  `EOPNOTSUPP` and logs one fallback reason line.
+- `ibv_dereg_mr()` on a dmabuf MR succeeds without leak when enabled.
 
 ### Phase 2 — Data-path copy helpers made dmabuf-aware
 
-**Goal:** `ibv_post_send` / `ibv_post_recv` with a dmabuf MR work end-to-end
-using the existing copy-through-CPU model.
+**Goal:** keep both copy paths and select per-MR at runtime:
+host-copy for regular MRs, dmabuf-aware host-copy for dmabuf MRs when
+GPU-direct is enabled.
 
 **Files / functions touched:**
 
@@ -504,8 +617,10 @@ copied path for Phase 2. The existing guard (`ibdev.c:3619–3626`) is not remov
 its comment about a "peer-direct contract" is precisely what Phase 4 addresses.
 
 **Acceptance criteria:**
+- With `gpu_direct=off` (or compiled out), dmabuf registration still returns
+  `EOPNOTSUPP` and all host-copy tests match current behavior.
 - `ib_send_bw --use_rocm` (or equivalent perftest with a ROCm dmabuf MR)
-  completes without error on Strix Halo.
+  completes without error on Strix Halo when gpu_direct is enabled.
 - `ib_write_bw` with a dmabuf MR completes.
 - Bandwidth is within 5% of the host-MR baseline (copy overhead is dominated by
   Thunderbolt fabric, not CPU).
@@ -513,14 +628,15 @@ its comment about a "peer-direct contract" is precisely what Phase 4 addresses.
 
 ### Phase 3 — Userspace driver-id, capability advertising, RCCL/NCCL enablement
 
-**Goal:** RCCL/NCCL feature-probe succeeds and selects the dmabuf path.
+**Goal:** document and validate both supported configurations: host-staging and
+GPU-direct opt-in.
 
 **Files / functions touched:**
 
 | File | Change |
 |---|---|
 | `userspace/usb4_rdma/usb4_rdma.c:293` | Change `RDMA_DRIVER_UNKNOWN` → `RDMA_DRIVER_USB4` (once upstream enum is allocated); in the interim add a `/* TODO: request upstream RDMA_DRIVER_USB4 */` comment |
-| `docs/vllm-toolbox-integration.md:275` | Update `NCCL_NET_GDR_LEVEL=0` note to reflect that ≥ 1 is valid after Phase 2 lands |
+| `docs/vllm-toolbox-integration.md:275` | Document both modes: host-staging (`NCCL_NET_GDR_LEVEL=0`) and GPU-direct opt-in (`NCCL_NET_GDR_LEVEL ≥ 1`) keyed off `gpu_direct` state |
 | `userspace/bench/tbv_vllm_smoke.sh:453` | No code change; validate that `ROCSHMEM_GDA_ENABLE_DMABUF=1` now works end-to-end |
 
 No kernel change is needed for Phase 3: NCCL/RCCL probe by calling
@@ -528,15 +644,19 @@ No kernel change is needed for Phase 3: NCCL/RCCL probe by calling
 probe succeeds automatically.
 
 **Acceptance criteria:**
+- Documentation clearly states:
+  - `gpu_direct=off` + `NCCL_NET_GDR_LEVEL=0` = current host-staging path;
+  - `gpu_direct=on|auto(enabled)` + `NCCL_NET_GDR_LEVEL ≥ 1` = direct-GPU path.
 - `RCCL_ROCSHMEM_ENABLE=1 ROCSHMEM_GDA_ENABLE_DMABUF=1` allreduce completes on
-  two Strix Halo machines.
+  two Strix Halo machines when GPU-direct is enabled.
 - `tbv_vllm_smoke.sh --transport gda` exits 0.
-- `NCCL_NET_GDR_LEVEL` can be set to 1 without errors.
+- `NCCL_NET_GDR_LEVEL` can be set to 1 without errors when feature-gated on.
 
 ### Phase 4 — Move-notify / dynamic dmabuf and zcopy re-baselining
 
 **Goal:** support HMM / dynamic dmabuf (ODP-equivalent for GPU memory) and, if
-Strix Halo pages remain zone-normal, enable the ring zcopy path for dmabuf MRs.
+Strix Halo pages remain zone-normal, conditionally enable ring zcopy for dmabuf
+MRs only when `gpu_direct` is explicitly enabled.
 
 **Files / functions touched:**
 
@@ -544,27 +664,30 @@ Strix Halo pages remain zone-normal, enable the ring zcopy path for dmabuf MRs.
 |---|---|
 | `kernel/ibdev_mr.c` | Add `ib_umem_dmabuf_get()` variant with move-notify callback; wire `tbv_mr.notifier` |
 | `kernel/ibdev_internal.h` | Add notifier field to `struct tbv_mr` |
-| `kernel/ibdev.c:3619` | Evaluate whether to lift the `tbv_page_zcopy_safe` zone-device guard for pinned dmabuf MRs |
+| `kernel/ibdev.c:3619` | Evaluate whether to lift the `tbv_page_zcopy_safe` zone-device guard for pinned dmabuf MRs, but only under explicit GPU-direct enablement |
 | `bench/perftest-smoke-baseline.csv` | Re-baseline if dmabuf zcopy changes throughput |
-| `docs/vllm-toolbox-integration.md` | Flip `NCCL_NET_GDR_LEVEL` default and remove host-staging caveat |
+| `docs/vllm-toolbox-integration.md` | Keep dual-mode docs; add Phase 4 guidance for move-notify/zcopy under explicit GPU-direct opt-in while preserving host-staging guidance |
 
 **Acceptance criteria:**
 - `ibv_reg_dmabuf_mr` with a moveable allocation does not crash on invalidation.
-- Ring zcopy (if enabled) does not corrupt data on migration.
+- Ring zcopy (if enabled under explicit parameter opt-in) does not corrupt data
+  on migration.
 - Smoke baselines updated and regression CI passes.
 
 ---
 
-## 9. Risk and security analysis
+## 10. Risk and security analysis
 
-### 9.1 dmabuf invalidation race (Phase 1–2)
+### 10.1 dmabuf invalidation race (Phase 1–2)
 
 With `ib_umem_dmabuf_get_pinned()`, pages are pinned for the lifetime of the MR.
 If the GPU driver attempts to evict or migrate the allocation, the pin blocks it,
 which is the correct behavior for Phase 1. Risk: long-lived MRs could OOM the
 GPU allocator if pinning prevents reclaim. Mitigation: document a recommended
 MR lifetime model (register-use-deregister per transfer) and expose this in the
-vLLM integration guide.
+vLLM integration guide. Operational mitigation is explicit: operators can set
+`gpu_direct=off` to force the host-copy path if pin pressure appears in
+production.
 
 For Phase 4 (dynamic dmabuf), the move-notify / invalidation path must hold the
 driver lock and quiesce in-flight send/receive operations on the MR before
@@ -572,7 +695,7 @@ allowing the page to move. Failure to do so could cause the ring to DMA from a
 stale physical address. This is the same race that `ib_umem_odp` handles for
 on-demand-paging MRs and should follow the same pattern.
 
-### 9.2 Existing `tbv_page_zcopy_safe` guard
+### 10.2 Existing `tbv_page_zcopy_safe` guard
 
 The guard at `kernel/ibdev.c:3619–3626` is an explicit defense against feeding
 GPU pages to the NHI DMA engine without a peer-direct contract. This plan keeps
@@ -583,8 +706,10 @@ the guard for Phases 1–3. Removing it in Phase 4 requires verifying:
   matrix.
 - Move-notify is in place so the ring does not DMA a page that the GPU driver
   has concurrently remapped.
+- The load-time off switch (`gpu_direct=off`) remains an immediate escape hatch
+  to restore current host-copy behavior if field issues appear.
 
-### 9.3 Peer-scoped rkey model
+### 10.3 Peer-scoped rkey model
 
 `tbv_mr_get` (`kernel/ibdev.c:530` area) validates `peer_id` on MR lookup to
 prevent one peer from using another peer's rkey. A dmabuf MR must carry the same
@@ -592,7 +717,7 @@ prevent one peer from using another peer's rkey. A dmabuf MR must carry the same
 `tbv_mr_publish` path (`kernel/ibdev_mr.c:54`) sets `mr->peer_id` from
 `tbv_ibdev_peer_id(pd->device)` and `tbv_reg_dmabuf_mr` must use the same path.
 
-### 9.4 Access flag forwarding
+### 10.4 Access flag forwarding
 
 `ib_umem_dmabuf_get_pinned(device, offset, length, fd, access)` forwards the
 access flags to the dmabuf exporter. The kernel's dmabuf fencing infrastructure
@@ -602,7 +727,7 @@ The implementation must forward `access` faithfully from the uverbs request.
 
 ---
 
-## 10. Precise per-phase file list with current line references
+## 11. Precise per-phase file list with current line references
 
 | Phase | File | Lines (HEAD) | What changes |
 |---|---|---|---|
@@ -611,6 +736,10 @@ The implementation must forward `access` faithfully from the uverbs request.
 | 1 | `kernel/ibdev_mr.c` | 163–179 | `tbv_dereg_mr`: release dmabuf umem |
 | 1 | `kernel/ibdev.c` | 8086 | Add `.reg_user_mr_dmabuf = tbv_reg_dmabuf_mr` |
 | 1 | `kernel/ibdev_split.h` | (prototype section) | Export `tbv_reg_dmabuf_mr` |
+| 1 | `kernel/Kconfig` | 3–20 (+new symbol) | Add `CONFIG_TBV_GPU_DIRECT` gate (proposed name) |
+| 1 | `kernel/Makefile` | 15–28 (+new make variable) | Wire compile-time gate (proposed `tbv_gpu_direct`) following existing feature-detect style |
+| 1 | `kernel/main.c` | module-parameter block | Add `gpu_direct=auto|on|off` gate (proposed name) |
+| 1 | `docs/MODULE_PARAMETERS.md` / `docs/ARCHITECTURE.md` / `README.md` | parameter + modprobe sections | Document load-time switch and safe default |
 | 2 | `kernel/ibdev.c` | 3336 | `tbv_copy_send_range`: dmabuf umem branch |
 | 2 | `kernel/ibdev.c` | 5616 | `tbv_umem_copy_to`: dmabuf umem branch |
 | 2 | `kernel/ibdev.c` | 5702 | `tbv_umem_page_from_addr`: dmabuf umem branch |
@@ -625,20 +754,22 @@ The implementation must forward `access` faithfully from the uverbs request.
 
 ---
 
-## 11. Acceptance criteria and test/validation plan
+## 12. Acceptance criteria and test/validation plan
 
-### 11.1 Phase 1 smoke
+### 12.1 Phase 1 smoke
 
 ```sh
 # Allocate a ROCm buffer, export dmabuf fd, register as RDMA MR
-# Expected: ibv_reg_dmabuf_mr() returns non-NULL, ibv_dereg_mr() returns 0
+# Expected:
+# - CONFIG_TBV_GPU_DIRECT=off OR gpu_direct=off -> EOPNOTSUPP
+# - gpu_direct=auto/on with support present -> non-NULL MR + clean dereg
 ./userspace/bench/rc_write_gpu_poll --dmabuf --verify
 ```
 
 `userspace/bench/rc_write_gpu_poll.cpp` already exists as a skeleton; it will
 need a `--dmabuf` flag and a HIP `hipMemGetHandleForAddressRange` call added.
 
-### 11.2 Phase 2 smoke (data-path)
+### 12.2 Phase 2 smoke (data-path)
 
 ```sh
 # ib_write_bw / ib_send_bw equivalent using ROCm dmabuf MR
@@ -658,9 +789,13 @@ Debugfs validation:
 grep -r copy_error /sys/kernel/debug/thunderbolt_ibverbs/
 ```
 
-### 11.3 Phase 3 RCCL/NCCL smoke
+### 12.3 Phase 3 RCCL/NCCL smoke
 
 ```sh
+# Host-staging (default-safe mode)
+NCCL_NET_GDR_LEVEL=0 ./userspace/bench/tbv_vllm_smoke.sh --transport gda ...
+
+# GPU-direct opt-in mode
 ./userspace/bench/tbv_vllm_smoke.sh \
     --transport gda \
     --head-host node0 --worker-host node1 \
@@ -668,10 +803,10 @@ grep -r copy_error /sys/kernel/debug/thunderbolt_ibverbs/
     --rocshmem-install /opt/rocshmem-gda
 ```
 
-Expected: exits 0, `assert_rdma_used` passes (confirming RDMA path was taken),
-no `NCCL_NET_GDR_LEVEL=0` override needed.
+Expected: host-staging mode remains valid, and GPU-direct mode exits 0 with
+`assert_rdma_used` passing when `gpu_direct` is enabled.
 
-### 11.4 Phase 4 move-notify regression
+### 12.4 Phase 4 move-notify regression
 
 ```sh
 # Trigger GPU memory migration while an RDMA MR is live; confirm no crash/corruption
@@ -679,9 +814,12 @@ no `NCCL_NET_GDR_LEVEL=0` override needed.
 ./tools/ci/datapath-functional.sh   # existing CI smoke must still pass
 ```
 
+Also verify `gpu_direct=off` immediately restores host-copy behavior after
+Phase 4 lands.
+
 ---
 
-## 12. Checklist — issue-ready task specs
+## 13. Checklist — issue-ready task specs
 
 The following items map each phase to a trackable GitHub issue. Each is written
 so it can be filed with the body below and linked back to this document.
@@ -699,9 +837,14 @@ so it can be filed with the body below and linked back to this document.
   `struct tbv_mr` (`ibdev_internal.h:317`); implement `tbv_reg_dmabuf_mr()` in
   `kernel/ibdev_mr.c` using `ib_umem_dmabuf_get_pinned()`; wire the dereg path
   in `tbv_dereg_mr`; add `.reg_user_mr_dmabuf = tbv_reg_dmabuf_mr` to
-  `tbv_ibdev_ops` (`ibdev.c:8086`). No data-path change.
-- **Acceptance:** `ibv_reg_dmabuf_mr()` returns a valid MR on a ROCm allocation.
-  `ibv_dereg_mr()` succeeds without leak. Module builds clean (checkpatch, sparse).
+  `tbv_ibdev_ops` (`ibdev.c:8086`). In the same phase, add proposed
+  (non-binding) build-time (`CONFIG_TBV_GPU_DIRECT`) and load-time
+  (`gpu_direct=auto|on|off`) gates, defaulting to current behavior.
+- **Acceptance:** With `CONFIG_TBV_GPU_DIRECT` off **or** `gpu_direct=off`,
+  behavior is byte-for-byte identical to today and `ibv_reg_dmabuf_mr()`
+  returns `EOPNOTSUPP`. With feature enabled and prerequisites present,
+  `ibv_reg_dmabuf_mr()` returns a valid MR; `ibv_dereg_mr()` succeeds without
+  leak. Module builds clean (checkpatch, sparse).
 - **Labels:** `kernel`, `gpu-direct`, `enhancement`
 
 ---
@@ -717,9 +860,11 @@ so it can be filed with the body below and linked back to this document.
   path, add a branch that uses `mr->umem_dmabuf->umem` (the embedded `ib_umem`
   inside the pinned dmabuf structure) when `mr->dmabuf_mr` is set. No change to
   the NHI ring path or the zcopy guard (`ibdev.c:3619`). Keep all dmabuf MRs on
-  the copied path.
+  the copied path and preserve host-copy behavior for non-dmabuf MRs.
 - **Acceptance:** `ib_write_bw` / `ib_send_bw` with a ROCm dmabuf MR completes
-  on two Strix Halo machines. Bandwidth within 7.5% of host-MR baseline.
+  on two Strix Halo machines when GPU-direct is enabled. With `gpu_direct=off`,
+  dmabuf registration remains `EOPNOTSUPP` and host-copy behavior remains
+  unchanged. Bandwidth within 7.5% of host-MR baseline.
   `data_rx_copy_error` / `data_wr_copy_error` remain zero.
 - **Labels:** `kernel`, `gpu-direct`, `data-path`
 
@@ -732,12 +877,14 @@ so it can be filed with the body below and linked back to this document.
   GPU-direct. The GDA transport smoke (`tbv_vllm_smoke.sh --transport gda`) will
   still fail at the RCCL rocSHMEM level without a config update.
 - **Scope:** Update `docs/vllm-toolbox-integration.md` to reflect that
-  `NCCL_NET_GDR_LEVEL ≥ 1` is valid once Phases 1+2 land; add a `/* TODO:
-  request upstream RDMA_DRIVER_USB4 */` comment to `usb4_rdma.c:293`; run
-  `tbv_vllm_smoke.sh --transport gda` to validate end-to-end. No kernel change.
+  host-staging (`NCCL_NET_GDR_LEVEL=0`) and GPU-direct opt-in
+  (`NCCL_NET_GDR_LEVEL ≥ 1`) configurations, keyed off `gpu_direct` state; add
+  a `/* TODO: request upstream RDMA_DRIVER_USB4 */` comment to `usb4_rdma.c:293`;
+  run `tbv_vllm_smoke.sh --transport gda` to validate end-to-end. No kernel change.
 - **Acceptance:** `tbv_vllm_smoke.sh --transport gda` exits 0. RCCL allreduce
-  confirms RDMA path (`assert_rdma_used`). `NCCL_NET_GDR_LEVEL=0` override
-  removed from integration docs.
+  confirms RDMA path (`assert_rdma_used`) when GPU-direct is enabled; with
+  feature off/unavailable, documented fallback path remains host-staging with
+  `EOPNOTSUPP` probe handling and no hard-fail.
 - **Labels:** `userspace`, `gpu-direct`, `documentation`
 
 ---
@@ -752,9 +899,10 @@ so it can be filed with the body below and linked back to this document.
 - **Scope:** Add `ib_umem_dmabuf_get()` with an invalidation callback to
   `tbv_reg_dmabuf_mr`; wire the callback to quiesce in-flight WRs; add
   a notifier field to `struct tbv_mr`; evaluate the `tbv_page_zcopy_safe` guard;
-  re-baseline `bench/perftest-smoke-baseline.csv` if zcopy is enabled; flip
-  `NCCL_NET_GDR_LEVEL` default in the toolbox integration doc.
+  re-baseline `bench/perftest-smoke-baseline.csv` if zcopy is enabled under
+  explicit `gpu_direct` opt-in; keep `gpu_direct=off` as escape hatch.
 - **Acceptance:** GPU memory migration stress test + concurrent RDMA traffic
   produces no crash or data corruption. All existing `datapath-functional.sh` and
   regression-suite CI checks pass. Baselines updated if zcopy throughput changes.
+  `gpu_direct=off` still restores current host-copy behavior.
 - **Labels:** `kernel`, `gpu-direct`, `performance`, `reliability`
