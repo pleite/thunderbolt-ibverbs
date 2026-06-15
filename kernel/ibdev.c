@@ -466,18 +466,17 @@ out:
 
 static void tbv_mr_free(struct tbv_mr *mr)
 {
+	struct ib_umem *umem = mr->umem;
+
 #ifdef CONFIG_TBV_GPU_DIRECT
-	if (mr->dmabuf_mr) {
-		/* ib_umem_release() dispatches to the dma-buf release path. */
-		if (mr->umem_dmabuf)
-			ib_umem_release(&mr->umem_dmabuf->umem);
-	} else if (mr->umem) {
-		ib_umem_release(mr->umem);
-	}
-#else
-	if (mr->umem)
-		ib_umem_release(mr->umem);
+	/* dma-buf MRs keep their umem inside the embedded ib_umem_dmabuf. */
+	if (mr->dmabuf_mr && mr->umem_dmabuf)
+		umem = &mr->umem_dmabuf->umem;
 #endif
+	/* ib_umem_release() dispatches to the dma-buf release path as needed. */
+	if (umem)
+		ib_umem_release(umem);
+
 	if (mr->owner)
 		atomic_dec(&mr->owner->verbs_mrs);
 	kfree(mr);
