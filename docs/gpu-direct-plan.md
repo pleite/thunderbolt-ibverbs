@@ -487,7 +487,7 @@ parameter table), and README `modprobe` examples.
 - If build-time support is compiled in **and** required kernel/`amdgpu` dmabuf
   support is present, activate the dma-buf MR op.
 - Otherwise, keep host-copy as the active behavior and emit one single-line
-  info log with the reason (e.g., "gpu_direct=auto fallback: dmabuf support not available").
+  info log with the reason (e.g., "gpu_direct=auto fallback: amdgpu dmabuf interface unavailable").
 
 `on` semantics:
 
