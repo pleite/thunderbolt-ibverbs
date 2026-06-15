@@ -149,3 +149,15 @@ prioritized fix list. Each finding was filed as its own issue + branch +
 draft PR by the [`scripts/archive/fixes/`](../scripts/archive/fixes/) toolkit,
 the same way these roadmap steps were; all findings now shipped, so that toolkit
 is archived too.
+
+## Follow-on work: GPU-direct RDMA via dma-buf
+
+A deep investigation of the dma-buf MR path and a phased implementation plan for
+GPU-direct RDMA on the **AMD AI MAX+ 395 (Strix Halo APU)** is documented in
+[`docs/gpu-direct-plan.md`](gpu-direct-plan.md). That document traces exactly
+where `ibv_reg_dmabuf_mr()` fails today, explains why the Strix Halo
+unified-memory architecture makes a copy-through-CPU first cut viable, and
+defines four implementation phases (GDP-1 through GDP-4) with explicit
+GPU-direct opt-in/host-copy fallback behavior as issue-ready task
+specs. File an issue per phase using the specs in the checklist at the end of
+that document.

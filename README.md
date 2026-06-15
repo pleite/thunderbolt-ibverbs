@@ -113,6 +113,7 @@ the configured thresholds versus baseline.
 - [Troubleshooting guide](docs/TROUBLESHOOTING.md) — symptom-by-symptom checklist
 - [Detailed contributor notes](docs/CONTRIBUTING.md) — build instructions, code style, and PR process
 - [Strix Halo vLLM toolbox integration](docs/vllm-toolbox-integration.md) — using the kyuz0 RCCL toolbox over thunderbolt-ibverbs
+- [GPU-direct RDMA via dma-buf — design and implementation plan](docs/gpu-direct-plan.md) — investigation findings and phased plan for dma-buf MR support on AMD AI MAX+ 395 (Strix Halo)
 
 ## Status
 
