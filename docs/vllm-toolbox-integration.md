@@ -275,6 +275,11 @@ export NCCL_IB_DISABLE=0            # keep RDMA path on — do NOT enable "Force
 # NCCL_IB_GID_INDEX=1 and NCCL_NET_GDR_LEVEL=0 are already set by the toolbox
 ```
 
+`NCCL_NET_GDR_LEVEL=0` is the **host-staging** (safe default) mode: RCCL
+copies GPU buffers through host memory before handing them to the RDMA
+transport. This works on any configuration regardless of the `gpu_direct`
+kernel module parameter.
+
 If env-exporting before the TUI does not propagate to Ray workers, add these
 lines to the toolbox's `scripts/cluster_manager.py` `setup_head_node` /
 `setup_worker_node` functions, alongside the existing `NCCL_SOCKET_IFNAME`
@@ -300,6 +305,72 @@ export RCCL_IB_HCA=usb4_rdma0
 
 > Do **not** vendor or copy large portions of the toolbox's files — the two
 > `export` lines above are the only additions required.
+
+### 6.3.1 Host-staging mode (default, always supported)
+
+`NCCL_NET_GDR_LEVEL=0` + `gpu_direct=off` (or compiled out) is the
+out-of-the-box configuration. RCCL / rocSHMEM stage GPU buffers through host
+memory; the driver uses its standard `ib_umem` copy path.
+
+```sh
+# Host-staging — no special module parameter needed:
+export NCCL_IB_HCA=usb4_rdma0
+export RCCL_IB_HCA=usb4_rdma0
+export NCCL_IB_DISABLE=0
+export NCCL_NET_GDR_LEVEL=0   # force host-staging (already the toolbox default)
+```
+
+`ibv_reg_dmabuf_mr()` returns `EOPNOTSUPP` in this mode; RCCL/rocSHMEM treat
+that as "GPU-direct unavailable" and fall back to host-staging automatically.
+
+### 6.3.2 GPU-direct opt-in mode (requires `gpu_direct` enabled)
+
+When the kernel module is built with `CONFIG_TBV_GPU_DIRECT=y` (out-of-tree:
+`make tbv_gpu_direct=1`) and loaded with `gpu_direct=auto` or `gpu_direct=on`,
+`ibv_reg_dmabuf_mr()` succeeds for ROCm unified-memory buffers. RCCL can then
+use `NCCL_NET_GDR_LEVEL ≥ 1` to register GPU buffers directly as RDMA MRs,
+avoiding the GPU→CPU staging copy.
+
+**Prerequisites:**
+
+- Kernel module built with GPU-direct support and loaded with
+  `gpu_direct=auto` or `gpu_direct=on` (see [MODULE_PARAMETERS.md](MODULE_PARAMETERS.md)).
+- ROCm ≥ 6.0 on all nodes (`hipMemGetHandleForAddressRange` with dmabuf fd).
+- Linux kernel ≥ 6.2 on all nodes (amdgpu unified-memory in ZONE_NORMAL).
+
+**modprobe configuration** (add `gpu_direct=auto` to the existing line):
+
+```text
+options thunderbolt_ibverbs profile=linux_perf ... peer_auth_acl=<UUID>=<PSK> gpu_direct=auto
+```
+
+**Environment for GPU-direct mode:**
+
+```sh
+export NCCL_IB_HCA=usb4_rdma0
+export RCCL_IB_HCA=usb4_rdma0
+export NCCL_IB_DISABLE=0
+export NCCL_NET_GDR_LEVEL=1   # enable GPU-direct (requires gpu_direct=auto|on)
+# rocSHMEM GDA transport (optional — enables ROCSHMEM dmabuf path):
+export RCCL_ROCSHMEM_ENABLE=1
+export ROCSHMEM_GDA_PROVIDER=ib
+export ROCSHMEM_GDA_ENABLE_DMABUF=1
+```
+
+If `gpu_direct` is off or unavailable, `ibv_reg_dmabuf_mr()` returns
+`EOPNOTSUPP` and RCCL/rocSHMEM automatically fall back to host-staging. There
+is no hard-fail: switching back to `NCCL_NET_GDR_LEVEL=0` or setting
+`gpu_direct=off` and reloading the module restores the fully supported
+host-staging path immediately.
+
+**Mode summary:**
+
+| `gpu_direct` param | `NCCL_NET_GDR_LEVEL` | `ibv_reg_dmabuf_mr()` | Data path |
+|---|---|---|---|
+| `off` / compiled out | 0 | `EOPNOTSUPP` | Host-staging (current default) |
+| `auto` / `on` (support absent) | 0 | `EOPNOTSUPP` | Host-staging fallback — same behavior as row 1 |
+| `auto` / `on` (support present) | 0 | success (not used) | Host-staging |
+| `auto` / `on` (support present) | ≥ 1 | success | GPU-direct dmabuf MR |
 
 ### 6.4 Start the cluster and launch inference
 

@@ -872,7 +872,7 @@ so it can be filed with the body below and linked back to this document.
 
 ### GDP-3 · Phase 3: RCCL/NCCL enablement and capability advertising
 
-- [ ] **Motivation:** Even after Phases 1+2, NCCL's `NCCL_NET_GDR_LEVEL` is
+- [x] **Motivation:** Even after Phases 1+2, NCCL's `NCCL_NET_GDR_LEVEL` is
   documented as 0 (`docs/vllm-toolbox-integration.md:275`), suppressing
   GPU-direct. The GDA transport smoke (`tbv_vllm_smoke.sh --transport gda`) will
   still fail at the RCCL rocSHMEM level without a config update.
