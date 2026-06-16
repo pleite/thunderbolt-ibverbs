@@ -403,8 +403,57 @@ an opt-in once kernel dmabuf MR support is present and enabled.
 
 ### 7.1 Driver ID
 
-`tbv_ibdev_ops.driver_id = RDMA_DRIVER_UNKNOWN` (`kernel/ibdev.c:8054`). NCCL
-and UCX do not require a specific driver ID for dmabuf probe, but some
+`tbv_ibdev_ops.driver_id = RDMA_DRIVER_UNKNOWN` (`kernel/ibdev.c:8054`).
+
+#### What `RDMA_DRIVER_UNKNOWN` means
+
+`verbs_init_and_alloc_context()` in the userspace provider
+(`userspace/usb4_rdma/usb4_rdma.c:293`) registers the provider against a
+driver ID from `enum rdma_driver_id` (`<infiniband/verbs.h>`), which is
+defined in the upstream Linux kernel and mirrored into rdma-core. Entries
+include `RDMA_DRIVER_MLX5`, `RDMA_DRIVER_IRDMA`, etc. There is no
+`RDMA_DRIVER_USB4` entry because this driver has never been submitted
+upstream; no slot has been allocated.
+
+`RDMA_DRIVER_UNKNOWN` (0) is the catch-all value meaning "do not match by
+driver ID." This is **intentional and correct today** because:
+
+1. The kernel side sets `uverbs_no_driver_id_binding = 1`
+   (`kernel/ibdev.c:8056`), which tells the uverbs core to match the provider
+   by node GUID rather than driver ID (see §7.4 below). The kernel therefore
+   never rejects the provider for having an unknown ID.
+2. rdma-core's device matching falls back to GUID-based matching when the
+   driver ID is `RDMA_DRIVER_UNKNOWN`, so provider discovery works correctly.
+
+**Nothing is broken.** All verbs operations work correctly with
+`RDMA_DRIVER_UNKNOWN`.
+
+#### Why it matters (future work)
+
+- **Diagnostic tools** — some tools print human-readable names or take
+  driver-specific code paths based on driver ID. The device shows up as
+  "unknown driver" in those paths.
+- **Framework allow-lists** — a few GPU-direct plugins maintain explicit
+  allow-lists of recognized driver IDs for GPU-direct paths. `RDMA_DRIVER_UNKNOWN`
+  could cause them to skip optimizations, though NCCL/RCCL probe by calling
+  `ibv_reg_dmabuf_mr()` rather than by checking driver ID.
+- **Upstream submission** — obtaining a real `RDMA_DRIVER_USB4` allocation is
+  a prerequisite for any serious upstream kernel submission.
+
+#### What would fully resolve it
+
+1. **Upstream kernel patch**: add `RDMA_DRIVER_USB4` to
+   `enum rdma_driver_id` in
+   `include/uapi/rdma/rdma_user_ioctl_cmds.h` (linux-rdma mailing list /
+   RDMA maintainers). Once accepted and mirrored into rdma-core, the enum
+   value is available.
+2. **Userspace change**: replace `RDMA_DRIVER_UNKNOWN` with `RDMA_DRIVER_USB4`
+   in `usb4_rdma.c:293`.
+3. **Kernel change**: set `tbv_ibdev_ops.driver_id = RDMA_DRIVER_USB4` and
+   remove the `uverbs_no_driver_id_binding = 1` workaround.
+
+The `TODO` comment added in Phase 3 tracks this pending upstream work.
+NCCL and UCX do not require a specific driver ID for dmabuf probe, but some
 frameworks and diagnostic tools branch on it. A real `RDMA_DRIVER_USB4` enum
 upstream is tracked as a separate item.
 
