@@ -3714,26 +3714,11 @@ static bool tbv_send_segments_zcopy_safe(struct tbv_send_segment *segs,
 					 int nsegs, u32 total_len)
 {
 	u32 offset = 0;
-	int i;
-
-	/*
-	 * dma-buf (GPU-direct) MRs are kept off the NHI ring zcopy path and on
-	 * the bounded CPU-copy staging path.  On unified-memory APUs the backing
-	 * pages are ordinary ZONE_NORMAL system pages, so the per-page
-	 * is_zone_device_page() guard below would NOT exclude them; this
-	 * explicit check enforces the documented invariant that no dma-buf MR is
-	 * streamed directly from the ring without a peer-direct/move-notify
-	 * contract.  Lifting this for pinned dma-buf MRs is tracked as a Phase 4
-	 * future adjustment in docs/gpu-direct-plan.md.
-	 */
-	for (i = 0; i < nsegs; i++) {
-		if (segs[i].mr && segs[i].mr->dmabuf_mr)
-			return false;
-	}
 
 	while (offset < total_len) {
 		u32 skipped = 0;
 		bool found = false;
+		int i;
 
 		for (i = 0; i < nsegs; i++) {
 			struct tbv_send_segment *seg = &segs[i];
@@ -3750,6 +3735,21 @@ static bool tbv_send_segments_zcopy_safe(struct tbv_send_segment *segs,
 			}
 			if (offset > skipped)
 				seg_off = offset - skipped;
+
+			/*
+			 * dma-buf (GPU-direct) MRs are kept off the NHI ring
+			 * zcopy path and on the bounded CPU-copy staging path.
+			 * On unified-memory APUs the backing pages are ordinary
+			 * ZONE_NORMAL system pages, so the per-page
+			 * is_zone_device_page() guard below would NOT exclude
+			 * them; this explicit check enforces the documented
+			 * invariant that no dma-buf MR is streamed directly from
+			 * the ring without a peer-direct/move-notify contract.
+			 * Lifting this for pinned dma-buf MRs is tracked as a
+			 * Phase 4 future adjustment in docs/gpu-direct-plan.md.
+			 */
+			if (seg->mr && seg->mr->dmabuf_mr)
+				return false;
 
 			remaining = min_t(u32, seg->length - seg_off,
 					  total_len - offset);

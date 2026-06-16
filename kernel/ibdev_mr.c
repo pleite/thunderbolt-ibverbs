@@ -186,6 +186,12 @@ static void tbv_dmabuf_move_notify(struct dma_buf_attachment *attach)
 }
 
 static const struct dma_buf_attach_ops tbv_dmabuf_attach_ops = {
+	/*
+	 * Unified-memory only: dma-buf pages are imported into host system
+	 * memory and copied through the CPU, so PCIe peer-to-peer (discrete-GPU
+	 * BAR DMA) is neither used nor supported here.  Enabling P2P is a v2
+	 * non-goal tracked in docs/gpu-direct-plan.md (§ future adjustments).
+	 */
 	.allow_peer2peer = false,
 	.move_notify = tbv_dmabuf_move_notify,
 };
