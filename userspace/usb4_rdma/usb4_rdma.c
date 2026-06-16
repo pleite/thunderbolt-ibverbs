@@ -289,6 +289,7 @@ static struct verbs_context *usb4_rdma_alloc_context(struct ibv_device *base_dev
 	struct ib_uverbs_get_context_resp resp;
 	int rv;
 
+	/* TODO: request upstream RDMA_DRIVER_USB4 and replace RDMA_DRIVER_UNKNOWN */
 	ctx = verbs_init_and_alloc_context(base_dev, cmd_fd, ctx, base,
 					   RDMA_DRIVER_UNKNOWN);
 	if (!ctx)
