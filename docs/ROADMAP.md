@@ -161,3 +161,10 @@ defines four implementation phases (GDP-1 through GDP-4) with explicit
 GPU-direct opt-in/host-copy fallback behavior as issue-ready task
 specs. File an issue per phase using the specs in the checklist at the end of
 that document.
+
+## Upstream synchronisation
+
+Every upstream release since our v0.3.0 baseline is catalogued in
+[`docs/UPSTREAM_SYNC.md`](UPSTREAM_SYNC.md) with a per-PR applicability
+assessment, conflict risk rating, integration path, and regression analysis. That
+document is the canonical reference before any upstream merge is attempted.
