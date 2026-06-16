@@ -329,6 +329,7 @@ struct tbv_mr {
 	bool closing;
 	bool dma_mr;
 	bool dmabuf_mr;
+	bool dmabuf_dynamic;
 };
 
 struct tbv_ah {

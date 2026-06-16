@@ -29,6 +29,7 @@
 | `register_verbs` | bool | `0` | `0444` | Register guarded libibverbs device skeleton. |
 | `peer_allowlist` | string | empty | `0444` | Optional comma-separated remote UUID allow-list. |
 | `gpu_direct` | string | `auto` | `0444` | GPU-direct dma-buf memory regions: `auto`, `on`, `off`. Only present when the module is built with `tbv_gpu_direct=1` (`CONFIG_TBV_GPU_DIRECT`); otherwise `ibv_reg_dmabuf_mr()` returns `EOPNOTSUPP`. |
+| `gpu_direct_dynamic` | bool | `0` | `0444` | Import GPU-direct dma-buf MRs with a dynamic move-notify callback (Phase 4) instead of a hard pin. When `0` (default) the backing pages are pinned for the MR lifetime (Phase 1 behaviour). When `1`, the exporting GPU driver may migrate/reclaim the pages while the MR is live; the data path re-maps them under the dma-buf reservation lock for each transfer. Only present with `CONFIG_TBV_GPU_DIRECT`; has no effect unless `gpu_direct` is `auto`/`on` and the dma-buf import succeeds. |
 
 ## Transport and ring tuning (`kernel/path.c`)
 

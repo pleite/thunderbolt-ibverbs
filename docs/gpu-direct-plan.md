@@ -1,9 +1,12 @@
 # GPU-direct RDMA via dma-buf — Design and Implementation Plan
 
-> **Status: planning** — this document is the deliverable of the investigation
-> phase. No kernel, provider, or data-path behavior changes are made here.
-> Every claim cites the file and line in the current `main` HEAD. The follow-up
-> implementation work is tracked in the checklist at the end.
+> **Status: implemented** — Phases 1–4 have landed (see the per-phase checklist
+> at the end). This document began as the investigation-phase deliverable; the
+> per-phase sections now also record what was built. Behavior is unchanged by
+> default: GPU-direct is gated by the build-time `CONFIG_TBV_GPU_DIRECT` and the
+> load-time `gpu_direct` / `gpu_direct_dynamic` parameters, all off/pinned by
+> default. Remaining hardware-gated work is collected under "Phase 4
+> implementation notes and future adjustments".
 
 ---
 
@@ -319,8 +322,9 @@ The `amdgpu` driver backs these allocations with system pages (not
 - `sg_pcopy_from_buffer` / `ib_umem_copy_from` work without any special BAR
   mapping.
 - `is_zone_device_page()` returns false, so the existing `tbv_page_zcopy_safe`
-  guard does not block them (though Phase 2 deliberately avoids the zcopy path
-  for all dmabuf MRs anyway).
+  guard does **not** block them on its own. Phase 4 therefore adds an explicit
+  dma-buf exclusion in `tbv_send_segments_zcopy_safe` so that all dma-buf MRs
+  stay on the CPU-copy path regardless of page zone.
 
 This is the key architectural reason Phase 1+2 (pinned dmabuf + CPU-copy) is
 viable without any DMA topology or ring-driver change.
@@ -703,25 +707,89 @@ probe succeeds automatically.
 
 ### Phase 4 — Move-notify / dynamic dmabuf and zcopy re-baselining
 
+> **Status: implemented (dynamic dma-buf) — zcopy lift deferred to hardware
+> validation.** The dynamic move-notify import path is wired and gated behind
+> the `gpu_direct_dynamic` load-time parameter (default off = pinned). The
+> `tbv_page_zcopy_safe` guard was *evaluated* and deliberately **retained**;
+> dma-buf MRs are now explicitly forced onto the CPU-copy path. See
+> "Phase 4 implementation notes and future adjustments" below.
+
 **Goal:** support HMM / dynamic dmabuf (ODP-equivalent for GPU memory) and, if
 Strix Halo pages remain zone-normal, conditionally enable ring zcopy for dmabuf
 MRs only when `gpu_direct` is explicitly enabled.
 
-**Files / functions touched:**
+**Files / functions touched (as implemented):**
 
 | File | Change |
 |---|---|
-| `kernel/ibdev_mr.c` | Add `ib_umem_dmabuf_get()` variant with move-notify callback; wire `tbv_mr.notifier` |
-| `kernel/ibdev_internal.h` | Add notifier field to `struct tbv_mr` |
-| `kernel/ibdev.c:3619` | Evaluate whether to lift the `tbv_page_zcopy_safe` zone-device guard for pinned dmabuf MRs, but only under explicit GPU-direct enablement |
-| `bench/perftest-smoke-baseline.csv` | Re-baseline if dmabuf zcopy changes throughput |
-| `docs/vllm-toolbox-integration.md` | Keep dual-mode docs; add Phase 4 guidance for move-notify/zcopy under explicit GPU-direct opt-in while preserving host-staging guidance |
+| `kernel/ibdev_mr.c` | Added `ib_umem_dmabuf_get()` variant with a `move_notify` callback (`tbv_dmabuf_move_notify` + `tbv_dmabuf_attach_ops`); selected at registration by `tbv_gpu_direct_dynamic()` |
+| `kernel/ibdev_internal.h` | Added `bool dmabuf_dynamic` to `struct tbv_mr` |
+| `kernel/main.c` / `kernel/tbv.h` | Added `gpu_direct_dynamic` module parameter and `tbv_gpu_direct_dynamic()` accessor |
+| `kernel/ibdev.c` (`tbv_mr_dmabuf_access_begin/end`) | Map dynamic dma-buf pages under the dma-buf reservation lock for each CPU copy; balanced unlock |
+| `kernel/ibdev.c` (`tbv_send_segments_zcopy_safe`) | **Consistency fix:** explicitly exclude *all* dma-buf MRs from the NHI ring zcopy path (the per-page `is_zone_device_page()` guard does not exclude ZONE_NORMAL unified-memory pages) |
+| `kernel/ibdev.c` (`tbv_umem_page_from_addr`) | Refuse dynamic dma-buf MRs (`-EOPNOTSUPP`) so a moveable page is never handed to long-lived ring DMA |
+| `bench/perftest-smoke-baseline.csv` | **Not changed** — zcopy for dma-buf MRs remains disabled, so host-MR baselines are unaffected |
+| `docs/vllm-toolbox-integration.md` | Dual-mode (host-staging / GPU-direct opt-in) guidance retained |
 
 **Acceptance criteria:**
 - `ibv_reg_dmabuf_mr` with a moveable allocation does not crash on invalidation.
+  *(Met by design: move-notify only unmaps pages; the data path re-maps under
+  the reservation lock and only ever touches GPU pages via a bounded CPU copy
+  held under that same lock — never via long-lived ring DMA.)*
 - Ring zcopy (if enabled under explicit parameter opt-in) does not corrupt data
-  on migration.
-- Smoke baselines updated and regression CI passes.
+  on migration. *(Deferred: zcopy for dma-buf MRs is intentionally not enabled;
+  see future adjustments.)*
+- Smoke baselines updated and regression CI passes. *(Baselines unchanged
+  because the data path for dma-buf MRs is unchanged; `gpu_direct`/
+  `gpu_direct_dynamic` default off, so the default build is byte-for-byte
+  identical.)*
+
+#### Phase 4 implementation notes and future adjustments
+
+**What is implemented and safe now:**
+
+- **Dynamic dma-buf import (`gpu_direct_dynamic=1`).** Registration uses
+  `ib_umem_dmabuf_get()` with a `move_notify` callback instead of the pinned
+  importer. The callback (`tbv_dmabuf_move_notify`) runs under the dma-buf
+  reservation lock and calls `ib_umem_dmabuf_unmap_pages()`, allowing the GPU
+  driver to migrate/reclaim the buffer while the MR is live. This removes the
+  long-lived hard pin that the Phase 1 path holds (risk 10.1).
+- **Quiescing without a separate fence.** dma-buf MRs only ever touch GPU pages
+  through a bounded CPU copy (`tbv_copy_send_range`, `tbv_umem_copy_to`,
+  `tbv_umem_copy_from_iova`). For dynamic MRs each such copy takes the dma-buf
+  reservation lock and re-maps the pages (`tbv_mr_dmabuf_access_begin`). Because
+  `move_notify` also takes that lock, a copy and an invalidation can never run
+  concurrently, so the copy can never read a stale mapping. The data path runs
+  in sleepable context (RX under the `rx_lock` mutex; TX with `GFP_KERNEL`
+  staging allocations), so taking the sleeping reservation lock there is safe.
+- **Zcopy guard evaluated and retained.** `tbv_page_zcopy_safe()` only rejects
+  `ZONE_DEVICE` pages. Strix Halo unified-memory dma-buf pages are `ZONE_NORMAL`
+  (§4.3), so that guard alone would have let a pinned dma-buf MR reach the ring
+  zcopy path — contradicting the documented Phase 1–3 invariant. This is now
+  fixed explicitly in `tbv_send_segments_zcopy_safe`, which rejects any segment
+  whose MR is a dma-buf MR, and defensively in `tbv_umem_page_from_addr`, which
+  rejects dynamic dma-buf MRs outright.
+
+**Required future adjustments (need Strix Halo hardware + a GPU driver to
+validate; not safe to land blind):**
+
+1. **Ring zcopy for pinned dma-buf MRs.** Lifting the guard requires verifying,
+   under every supported kernel, that `amdgpu` returns permanently
+   `ZONE_NORMAL` pages for unified-memory allocations and that no peer-direct
+   contract is needed. Only then should `tbv_send_segments_zcopy_safe` admit
+   *pinned* dma-buf MRs, behind a further explicit opt-in (proposed
+   `gpu_direct_zcopy=0|1`). Dynamic dma-buf MRs must remain excluded from zcopy
+   regardless, because a moveable page cannot back long-lived ring DMA without a
+   move-notify-driven ring-quiesce protocol that this transport does not have.
+2. **Perf re-baseline.** Only if (1) is enabled — re-measure
+   `bench/perftest-smoke-baseline.csv` on two Strix Halo nodes and update the
+   regression thresholds in `.github/workflows/regression-self-hosted.yml`.
+3. **`allow_peer2peer`.** Currently `false` in `tbv_dmabuf_attach_ops` (no PCIe
+   P2P; unified memory only). Revisit if discrete-GPU P2P (a v2 non-goal) is
+   ever pursued.
+4. **Move-notify stress test.** The acceptance test in §12.4 (GPU page-migration
+   stress + concurrent `ib_write_bw`) still needs to be run on hardware to
+   confirm no crash/corruption end-to-end.
 
 ---
 
@@ -746,9 +814,18 @@ on-demand-paging MRs and should follow the same pattern.
 
 ### 10.2 Existing `tbv_page_zcopy_safe` guard
 
-The guard at `kernel/ibdev.c:3619–3626` is an explicit defense against feeding
-GPU pages to the NHI DMA engine without a peer-direct contract. This plan keeps
-the guard for Phases 1–3. Removing it in Phase 4 requires verifying:
+The guard at `kernel/ibdev.c` (`tbv_page_zcopy_safe`) is an explicit defense
+against feeding GPU pages to the NHI DMA engine without a peer-direct contract.
+It only rejects `ZONE_DEVICE` pages, however, and Strix Halo unified-memory
+dma-buf pages are `ZONE_NORMAL` (§4.3) — so this guard alone does **not** keep
+dma-buf MRs off the zcopy path. Phase 4 therefore adds an explicit exclusion in
+`tbv_send_segments_zcopy_safe` (reject any dma-buf MR) plus a defensive
+`-EOPNOTSUPP` for dynamic dma-buf MRs in `tbv_umem_page_from_addr`. This keeps
+the documented Phases 1–3 invariant ("all dma-buf MRs use the copied path")
+actually enforced.
+
+Lifting the exclusion for *pinned* dma-buf MRs (a Phase 4 future adjustment)
+requires verifying:
 
 - The pages returned by `amdgpu` for Strix Halo unified memory are permanently
   `ZONE_NORMAL` (not `ZONE_DEVICE`) under all kernel versions in the support
@@ -940,16 +1017,27 @@ so it can be filed with the body below and linked back to this document.
 
 ### GDP-4 · Phase 4: Move-notify / dynamic dmabuf and zcopy re-baselining
 
-- [ ] **Motivation:** Phase 1 uses `ib_umem_dmabuf_get_pinned()`, which holds a
+- [x] **Motivation:** Phase 1 uses `ib_umem_dmabuf_get_pinned()`, which holds a
   hard pin. Long-lived MRs block GPU memory reclaim. Dynamic dmabuf
   (move-notify) allows the GPU to migrate allocations while the MR is live,
   and once move-notify is in place the zcopy guard (`ibdev.c:3619`) can be
   evaluated for lifting on Strix Halo unified pages.
-- **Scope:** Add `ib_umem_dmabuf_get()` with an invalidation callback to
-  `tbv_reg_dmabuf_mr`; wire the callback to quiesce in-flight WRs; add
-  a notifier field to `struct tbv_mr`; evaluate the `tbv_page_zcopy_safe` guard;
-  re-baseline `bench/perftest-smoke-baseline.csv` if zcopy is enabled under
-  explicit `gpu_direct` opt-in; keep `gpu_direct=off` as escape hatch.
+- **Scope (implemented):** Added `ib_umem_dmabuf_get()` with an invalidation
+  callback (`tbv_dmabuf_move_notify`/`tbv_dmabuf_attach_ops`) to
+  `tbv_reg_dmabuf_mr`, selected by the new `gpu_direct_dynamic` load-time
+  parameter (default off = pinned); added `bool dmabuf_dynamic` to
+  `struct tbv_mr`; the data-path copy helpers map the pages under the dma-buf
+  reservation lock for each transfer (`tbv_mr_dmabuf_access_begin/end`), which
+  quiesces in-flight access against `move_notify`. The `tbv_page_zcopy_safe`
+  guard was evaluated and **retained**: dma-buf MRs are now explicitly excluded
+  from the ring zcopy path (`tbv_send_segments_zcopy_safe`), and dynamic dma-buf
+  MRs are refused in `tbv_umem_page_from_addr`. `gpu_direct=off` remains the
+  escape hatch. `bench/perftest-smoke-baseline.csv` is unchanged because the
+  data path for dma-buf MRs is unchanged.
+- **Deferred to hardware validation (see "Phase 4 implementation notes and
+  future adjustments"):** lifting the zcopy guard for pinned dma-buf MRs behind
+  a further `gpu_direct_zcopy` opt-in, perf re-baselining, and the on-hardware
+  move-notify migration stress test (§12.4).
 - **Acceptance:** GPU memory migration stress test + concurrent RDMA traffic
   produces no crash or data corruption. All existing `datapath-functional.sh` and
   regression-suite CI checks pass. Baselines updated if zcopy throughput changes.

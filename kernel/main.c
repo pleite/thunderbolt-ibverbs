@@ -149,11 +149,30 @@ module_param(gpu_direct, charp, 0444);
 MODULE_PARM_DESC(gpu_direct,
 		 "GPU-direct dma-buf memory regions: auto, on, off");
 
+/*
+ * gpu_direct_dynamic: opt into the dynamic (move-notify) dma-buf import path.
+ * Defaults to 0 (off), which keeps the Phase 1 hard-pinned import so out-of-box
+ * behaviour is unchanged.  When set to 1, dma-buf MRs are imported with an
+ * invalidation callback so the exporting GPU driver can migrate/reclaim the
+ * backing pages while the MR is live; the data path re-maps the pages under the
+ * dma-buf reservation lock for each transfer.  See docs/gpu-direct-plan.md
+ * Phase 4.  Has no effect unless gpu_direct is auto/on and import succeeds.
+ */
+static bool gpu_direct_dynamic;
+module_param(gpu_direct_dynamic, bool, 0444);
+MODULE_PARM_DESC(gpu_direct_dynamic,
+		 "Use dynamic (move-notify) dma-buf import for GPU-direct MRs (default 0 = pinned)");
+
 static enum tbv_gpu_direct_mode tbv_gpu_direct_resolved = TBV_GPU_DIRECT_OFF;
 
 enum tbv_gpu_direct_mode tbv_gpu_direct_mode(void)
 {
 	return tbv_gpu_direct_resolved;
+}
+
+bool tbv_gpu_direct_dynamic(void)
+{
+	return tbv_gpu_direct_resolved != TBV_GPU_DIRECT_OFF && gpu_direct_dynamic;
 }
 
 static int tbv_gpu_direct_parse(const char *value,
@@ -177,6 +196,11 @@ static int tbv_gpu_direct_parse(const char *value,
 enum tbv_gpu_direct_mode tbv_gpu_direct_mode(void)
 {
 	return TBV_GPU_DIRECT_OFF;
+}
+
+bool tbv_gpu_direct_dynamic(void)
+{
+	return false;
 }
 #endif /* CONFIG_TBV_GPU_DIRECT */
 

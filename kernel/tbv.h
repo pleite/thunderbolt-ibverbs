@@ -886,6 +886,13 @@ bool tbv_debug_surfaces_enabled(void);
  * host-copy-only releases do.
  */
 enum tbv_gpu_direct_mode tbv_gpu_direct_mode(void);
+/*
+ * Whether the dynamic (move-notify) dma-buf import path is enabled
+ * (gpu_direct_dynamic module parameter).  Returns false when GPU-direct is
+ * compiled out or the dynamic opt-in is not set, in which case dma-buf MRs use
+ * the hard-pinned import (docs/gpu-direct-plan.md Phase 1 vs Phase 4).
+ */
+bool tbv_gpu_direct_dynamic(void);
 int tbv_debugfs_init(struct tbv_state *state);
 void tbv_debugfs_exit(struct tbv_state *state);
 int tbv_configfs_start(struct tbv_state *state);

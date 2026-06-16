@@ -10,6 +10,10 @@
 #include <linux/random.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
+#ifdef CONFIG_TBV_GPU_DIRECT
+#include <linux/dma-buf.h>
+#include <linux/dma-resv.h>
+#endif
 #include <rdma/ib_umem.h>
 #ifdef TBV_KERNEL_HAS_IB_UMEM_DMABUF_H
 #include <rdma/ib_umem_dmabuf.h>
@@ -165,9 +169,39 @@ struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 
 #ifdef CONFIG_TBV_GPU_DIRECT
 /*
- * Register a dma-buf-backed (GPU-direct) memory region.  The backing pages are
- * pinned for the lifetime of the MR via ib_umem_dmabuf_get_pinned(), so no
- * move-notify callback is required (Phase 1; see docs/gpu-direct-plan.md).
+ * Move-notify callback for dynamic dma-buf MRs (Phase 4).  The exporting GPU
+ * driver invokes this with the dma-buf reservation lock held when it needs to
+ * migrate or reclaim the backing pages.  Unmapping here drops our DMA mapping
+ * so the pages can move; the data path re-maps lazily (also under the resv
+ * lock) on the next transfer.  Because dma-buf MRs only ever touch GPU pages
+ * via a bounded CPU copy performed under the same resv lock — never via a
+ * long-lived NHI ring DMA — unmapping is sufficient to quiesce in-flight
+ * access without a separate fence.  See docs/gpu-direct-plan.md Phase 4.
+ */
+static void tbv_dmabuf_move_notify(struct dma_buf_attachment *attach)
+{
+	struct ib_umem_dmabuf *umem_dmabuf = attach->importer_priv;
+
+	ib_umem_dmabuf_unmap_pages(umem_dmabuf);
+}
+
+static const struct dma_buf_attach_ops tbv_dmabuf_attach_ops = {
+	.allow_peer2peer = false,
+	.move_notify = tbv_dmabuf_move_notify,
+};
+
+/*
+ * Register a dma-buf-backed (GPU-direct) memory region.
+ *
+ * Two import modes are supported, selected by the gpu_direct_dynamic load-time
+ * parameter:
+ *
+ *   - Pinned (default, Phase 1): ib_umem_dmabuf_get_pinned() holds a hard pin
+ *     for the MR lifetime, so no move-notify callback is required and the pages
+ *     are always mapped.
+ *   - Dynamic (Phase 4): ib_umem_dmabuf_get() installs a move-notify callback
+ *     so the GPU driver may reclaim/migrate the pages while the MR is live; the
+ *     data path maps the pages on demand under the dma-buf reservation lock.
  *
  * Gated at load time by the gpu_direct module parameter: when off, or when the
  * runtime dma-buf import fails (for example because the exporting GPU driver is
@@ -182,6 +216,7 @@ struct ib_mr *tbv_reg_dmabuf_mr(struct ib_pd *pd, u64 offset, u64 length,
 				struct uverbs_attr_bundle *attrs)
 {
 	struct ib_umem_dmabuf *umem_dmabuf;
+	bool dynamic = tbv_gpu_direct_dynamic();
 	struct tbv_mr *mr;
 	u64 virt_end;
 	int ret;
@@ -190,7 +225,7 @@ struct ib_mr *tbv_reg_dmabuf_mr(struct ib_pd *pd, u64 offset, u64 length,
 		return ERR_PTR(-EOPNOTSUPP);
 
 #ifdef TBV_KERNEL_HAS_IB_DMAH
-	/* DMA-handle-qualified dma-buf MRs are not supported in Phase 1. */
+	/* DMA-handle-qualified dma-buf MRs are not supported. */
 	if (dmah)
 		return ERR_PTR(-EOPNOTSUPP);
 #endif
@@ -204,8 +239,12 @@ struct ib_mr *tbv_reg_dmabuf_mr(struct ib_pd *pd, u64 offset, u64 length,
 	if (!mr)
 		return ERR_PTR(-ENOMEM);
 
-	umem_dmabuf = ib_umem_dmabuf_get_pinned(pd->device, offset, length, fd,
-						access);
+	if (dynamic)
+		umem_dmabuf = ib_umem_dmabuf_get(pd->device, offset, length, fd,
+						 access, &tbv_dmabuf_attach_ops);
+	else
+		umem_dmabuf = ib_umem_dmabuf_get_pinned(pd->device, offset,
+							length, fd, access);
 	if (IS_ERR(umem_dmabuf)) {
 		ret = PTR_ERR(umem_dmabuf);
 		kfree(mr);
@@ -216,6 +255,7 @@ struct ib_mr *tbv_reg_dmabuf_mr(struct ib_pd *pd, u64 offset, u64 length,
 
 	mr->umem_dmabuf = umem_dmabuf;
 	mr->dmabuf_mr = true;
+	mr->dmabuf_dynamic = dynamic;
 	mr->base.type = IB_MR_TYPE_USER;
 	mr->base.iova = virt_addr;
 	mr->base.length = length;
@@ -223,7 +263,7 @@ struct ib_mr *tbv_reg_dmabuf_mr(struct ib_pd *pd, u64 offset, u64 length,
 	 * dma-buf MRs have no separate userspace VA: the remote (rkey) address
 	 * is the iova, and the umem spans [offset, offset+length).  Anchor
 	 * mr->start at virt_addr so the data-path offset arithmetic resolves to
-	 * an offset within the umem (wired in Phase 2).
+	 * an offset within the umem.
 	 */
 	mr->start = virt_addr;
 	mr->length = length;
@@ -236,8 +276,8 @@ struct ib_mr *tbv_reg_dmabuf_mr(struct ib_pd *pd, u64 offset, u64 length,
 		return ERR_PTR(ret);
 	}
 
-	pr_info_ratelimited("gpu_direct dma-buf MR registered (len %llu)\n",
-			    length);
+	pr_info_ratelimited("gpu_direct dma-buf MR registered (len %llu, %s)\n",
+			    length, dynamic ? "dynamic" : "pinned");
 	return &mr->base;
 }
 #endif /* CONFIG_TBV_GPU_DIRECT */

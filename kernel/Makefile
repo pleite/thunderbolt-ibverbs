@@ -88,6 +88,7 @@ help:
 	@echo "  peer_allowlist=<uuid[,uuid...]>"
 	@echo "  peer_auth_acl=<uuid=32hexpsk[,uuid=32hexpsk...]>"
 	@echo "  gpu_direct=auto|on|off"
+	@echo "  gpu_direct_dynamic=0|1"
 	@echo "  apple_tx_max_inflight_wr=<N>"
 	@echo "  apple_tx_max_inflight_frames=<N>"
 	@echo "  apple_rx_pending_bytes=<bytes>"
