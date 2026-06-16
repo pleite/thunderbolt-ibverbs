@@ -1,3 +1,47 @@
+# Release notes — v0.3.1pl (fork of upstream v0.3.0)
+
+Downstream `pleite/thunderbolt-ibverbs`. This is an incremental release on top
+of [`v0.3.0pl`](#release-notes--v030pl-fork-of-upstream-v030) that adds optional,
+gated GPU-direct RDMA support and a documented upstream-sync path.
+
+> Note: distribution packages (DKMS + userspace provider) are versioned `0.3.1`
+> to keep Debian/RPM/Arch/Nix version strings valid; the Git tag and GitHub
+> release for this downstream snapshot are named `v0.3.1pl`.
+
+**Full comparison:** `v0.3.0pl...v0.3.1pl`
+
+## 🚀 GPU-direct RDMA (dma-buf) — optional and gated
+
+Brings up GPU-direct RDMA over the Thunderbolt transport using dma-buf memory
+regions. The feature is fully optional: disabled unless built with
+`CONFIG_TBV_GPU_DIRECT` (out-of-tree `tbv_gpu_direct=1`) and enabled at load
+time via `gpu_direct=auto|on|off`. Delivered in four phases:
+
+- **Phase 1** — `tbv_reg_dmabuf_mr()` dma-buf MR registration plumbing.
+- **Phase 2** — dma-buf-aware data-path copy helpers.
+- **Phase 3** — RCCL/NCCL GPU-direct capability advertising and docs.
+- **Phase 4** — dynamic (move-notify) dma-buf via `gpu_direct_dynamic=0|1`,
+  mapping under the dma-buf reservation lock, with a guard that excludes
+  dma-buf MRs from ring zero-copy.
+
+See [`docs/gpu-direct-plan.md`](docs/gpu-direct-plan.md) for the full design.
+
+## 📚 Documentation
+
+- [`docs/UPSTREAM_SYNC.md`](docs/UPSTREAM_SYNC.md) — catalogues upstream
+  `v0.3.1`–`v0.3.4` changes and the downstream integration path.
+- [`docs/vllm-toolbox-integration.md`](docs/vllm-toolbox-integration.md) — vLLM
+  toolbox integration guide.
+
+## 🧱 Packaging
+
+- Version strings bumped from `0.3.0` to `0.3.1` across `dkms.conf`, `flake.nix`,
+  `nix/module.nix`, `nix/bench-tools.nix`, the RPM specs, and the README install
+  URL.
+- Refreshed `flake.lock` (nixpkgs bump).
+
+---
+
 # Release notes — v0.3.0pl (fork of upstream v0.3.0)
 
 Downstream `pleite/thunderbolt-ibverbs`, diverged from upstream
