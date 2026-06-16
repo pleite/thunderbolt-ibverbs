@@ -28,6 +28,10 @@
 #include <linux/workqueue.h>
 #include <rdma/ib_cache.h>
 #include <rdma/ib_mad.h>
+#ifdef CONFIG_TBV_GPU_DIRECT
+#include <linux/dma-buf.h>
+#include <linux/dma-resv.h>
+#endif
 #include <rdma/ib_umem.h>
 #ifdef TBV_KERNEL_HAS_IB_UMEM_DMABUF_H
 #include <rdma/ib_umem_dmabuf.h>
@@ -509,6 +513,47 @@ static struct ib_umem *tbv_mr_data_umem(const struct tbv_mr *mr)
 		return &mr->umem_dmabuf->umem;
 #endif
 	return mr->umem;
+}
+
+/*
+ * Prepare @mr's backing pages for a CPU-copy data-path access and, for dynamic
+ * dma-buf MRs, hold the dma-buf reservation lock for the duration of the
+ * access.  For pinned dma-buf MRs and ordinary host MRs the pages are always
+ * mapped, so this is a no-op that returns success.
+ *
+ * For dynamic dma-buf MRs (Phase 4) the GPU driver may have unmapped the pages
+ * via the move-notify callback; this takes the reservation lock and re-maps
+ * them.  Holding the lock across the copy serialises against a concurrent
+ * move-notify (which also runs under the reservation lock), so the copy can
+ * never read from a stale mapping.  Callers MUST balance every successful call
+ * with tbv_mr_dmabuf_access_end().  Must be called from a sleepable context.
+ */
+static int tbv_mr_dmabuf_access_begin(struct tbv_mr *mr)
+{
+#ifdef CONFIG_TBV_GPU_DIRECT
+	struct dma_resv *resv;
+	int ret;
+
+	if (!mr->dmabuf_dynamic || !mr->umem_dmabuf)
+		return 0;
+
+	resv = mr->umem_dmabuf->attach->dmabuf->resv;
+	dma_resv_lock(resv, NULL);
+	ret = ib_umem_dmabuf_map_pages(mr->umem_dmabuf);
+	if (ret) {
+		dma_resv_unlock(resv);
+		return ret;
+	}
+#endif
+	return 0;
+}
+
+static void tbv_mr_dmabuf_access_end(struct tbv_mr *mr)
+{
+#ifdef CONFIG_TBV_GPU_DIRECT
+	if (mr->dmabuf_dynamic && mr->umem_dmabuf)
+		dma_resv_unlock(mr->umem_dmabuf->attach->dmabuf->resv);
+#endif
 }
 
 void tbv_mr_put(struct tbv_mr *mr)
@@ -3367,10 +3412,14 @@ static int tbv_copy_send_range(const struct tbv_send_segment *segs, int nsegs,
 			seg_off = offset - skipped;
 
 		chunk = min_t(u32, seg->length - seg_off, length - copied);
+		ret = tbv_mr_dmabuf_access_begin(seg->mr);
+		if (ret)
+			return ret;
 		ret = ib_umem_copy_from((u8 *)dst + copied,
 					tbv_mr_data_umem(seg->mr),
 					seg->addr + seg_off - seg->mr->start,
 					chunk);
+		tbv_mr_dmabuf_access_end(seg->mr);
 		if (ret)
 			return ret;
 		copied += chunk;
@@ -3686,6 +3735,21 @@ static bool tbv_send_segments_zcopy_safe(struct tbv_send_segment *segs,
 			}
 			if (offset > skipped)
 				seg_off = offset - skipped;
+
+			/*
+			 * dma-buf (GPU-direct) MRs are kept off the NHI ring
+			 * zcopy path and on the bounded CPU-copy staging path.
+			 * On unified-memory APUs the backing pages are ordinary
+			 * ZONE_NORMAL system pages, so the per-page
+			 * is_zone_device_page() guard below would NOT exclude
+			 * them; this explicit check enforces the documented
+			 * invariant that no dma-buf MR is streamed directly from
+			 * the ring without a peer-direct/move-notify contract.
+			 * Lifting this for pinned dma-buf MRs is tracked as a
+			 * Phase 4 future adjustment in docs/gpu-direct-plan.md.
+			 */
+			if (seg->mr && seg->mr->dmabuf_mr)
+				return false;
 
 			remaining = min_t(u32, seg->length - seg_off,
 					  total_len - offset);
@@ -5657,6 +5721,7 @@ static int tbv_umem_copy_to(struct tbv_mr *mr, u64 addr, const void *src,
 	size_t copied;
 	u64 mr_end;
 	u64 end;
+	int ret;
 
 	if (!len)
 		return 0;
@@ -5669,11 +5734,15 @@ static int tbv_umem_copy_to(struct tbv_mr *mr, u64 addr, const void *src,
 	if (addr < mr->start || end > mr_end)
 		return -EFAULT;
 
+	ret = tbv_mr_dmabuf_access_begin(mr);
+	if (ret)
+		return ret;
 	umem = tbv_mr_data_umem(mr);
 	sgt = &umem->sgt_append.sgt;
 	offset = ib_umem_offset(umem) + addr - mr->start;
 	copied = sg_pcopy_from_buffer(sgt->sgl, sgt->orig_nents, src, len,
 				      offset);
+	tbv_mr_dmabuf_access_end(mr);
 	return copied == len ? 0 : -EFAULT;
 }
 
@@ -5734,7 +5803,13 @@ static int tbv_umem_copy_from_iova(struct tbv_mr *mr, u64 iova,
 	if (ret)
 		return ret;
 
-	return ib_umem_copy_from(dst, tbv_mr_data_umem(mr), addr - mr->start, len);
+	ret = tbv_mr_dmabuf_access_begin(mr);
+	if (ret)
+		return ret;
+	ret = ib_umem_copy_from(dst, tbv_mr_data_umem(mr), addr - mr->start,
+				len);
+	tbv_mr_dmabuf_access_end(mr);
+	return ret;
 }
 
 static int tbv_umem_page_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
@@ -5752,6 +5827,15 @@ static int tbv_umem_page_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
 	if (!max_len)
 		return -EINVAL;
 	if (mr->dma_mr)
+		return -EOPNOTSUPP;
+	/*
+	 * This hands a raw page to the NHI ring (zcopy) DMA path.  A dynamic
+	 * dma-buf page may be migrated/reclaimed by the GPU driver at any time,
+	 * so it must never be exposed for long-lived ring DMA; force such MRs
+	 * onto the bounded CPU-copy path instead.  See docs/gpu-direct-plan.md
+	 * Phase 4 (zcopy guard evaluation).
+	 */
+	if (mr->dmabuf_dynamic)
 		return -EOPNOTSUPP;
 	if (check_add_overflow(addr, (u64)max_len, &end))
 		return -EINVAL;

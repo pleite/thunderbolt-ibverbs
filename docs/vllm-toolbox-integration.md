@@ -344,6 +344,23 @@ avoiding the GPU→CPU staging copy.
 options thunderbolt_ibverbs profile=linux_perf ... peer_auth_acl=<UUID>=<PSK> gpu_direct=auto
 ```
 
+**Pinned vs dynamic dma-buf import (`gpu_direct_dynamic`):**
+
+By default GPU-direct MRs are *pinned* for their lifetime, which can block the
+GPU allocator from reclaiming long-lived buffers. Adding `gpu_direct_dynamic=1`
+switches to the dynamic move-notify import (Phase 4): the GPU driver may
+migrate/reclaim the buffer while the MR is live, and the transport re-maps the
+pages under the dma-buf reservation lock for each transfer. This is the
+recommended setting for long-lived MRs (e.g. persistent KV-cache registrations)
+to avoid pin pressure. The data path is otherwise identical (still a bounded CPU
+copy — dma-buf MRs are never streamed directly from the NHI ring), so it remains
+safe on migration. Leave it at `0` (pinned) if you prefer the simpler Phase 1
+behaviour or register/deregister per transfer.
+
+```text
+options thunderbolt_ibverbs profile=linux_perf ... gpu_direct=auto gpu_direct_dynamic=1
+```
+
 **Environment for GPU-direct mode:**
 
 ```sh
