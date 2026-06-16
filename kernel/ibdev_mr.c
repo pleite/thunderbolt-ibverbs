@@ -11,6 +11,9 @@
 #include <linux/slab.h>
 #include <linux/workqueue.h>
 #include <rdma/ib_umem.h>
+#ifdef TBV_KERNEL_HAS_IB_UMEM_DMABUF_H
+#include <rdma/ib_umem_dmabuf.h>
+#endif
 #include <rdma/ib_verbs.h>
 
 #include "tbv.h"
@@ -159,6 +162,85 @@ struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	}
 	return &mr->base;
 }
+
+#ifdef CONFIG_TBV_GPU_DIRECT
+/*
+ * Register a dma-buf-backed (GPU-direct) memory region.  The backing pages are
+ * pinned for the lifetime of the MR via ib_umem_dmabuf_get_pinned(), so no
+ * move-notify callback is required (Phase 1; see docs/gpu-direct-plan.md).
+ *
+ * Gated at load time by the gpu_direct module parameter: when off, or when the
+ * runtime dma-buf import fails (for example because the exporting GPU driver is
+ * unavailable), the call returns an error so consumers fall back to the
+ * host-copy staging path, matching the EOPNOTSUPP probe contract.
+ */
+struct ib_mr *tbv_reg_dmabuf_mr(struct ib_pd *pd, u64 offset, u64 length,
+				u64 virt_addr, int fd, int access,
+#ifdef TBV_KERNEL_HAS_IB_DMAH
+				struct ib_dmah *dmah,
+#endif
+				struct uverbs_attr_bundle *attrs)
+{
+	struct ib_umem_dmabuf *umem_dmabuf;
+	struct tbv_mr *mr;
+	u64 virt_end;
+	int ret;
+
+	if (tbv_gpu_direct_mode() == TBV_GPU_DIRECT_OFF)
+		return ERR_PTR(-EOPNOTSUPP);
+
+#ifdef TBV_KERNEL_HAS_IB_DMAH
+	/* DMA-handle-qualified dma-buf MRs are not supported in Phase 1. */
+	if (dmah)
+		return ERR_PTR(-EOPNOTSUPP);
+#endif
+
+	if (!length)
+		return ERR_PTR(-EINVAL);
+	if (check_add_overflow(virt_addr, length, &virt_end))
+		return ERR_PTR(-EINVAL);
+
+	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
+	if (!mr)
+		return ERR_PTR(-ENOMEM);
+
+	umem_dmabuf = ib_umem_dmabuf_get_pinned(pd->device, offset, length, fd,
+						access);
+	if (IS_ERR(umem_dmabuf)) {
+		ret = PTR_ERR(umem_dmabuf);
+		kfree(mr);
+		pr_info_ratelimited("gpu_direct dma-buf MR unavailable (err %d); falling back to host-copy\n",
+				    ret);
+		return ERR_PTR(ret);
+	}
+
+	mr->umem_dmabuf = umem_dmabuf;
+	mr->dmabuf_mr = true;
+	mr->base.type = IB_MR_TYPE_USER;
+	mr->base.iova = virt_addr;
+	mr->base.length = length;
+	/*
+	 * dma-buf MRs have no separate userspace VA: the remote (rkey) address
+	 * is the iova, and the umem spans [offset, offset+length).  Anchor
+	 * mr->start at virt_addr so the data-path offset arithmetic resolves to
+	 * an offset within the umem (wired in Phase 2).
+	 */
+	mr->start = virt_addr;
+	mr->length = length;
+	mr->virt_addr = virt_addr;
+	mr->access = access;
+	ret = tbv_mr_publish(mr, pd);
+	if (ret) {
+		ib_umem_release(&umem_dmabuf->umem);
+		kfree(mr);
+		return ERR_PTR(ret);
+	}
+
+	pr_info_ratelimited("gpu_direct dma-buf MR registered (len %llu)\n",
+			    length);
+	return &mr->base;
+}
+#endif /* CONFIG_TBV_GPU_DIRECT */
 
 int tbv_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
 {

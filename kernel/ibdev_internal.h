@@ -318,6 +318,7 @@ struct tbv_mr {
 	struct ib_mr base;
 	struct tbv_state *owner;
 	struct ib_umem *umem;
+	struct ib_umem_dmabuf *umem_dmabuf;
 	refcount_t refs;
 	struct work_struct free_work;
 	u64 start;
@@ -327,6 +328,7 @@ struct tbv_mr {
 	u32 peer_id;
 	bool closing;
 	bool dma_mr;
+	bool dmabuf_mr;
 };
 
 struct tbv_ah {

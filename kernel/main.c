@@ -137,6 +137,49 @@ module_param(peer_auth_acl, charp, 0444);
 MODULE_PARM_DESC(peer_auth_acl,
 		 "Required native peer auth ACL as comma-separated uuid=32hexpsk entries");
 
+#ifdef CONFIG_TBV_GPU_DIRECT
+/*
+ * gpu_direct: load-time gate for the dma-buf (GPU-direct) memory-region path.
+ * Defaults to auto so that, when the feature is compiled in, registration is
+ * attempted and cleanly falls back to EOPNOTSUPP if runtime dma-buf support is
+ * absent.  See docs/gpu-direct-plan.md Phase 1.
+ */
+static char *gpu_direct = "auto";
+module_param(gpu_direct, charp, 0444);
+MODULE_PARM_DESC(gpu_direct,
+		 "GPU-direct dma-buf memory regions: auto, on, off");
+
+static enum tbv_gpu_direct_mode tbv_gpu_direct_resolved = TBV_GPU_DIRECT_OFF;
+
+enum tbv_gpu_direct_mode tbv_gpu_direct_mode(void)
+{
+	return tbv_gpu_direct_resolved;
+}
+
+static int tbv_gpu_direct_parse(const char *value,
+				enum tbv_gpu_direct_mode *out)
+{
+	if (!value || !strcmp(value, "auto")) {
+		*out = TBV_GPU_DIRECT_AUTO;
+		return 0;
+	}
+	if (!strcmp(value, "on")) {
+		*out = TBV_GPU_DIRECT_ON;
+		return 0;
+	}
+	if (!strcmp(value, "off")) {
+		*out = TBV_GPU_DIRECT_OFF;
+		return 0;
+	}
+	return -EINVAL;
+}
+#else
+enum tbv_gpu_direct_mode tbv_gpu_direct_mode(void)
+{
+	return TBV_GPU_DIRECT_OFF;
+}
+#endif /* CONFIG_TBV_GPU_DIRECT */
+
 static struct tbv_state tbv_driver_state;
 
 bool tbv_debug_surfaces_enabled(void)
@@ -298,6 +341,14 @@ static int __init tbv_init(void)
 			       tbnet_identity, lanes);
 	if (ret)
 		return ret;
+
+#ifdef CONFIG_TBV_GPU_DIRECT
+	ret = tbv_gpu_direct_parse(gpu_direct, &tbv_gpu_direct_resolved);
+	if (ret) {
+		pr_err("gpu_direct must be one of auto, on, off\n");
+		return ret;
+	}
+#endif
 
 	ret = tbv_config_resolve(&resolved, &cfg);
 	if (ret)

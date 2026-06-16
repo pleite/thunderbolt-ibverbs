@@ -29,6 +29,9 @@
 #include <rdma/ib_cache.h>
 #include <rdma/ib_mad.h>
 #include <rdma/ib_umem.h>
+#ifdef TBV_KERNEL_HAS_IB_UMEM_DMABUF_H
+#include <rdma/ib_umem_dmabuf.h>
+#endif
 #include <rdma/ib_user_verbs.h>
 #include <rdma/ib_verbs.h>
 
@@ -463,8 +466,17 @@ out:
 
 static void tbv_mr_free(struct tbv_mr *mr)
 {
-	if (mr->umem)
-		ib_umem_release(mr->umem);
+	struct ib_umem *umem = mr->umem;
+
+#ifdef CONFIG_TBV_GPU_DIRECT
+	/* dma-buf MRs keep their umem inside the embedded ib_umem_dmabuf. */
+	if (mr->dmabuf_mr && mr->umem_dmabuf)
+		umem = &mr->umem_dmabuf->umem;
+#endif
+	/* ib_umem_release() dispatches to the dma-buf release path as needed. */
+	if (umem)
+		ib_umem_release(umem);
+
 	if (mr->owner)
 		atomic_dec(&mr->owner->verbs_mrs);
 	kfree(mr);
@@ -8084,6 +8096,9 @@ static const struct ib_device_ops tbv_ibdev_ops = {
 	.poll_cq = tbv_poll_cq,
 	.req_notify_cq = tbv_req_notify_cq,
 	.reg_user_mr = tbv_reg_user_mr,
+#ifdef CONFIG_TBV_GPU_DIRECT
+	.reg_user_mr_dmabuf = tbv_reg_dmabuf_mr,
+#endif
 	.dereg_mr = tbv_dereg_mr,
 
 	INIT_RDMA_OBJ_SIZE(ib_ucontext, tbv_ucontext, base),
