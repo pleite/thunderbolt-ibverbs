@@ -851,7 +851,7 @@ so it can be filed with the body below and linked back to this document.
 
 ### GDP-2 · Phase 2: Data-path copy helpers dmabuf-aware
 
-- [ ] **Motivation:** After Phase 1, any `ibv_post_send` / `ibv_post_recv` using
+- [x] **Motivation:** After Phase 1, any `ibv_post_send` / `ibv_post_recv` using
   a dmabuf MR crashes or silently produces wrong data because `tbv_copy_send_range`
   (`ibdev.c:3336`), `tbv_umem_copy_to` (`ibdev.c:5616`), and related helpers
   dereference `mr->umem` directly — which is NULL for a dmabuf MR.

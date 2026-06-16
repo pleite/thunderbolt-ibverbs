@@ -489,6 +489,28 @@ void tbv_mr_free_work(struct work_struct *work)
 	tbv_mr_free(mr);
 }
 
+/*
+ * Return the ib_umem that backs the data pages of @mr.  For regular host-copy
+ * MRs this is mr->umem.  For GPU-direct dma-buf MRs (Phase 2) the pinned umem
+ * is embedded inside mr->umem_dmabuf; returning a pointer to it lets every
+ * data-path helper — ib_umem_copy_from, ib_umem_offset, sg_pcopy_from_buffer
+ * — work without modification, because ib_umem_dmabuf_get_pinned() builds an
+ * ib_umem with the same sgt_append layout as a regular ib_umem_get().
+ *
+ * Callers that are only reached when CONFIG_TBV_GPU_DIRECT is compiled in need
+ * not add their own #ifdef; this helper is always safe to call because
+ * mr->dmabuf_mr is initialised to false and mr->umem_dmabuf to NULL when the
+ * feature is compiled out.
+ */
+static struct ib_umem *tbv_mr_data_umem(const struct tbv_mr *mr)
+{
+#ifdef CONFIG_TBV_GPU_DIRECT
+	if (mr->dmabuf_mr && mr->umem_dmabuf)
+		return &mr->umem_dmabuf->umem;
+#endif
+	return mr->umem;
+}
+
 void tbv_mr_put(struct tbv_mr *mr)
 {
 	if (!mr)
@@ -3345,7 +3367,8 @@ static int tbv_copy_send_range(const struct tbv_send_segment *segs, int nsegs,
 			seg_off = offset - skipped;
 
 		chunk = min_t(u32, seg->length - seg_off, length - copied);
-		ret = ib_umem_copy_from((u8 *)dst + copied, seg->mr->umem,
+		ret = ib_umem_copy_from((u8 *)dst + copied,
+					tbv_mr_data_umem(seg->mr),
 					seg->addr + seg_off - seg->mr->start,
 					chunk);
 		if (ret)
@@ -5628,7 +5651,8 @@ void tbv_qp_flush_apple_sq(struct tbv_qp *tqp)
 static int tbv_umem_copy_to(struct tbv_mr *mr, u64 addr, const void *src,
 			    size_t len)
 {
-	struct sg_table *sgt = &mr->umem->sgt_append.sgt;
+	struct ib_umem *umem;
+	struct sg_table *sgt;
 	size_t offset;
 	size_t copied;
 	u64 mr_end;
@@ -5645,7 +5669,9 @@ static int tbv_umem_copy_to(struct tbv_mr *mr, u64 addr, const void *src,
 	if (addr < mr->start || end > mr_end)
 		return -EFAULT;
 
-	offset = ib_umem_offset(mr->umem) + addr - mr->start;
+	umem = tbv_mr_data_umem(mr);
+	sgt = &umem->sgt_append.sgt;
+	offset = ib_umem_offset(umem) + addr - mr->start;
 	copied = sg_pcopy_from_buffer(sgt->sgl, sgt->orig_nents, src, len,
 				      offset);
 	return copied == len ? 0 : -EFAULT;
@@ -5708,14 +5734,15 @@ static int tbv_umem_copy_from_iova(struct tbv_mr *mr, u64 iova,
 	if (ret)
 		return ret;
 
-	return ib_umem_copy_from(dst, mr->umem, addr - mr->start, len);
+	return ib_umem_copy_from(dst, tbv_mr_data_umem(mr), addr - mr->start, len);
 }
 
 static int tbv_umem_page_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
 				   struct page **page_out,
 				   u32 *page_off_out, u32 *len_out)
 {
-	struct sg_table *sgt = &mr->umem->sgt_append.sgt;
+	struct ib_umem *umem;
+	struct sg_table *sgt;
 	struct scatterlist *sg;
 	size_t offset;
 	u64 end;
@@ -5733,7 +5760,9 @@ static int tbv_umem_page_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
 	if (addr < mr->start || end > mr_end)
 		return -EFAULT;
 
-	offset = ib_umem_offset(mr->umem) + addr - mr->start;
+	umem = tbv_mr_data_umem(mr);
+	sgt = &umem->sgt_append.sgt;
+	offset = ib_umem_offset(umem) + addr - mr->start;
 	for_each_sgtable_sg(sgt, sg, i) {
 		size_t seg_len = sg->length;
 		size_t seg_off;
