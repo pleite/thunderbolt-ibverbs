@@ -45,7 +45,17 @@
 #include "ibdev_internal.h"
 #include "ibdev_split.h"
 
-#if IS_ENABLED(CONFIG_KUNIT)
+/*
+ * KUnit selftests are gated on IS_BUILTIN() rather than IS_ENABLED().
+ * kunit_test_suite() and the KUNIT_* helpers reference KUnit core symbols
+ * that are only available to in-tree, built-in code. When CONFIG_KUNIT=m the
+ * KUnit core is a separate module and those symbols are not exported to this
+ * out-of-tree driver, so building the tests in would leave the module with
+ * unresolved symbols at load time. Compiling them only when CONFIG_KUNIT=y
+ * keeps the tests available for kernels built with built-in KUnit while making
+ * them fully optional everywhere else (CONFIG_KUNIT unset or =m).
+ */
+#if IS_BUILTIN(CONFIG_KUNIT)
 #include <kunit/test.h>
 #endif
 
@@ -7338,7 +7348,7 @@ static bool tbv_rdma_write_header_valid(const struct tbv_native_data_header *hdr
 	return last == (frag_end == total_len_field);
 }
 
-#if IS_ENABLED(CONFIG_KUNIT)
+#if IS_BUILTIN(CONFIG_KUNIT)
 static void tbv_kunit_rdma_write_header_valid_test(struct kunit *test)
 {
 	struct tbv_native_data_header hdr = {
@@ -7384,39 +7394,47 @@ static void tbv_kunit_mr_peer_scope_test(struct kunit *test)
 
 static void tbv_kunit_qp_native_session_match_test(struct kunit *test)
 {
-	struct tbv_peer peer = {
-		.backend = TBV_BACKEND_NATIVE,
-		.auth_acl_configured = true,
-		.auth_authenticated = true,
-		.auth_session_id = 11,
-		.auth_established_session_id = 11,
-	};
-	struct tbv_rail rail = {
-		.peer = &peer,
-	};
-	struct tbv_qp qp = {
-		.rail = &rail,
-		.peer_session_id = 11,
-	};
+	struct tbv_peer *peer;
+	struct tbv_rail *rail;
+	struct tbv_qp *qp;
 
-	KUNIT_EXPECT_TRUE(test, tbv_qp_native_session_matches(&qp));
-	qp.peer_session_id = 12;
-	KUNIT_EXPECT_FALSE(test, tbv_qp_native_session_matches(&qp));
-	qp.peer_session_id = 11;
-	peer.auth_authenticated = false;
-	peer.auth_established_session_id = 0;
-	KUNIT_EXPECT_FALSE(test, tbv_qp_native_session_matches(&qp));
+	peer = kunit_kzalloc(test, sizeof(*peer), GFP_KERNEL);
+	rail = kunit_kzalloc(test, sizeof(*rail), GFP_KERNEL);
+	qp = kunit_kzalloc(test, sizeof(*qp), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, peer);
+	KUNIT_ASSERT_NOT_NULL(test, rail);
+	KUNIT_ASSERT_NOT_NULL(test, qp);
+
+	peer->backend = TBV_BACKEND_NATIVE;
+	peer->auth_acl_configured = true;
+	peer->auth_authenticated = true;
+	peer->auth_session_id = 11;
+	peer->auth_established_session_id = 11;
+	rail->peer = peer;
+	qp->rail = rail;
+	qp->peer_session_id = 11;
+
+	KUNIT_EXPECT_TRUE(test, tbv_qp_native_session_matches(qp));
+	qp->peer_session_id = 12;
+	KUNIT_EXPECT_FALSE(test, tbv_qp_native_session_matches(qp));
+	qp->peer_session_id = 11;
+	peer->auth_authenticated = false;
+	peer->auth_established_session_id = 0;
+	KUNIT_EXPECT_FALSE(test, tbv_qp_native_session_matches(qp));
 }
 
 static void tbv_kunit_read_resp_queue_close_test(struct kunit *test)
 {
-	struct tbv_qp tqp = {};
+	struct tbv_qp *tqp;
 	struct tbv_read_resp_ctx queued = {};
 	struct tbv_read_resp_ctx rejected = {};
 	LIST_HEAD(flush);
 
-	spin_lock_init(&tqp.lock);
-	INIT_LIST_HEAD(&tqp.pending_read_resps);
+	tqp = kunit_kzalloc(test, sizeof(*tqp), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, tqp);
+
+	spin_lock_init(&tqp->lock);
+	INIT_LIST_HEAD(&tqp->pending_read_resps);
 	INIT_LIST_HEAD(&queued.node);
 	INIT_LIST_HEAD(&queued.retry_node);
 	INIT_LIST_HEAD(&rejected.node);
@@ -7424,13 +7442,13 @@ static void tbv_kunit_read_resp_queue_close_test(struct kunit *test)
 	refcount_set(&queued.refs, 1);
 	refcount_set(&rejected.refs, 1);
 
-	KUNIT_EXPECT_TRUE(test, tbv_qp_queue_read_resp(&tqp, &queued));
-	KUNIT_EXPECT_FALSE(test, list_empty(&tqp.pending_read_resps));
+	KUNIT_EXPECT_TRUE(test, tbv_qp_queue_read_resp(tqp, &queued));
+	KUNIT_EXPECT_FALSE(test, list_empty(&tqp->pending_read_resps));
 	KUNIT_EXPECT_EQ(test, refcount_read(&queued.refs), 2);
 
-	tbv_qp_begin_close(&tqp);
-	tbv_qp_cancel_read_resps(&tqp, &flush);
-	KUNIT_EXPECT_TRUE(test, list_empty(&tqp.pending_read_resps));
+	tbv_qp_begin_close(tqp);
+	tbv_qp_cancel_read_resps(tqp, &flush);
+	KUNIT_EXPECT_TRUE(test, list_empty(&tqp->pending_read_resps));
 	KUNIT_EXPECT_FALSE(test, list_empty(&flush));
 	KUNIT_EXPECT_TRUE(test, queued.closing);
 	KUNIT_EXPECT_PTR_EQ(test,
@@ -7441,7 +7459,7 @@ static void tbv_kunit_read_resp_queue_close_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&queued.refs), 1);
 	KUNIT_EXPECT_TRUE(test, list_empty(&flush));
 
-	KUNIT_EXPECT_FALSE(test, tbv_qp_queue_read_resp(&tqp, &rejected));
+	KUNIT_EXPECT_FALSE(test, tbv_qp_queue_read_resp(tqp, &rejected));
 	KUNIT_EXPECT_TRUE(test, list_empty(&rejected.node));
 	KUNIT_EXPECT_TRUE(test, rejected.closing);
 	KUNIT_EXPECT_EQ(test, refcount_read(&rejected.refs), 1);
