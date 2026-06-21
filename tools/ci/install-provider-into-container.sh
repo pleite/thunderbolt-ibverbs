@@ -88,8 +88,10 @@ fi
 [[ -f "$DRIVER_SRC" ]] ||
 	{ printf 'error: driver hint not found: %s (install usb4-rdma-provider on the host first)\n' "$DRIVER_SRC" >&2; exit 1; }
 
-# Conventional libibverbs provider directories, in preference order. Shared by
-# the host .so lookup and the container .so-dir detection below.
+# Conventional libibverbs provider directories, in preference order:
+# Debian/Ubuntu use the multiarch /usr/lib/x86_64-linux-gnu path, RHEL/Fedora
+# use /usr/lib64, and /usr/lib is the final fallback. Shared by the host .so
+# lookup and the container .so-dir detection below.
 LIBIBVERBS_DIRS=(
 	/usr/lib/x86_64-linux-gnu/libibverbs
 	/usr/lib64/libibverbs

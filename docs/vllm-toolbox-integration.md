@@ -280,7 +280,8 @@ upstream rdma-core pinned by `RDMA_CORE_TAG` (default `v62.0`) in
   43’s `libibverbs` before running the builder:
 
   ```sh
-  # Find the rdma-core version Fedora 43 ships, then pin the matching tag:
+  # Run inside the Fedora 43 container (needs dnf + network access). Find the
+  # rdma-core version the container's libibverbs ships, then pin the matching tag:
   dnf info libibverbs | grep -i version
   RDMA_CORE_TAG=v<matching-tag> tools/ci/distro-package-rdma.sh fedora
   ```
