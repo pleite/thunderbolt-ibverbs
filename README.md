@@ -113,6 +113,7 @@ the configured thresholds versus baseline.
 - [Troubleshooting guide](docs/TROUBLESHOOTING.md) — symptom-by-symptom checklist
 - [Detailed contributor notes](docs/CONTRIBUTING.md) — build instructions, code style, and PR process
 - [Strix Halo vLLM toolbox integration](docs/vllm-toolbox-integration.md) — using the kyuz0 RCCL toolbox over thunderbolt-ibverbs
+- [Toolbox feedback response](docs/toolbox-feedback-response.md) — how the tb-vllm-toolbox upstream recommendations were addressed
 - [GPU-direct RDMA via dma-buf — design and implementation plan](docs/gpu-direct-plan.md) — investigation findings and phased plan for dma-buf MR support on AMD AI MAX+ 395 (Strix Halo)
 - [Upstream sync analysis](docs/UPSTREAM_SYNC.md) — change table, applicability assessment, and integration path for upstream v0.3.1–v0.3.4 and open PRs
 
@@ -348,7 +349,10 @@ sudo modprobe -r thunderbolt_ibverbs
 ```
 
 To make a known-good configuration persistent, put the options in
-`/etc/modprobe.d/thunderbolt-ibverbs.conf`.
+`/etc/modprobe.d/thunderbolt-ibverbs.conf`. For a two-node directly-cabled
+cluster, copy the ready-to-edit drop-in
+[`packaging/modprobe.d/thunderbolt-ibverbs.conf.example`](packaging/modprobe.d/thunderbolt-ibverbs.conf.example)
+and fill in the peer UUID and shared PSK.
 
 ## Apple↔Linux Transport (mac_compat)
 

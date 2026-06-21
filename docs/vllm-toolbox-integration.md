@@ -56,6 +56,33 @@ Three pieces of evidence that this is an intended path:
 
 ---
 
+## Deployment model — host-DKMS vs container-DKMS
+
+The kernel module and the userspace provider live in **different places**:
+
+| Component | Where it runs | Recommended install |
+|---|---|---|
+| `thunderbolt_ibverbs` kernel module | **Host only** | Host DKMS (`thunderbolt-ibverbs-dkms` package or `sudo make dkms-*`) |
+| `usb4-rdma-provider` (libibverbs plugin) | **Host and container** | Host package; copy into the container if its libibverbs can't see the host's |
+
+**Host-DKMS is the blessed model and the only one needed for a working
+cluster.** Loading a module, supplying the `peer_auth_acl` PSK, and configuring
+`/etc/modprobe.d/` are host operations regardless of how you run vLLM, so the
+module is always built and loaded on the host (kernel ≥ 6.14). The container
+only needs the userspace provider so its `libibverbs` enumerates `usb4_rdma*`.
+
+Building the module **inside** a container via DKMS is possible (bind-mount
+`/lib/modules`, install `kernel-devel-$(uname -r)` on the host, run the
+container `--privileged`), but it is an **opt-in convenience**, not the
+recommended path — the loaded module still affects the host kernel. Prefer host
+DKMS unless you have a specific reason to build in the container.
+
+> The `dkms-*` Makefile targets derive their version from `dkms.conf`, so
+> `sudo make dkms-add dkms-build dkms-install` always builds the version the
+> packaging declares.
+
+---
+
 ## Prerequisites
 
 - **Linux 6.14+** on both nodes. The toolbox's tested Fedora 43 / 6.18.x
@@ -116,6 +143,11 @@ Native peer authentication via `peer_auth_acl` is required — without it native
 peers are rejected before a usable RDMA session is published (see
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md#symptom-native-peer-authentication-rejects-an-expected-peer)).
 Both sides must share the same PSK.
+
+A ready-to-edit drop-in ships at
+[`packaging/modprobe.d/thunderbolt-ibverbs.conf.example`](../packaging/modprobe.d/thunderbolt-ibverbs.conf.example)
+— copy it to `/etc/modprobe.d/thunderbolt-ibverbs.conf` on both nodes and fill
+in the two placeholders (the peer UUID and the shared PSK):
 
 **Node 1** `/etc/modprobe.d/thunderbolt-ibverbs.conf`:
 
@@ -219,9 +251,43 @@ toolbox run -c vllm -- ibv_devices
 ```
 
 > If `ibv_devices` is empty inside the container but works on the host, the
-> `usb4-rdma-provider` isn't visible to the container's libibverbs. Drop the
-> matching `usb4-rdma-provider` `.driver` file into the container's
-> `/etc/libibverbs.d/` and the `.so` into `/usr/lib64/libibverbs/`.
+> `usb4-rdma-provider` isn't visible to the container's libibverbs. Use the
+> helper to copy the host provider in:
+>
+> ```sh
+> tools/ci/install-provider-into-container.sh <container-name>
+> ```
+>
+> It copies the `.driver` hint into the container's `/etc/libibverbs.d/` and the
+> `libusb4_rdma-rdmav*.so` into its libibverbs dir. If devices are still missing
+> afterward, the container's libibverbs PABI differs from the host's — rebuild
+> the provider against the container's rdma-core (see
+> [§ Provider PABI](#provider-pabi-fedora-43) below).
+
+### 5.2 Provider PABI (Fedora 43)
+
+The `usb4-rdma-provider` is a **libibverbs plugin**, so its private ABI (PABI)
+must match the `libibverbs` it loads against. The provider is built from
+upstream rdma-core pinned by `RDMA_CORE_TAG` (default `v62.0`) in
+[`tools/ci/distro-package-rdma.sh`](../tools/ci/distro-package-rdma.sh).
+
+- **Host install (RPM/DEB):** the provider package is built against the same
+  rdma-core the host’s `libibverbs` ships, so no tuning is needed.
+- **Container use:** the toolbox image is **Fedora 43**. If the container’s
+  stock `libibverbs` PABI differs from `v62.0`, copying the host `.so` in (5.1)
+  may load but fail to enumerate. In that case rebuild the provider against the
+  container’s rdma-core by setting `RDMA_CORE_TAG` to the tag matching Fedora
+  43’s `libibverbs` before running the builder:
+
+  ```sh
+  # Find the rdma-core version Fedora 43 ships, then pin the matching tag:
+  dnf info libibverbs | grep -i version
+  RDMA_CORE_TAG=v<matching-tag> tools/ci/distro-package-rdma.sh fedora
+  ```
+
+  Install the resulting `usb4-rdma-provider-*.rpm` (or copy its `.so` +
+  `.driver` in with the 5.1 helper). Pin one `RDMA_CORE_TAG` per Fedora release
+  so the provider PABI tracks the container’s `libibverbs`.
 
 ---
 
@@ -448,3 +514,5 @@ export HF_TOKEN=your_token_here
 - [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — symptom-by-symptom checklist
 - [MODULE_PARAMETERS.md](MODULE_PARAMETERS.md) — full `thunderbolt_ibverbs` parameter catalog
 - [README.md](../README.md) — container usage and `usb4-rdma-provider` installation
+- [`packaging/modprobe.d/thunderbolt-ibverbs.conf.example`](../packaging/modprobe.d/thunderbolt-ibverbs.conf.example) — ready-to-edit module config drop-in
+- [`tools/ci/install-provider-into-container.sh`](../tools/ci/install-provider-into-container.sh) — copy the host provider into a running container
