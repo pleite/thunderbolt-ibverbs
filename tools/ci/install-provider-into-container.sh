@@ -88,8 +88,16 @@ fi
 [[ -f "$DRIVER_SRC" ]] ||
 	{ printf 'error: driver hint not found: %s (install usb4-rdma-provider on the host first)\n' "$DRIVER_SRC" >&2; exit 1; }
 
+# Conventional libibverbs provider directories, in preference order. Shared by
+# the host .so lookup and the container .so-dir detection below.
+LIBIBVERBS_DIRS=(
+	/usr/lib/x86_64-linux-gnu/libibverbs
+	/usr/lib64/libibverbs
+	/usr/lib/libibverbs
+)
+
 if [[ -z "$SO_SRC" ]]; then
-	for d in /usr/lib/x86_64-linux-gnu/libibverbs /usr/lib64/libibverbs /usr/lib/libibverbs; do
+	for d in "${LIBIBVERBS_DIRS[@]}"; do
 		[[ -d "$d" ]] || continue
 		SO_SRC="$(find "$d" -maxdepth 1 -name 'libusb4_rdma-rdmav*.so' -print -quit)"
 		[[ -n "$SO_SRC" ]] && break
@@ -108,7 +116,7 @@ printf '==> .so src:    %s\n' "$SO_SRC"
 in_container() { "$ENGINE" exec "$container" "$@"; }
 
 so_dir=""
-for d in /usr/lib/x86_64-linux-gnu/libibverbs /usr/lib64/libibverbs /usr/lib/libibverbs; do
+for d in "${LIBIBVERBS_DIRS[@]}"; do
 	if in_container test -d "$d" 2>/dev/null; then so_dir="$d"; break; fi
 done
 [[ -n "$so_dir" ]] ||
