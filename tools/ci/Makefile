@@ -1,46 +1,43 @@
 # SPDX-License-Identifier: GPL-2.0
+# Freestanding smoke binaries for proto/ (no kernel headers required).
 #
-# tools/ci/Makefile — build the freestanding proto smoke-test binaries.
+# Mirrors the source lists used by flake.nix (.#checks.*.proto-smoke) and the
+# release-artefacts CI job so downstream consumers (e.g. the tb-vllm-toolbox
+# image) can build every smoke test with a single `make -C tools/ci` instead of
+# reverse-engineering the per-binary translation units from #includes.
 #
-# These smoke tests compile without kernel headers or rdma-core and give
-# a quick sanity check of the wire protocol / reliability / identity /
-# config code paths.
-#
-# Usage:
-#   make -C tools/ci          # build all smoke binaries
-#   make -C tools/ci proto-smoke  # build specific test
-#
-# CC and CFLAGS can be overridden on the command line:
-#   make CC=clang CFLAGS="-O2 -g" -C tools/ci
-#
+# Run from the repository root or from tools/ci/ — paths are resolved relative
+# to the repo root regardless.
 
-THIS_MAKEFILE_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
-TOPDIR := $(abspath $(THIS_MAKEFILE_DIR)/../..)
-CI_SRCDIR := $(TOPDIR)/tools/ci
+CC      ?= gcc
+CFLAGS  ?= -std=c11 -Wall -Wextra -Werror
+REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
+CPPFLAGS += -I$(REPO_ROOT)
 
-CC ?= gcc
-CFLAGS ?= -Wall -Wextra -std=c11 -O2
-CFLAGS += -I$(TOPDIR)
+# Smoke binaries and their extra proto/*.c translation units. The smoke .c file
+# itself is tools/ci/<name>.c; SRCS_<name> lists the additional sources it needs.
+SMOKE_BINS := proto-smoke reliability-smoke identity-smoke config-smoke
 
-# Smoke test sources: name -> list of proto/*.c translation units needed
-SMOKES := proto-smoke reliability-smoke identity-smoke config-smoke
+SRCS_proto-smoke       :=
+SRCS_reliability-smoke := $(REPO_ROOT)/proto/reliability.c
+SRCS_identity-smoke    := $(REPO_ROOT)/proto/identity.c
+SRCS_config-smoke      := $(REPO_ROOT)/proto/config.c $(REPO_ROOT)/proto/identity.c
 
-# Source files for each smoke test (reliability, identity, config need their .c)
-.PHONY: all test clean
+.PHONY: all build test clean
 
 all: test
 
-test: $(SMOKES)
+build: $(SMOKE_BINS)
 
-define BUILD_SMOKE
-$1: $(CI_SRCDIR)/$1.c $2
-	$(CC) $(CFLAGS) -o $$@ $$< $2
-endef
+# Build then run each smoke binary, matching CI behaviour.
+test: build
+	@for t in $(SMOKE_BINS); do \
+		echo "RUN  ./$$t"; \
+		./$$t || exit 1; \
+	done
 
-$(eval $(call BUILD_SMOKE,proto-smoke,))
-$(eval $(call BUILD_SMOKE,reliability-smoke,$(TOPDIR)/proto/reliability.c))
-$(eval $(call BUILD_SMOKE,identity-smoke,$(TOPDIR)/proto/identity.c))
-$(eval $(call BUILD_SMOKE,config-smoke,$(TOPDIR)/proto/config.c $(TOPDIR)/proto/identity.c))
+$(SMOKE_BINS): %: $(REPO_ROOT)/tools/ci/%.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(SRCS_$@) -o $@
 
 clean:
-	rm -f $(SMOKES)
+	rm -f $(SMOKE_BINS)

@@ -1,0 +1,24 @@
+# Example modprobe.d drop-in for thunderbolt-ibverbs on a two-node,
+# directly-cabled USB4/Thunderbolt cluster (e.g. AMD Strix Halo + vLLM toolbox).
+#
+# Install: copy to /etc/modprobe.d/thunderbolt-ibverbs.conf on BOTH nodes,
+#          then fill in the two <...> placeholders below and reload the module:
+#              sudo cp packaging/modprobe.d/thunderbolt-ibverbs.conf.example \
+#                      /etc/modprobe.d/thunderbolt-ibverbs.conf
+#              sudo modprobe -r thunderbolt_ibverbs 2>/dev/null || true
+#              sudo modprobe thunderbolt_ibverbs
+#
+# Fill in per host:
+#   <PEER_UUID>  The *other* node's Thunderbolt UUID. Get it from the peer with:
+#                    cat /sys/bus/thunderbolt/devices/0-1/unique_id
+#   <PSK_32HEX>  One shared 16-byte PSK (32 hex chars), identical on both nodes:
+#                    openssl rand -hex 16
+#
+# The linux_perf defaults below are the recommended Strix-Halo native
+# Linux<->Linux fast-path settings. See docs/MODULE_PARAMETERS.md for the full
+# catalog and docs/vllm-toolbox-integration.md (Phase 2) for context.
+#
+# SECURITY: peer_auth_acl is the current hardening boundary. Without it native
+# peers are rejected. Treat the link as trusted-LAN-only; see docs/SECURITY.md.
+
+options thunderbolt_ibverbs profile=linux_perf bind_services=1 allocate_rings=1 start_rings=1 negotiate_native=1 enable_tunnels=1 register_verbs=1 roce_netdev=thunderbolt0 peer_auth_acl=<PEER_UUID>=<PSK_32HEX>
