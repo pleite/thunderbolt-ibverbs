@@ -14,7 +14,8 @@
 #   make CC=clang CFLAGS="-O2 -g" -C tools/ci
 #
 
-TOPDIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))../..)
+THIS_MAKEFILE_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
+TOPDIR := $(abspath $(THIS_MAKEFILE_DIR)/../..)
 CI_SRCDIR := $(TOPDIR)/tools/ci
 
 CC ?= gcc
@@ -25,19 +26,21 @@ CFLAGS += -I$(TOPDIR)
 SMOKES := proto-smoke reliability-smoke identity-smoke config-smoke
 
 # Source files for each smoke test (reliability, identity, config need their .c)
-SMOKE_EXTRA_proto-smoke :=
-SMOKE_EXTRA_reliability-smoke := $(TOPDIR)/proto/reliability.c
-SMOKE_EXTRA_identity-smoke := $(TOPDIR)/proto/identity.c
-SMOKE_EXTRA_config-smoke := $(TOPDIR)/proto/config.c $(TOPDIR)/proto/identity.c
-
 .PHONY: all test clean
 
 all: test
 
 test: $(SMOKES)
 
-$(SMOKES): %: $(CI_SRCDIR)/%.c
-	$(CC) $(CFLAGS) -o $@ $< $(SMOKE_EXTRA_$@)
+define BUILD_SMOKE
+$1: $(CI_SRCDIR)/$1.c $2
+	$(CC) $(CFLAGS) -o $$@ $$< $2
+endef
+
+$(eval $(call BUILD_SMOKE,proto-smoke,))
+$(eval $(call BUILD_SMOKE,reliability-smoke,$(TOPDIR)/proto/reliability.c))
+$(eval $(call BUILD_SMOKE,identity-smoke,$(TOPDIR)/proto/identity.c))
+$(eval $(call BUILD_SMOKE,config-smoke,$(TOPDIR)/proto/config.c $(TOPDIR)/proto/identity.c))
 
 clean:
 	rm -f $(SMOKES)
