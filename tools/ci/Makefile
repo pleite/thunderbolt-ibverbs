@@ -15,35 +15,29 @@
 #
 
 TOPDIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))../..)
-SRCDIR := $(TOPDIR)
+CI_SRCDIR := $(TOPDIR)/tools/ci
 
 CC ?= gcc
 CFLAGS ?= -Wall -Wextra -std=c11 -O2
-CFLAGS += -I$(SRCDIR)
+CFLAGS += -I$(TOPDIR)
 
 # Smoke test sources: name -> list of proto/*.c translation units needed
 SMOKES := proto-smoke reliability-smoke identity-smoke config-smoke
 
 # Source files for each smoke test (reliability, identity, config need their .c)
-SMOKE_RELIABILITY_SRCS := proto/reliability.c
-SMOKE_IDENTITY_SRCS := proto/identity.c
-SMOKE_CONFIG_SRCS := proto/config.c proto/identity.c
+SMOKE_EXTRA_proto-smoke :=
+SMOKE_EXTRA_reliability-smoke := $(TOPDIR)/proto/reliability.c
+SMOKE_EXTRA_identity-smoke := $(TOPDIR)/proto/identity.c
+SMOKE_EXTRA_config-smoke := $(TOPDIR)/proto/config.c $(TOPDIR)/proto/identity.c
 
-.PHONY: all clean
+.PHONY: all test clean
 
-all: $(SMOKES)
+all: test
 
-proto-smoke: tools/ci/proto-smoke.c
-	$(CC) $(CFLAGS) -o $@ $<
+test: $(SMOKES)
 
-reliability-smoke: tools/ci/reliability-smoke.c $(SMOKE_RELIABILITY_SRCS)
-	$(CC) $(CFLAGS) -o $@ $< $(SMOKE_RELIABILITY_SRCS)
-
-identity-smoke: tools/ci/identity-smoke.c $(SMOKE_IDENTITY_SRCS)
-	$(CC) $(CFLAGS) -o $@ $< $(SMOKE_IDENTITY_SRCS)
-
-config-smoke: tools/ci/config-smoke.c $(SMOKE_CONFIG_SRCS)
-	$(CC) $(CFLAGS) -o $@ $< $(SMOKE_CONFIG_SRCS)
+$(SMOKES): %: $(CI_SRCDIR)/%.c
+	$(CC) $(CFLAGS) -o $@ $< $(SMOKE_EXTRA_$@)
 
 clean:
 	rm -f $(SMOKES)
