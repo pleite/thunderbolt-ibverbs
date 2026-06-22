@@ -14,6 +14,12 @@ modules.order
 # proto/ unit test binaries (compiled outputs, no extension)
 proto/test_reliability_dedup
 
+# tools/ci/ smoke binaries (compiled outputs, no extension)
+tools/ci/proto-smoke
+tools/ci/reliability-smoke
+tools/ci/identity-smoke
+tools/ci/config-smoke
+
 # DKMS/local packaging outputs
 *.deb
 *.rpm

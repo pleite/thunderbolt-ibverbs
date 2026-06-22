@@ -6,6 +6,12 @@ KVER ?= $(shell uname -r)
 KDIR ?= /lib/modules/$(KVER)/build
 KERNEL_DIR ?= kernel
 
+# Single source of truth for the DKMS package name/version is dkms.conf.
+# Deriving them here keeps the Makefile, dkms.conf, and packaging in lockstep.
+DKMS_NAME    ?= $(shell awk -F'"' '/^PACKAGE_NAME=/    { print $$2; exit }' dkms.conf)
+DKMS_VERSION ?= $(shell awk -F'"' '/^PACKAGE_VERSION=/ { print $$2; exit }' dkms.conf)
+DKMS_MODULE   = $(DKMS_NAME)/$(DKMS_VERSION)
+
 .PHONY: all clean modules modules_install help dkms-add dkms-build dkms-install dkms-remove
 
 all: modules
@@ -32,10 +38,10 @@ dkms-add:
 	dkms add .
 
 dkms-build:
-	dkms build thunderbolt-ibverbs/0.1.0 -k $(KVER)
+	dkms build $(DKMS_MODULE) -k $(KVER)
 
 dkms-install:
-	dkms install thunderbolt-ibverbs/0.1.0 -k $(KVER)
+	dkms install $(DKMS_MODULE) -k $(KVER)
 
 dkms-remove:
-	dkms remove thunderbolt-ibverbs/0.1.0 --all
+	dkms remove $(DKMS_MODULE) --all

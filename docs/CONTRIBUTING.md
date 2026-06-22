@@ -47,6 +47,13 @@ nix develop                              # dev shell
 
 ## Testing
 
+Freestanding `proto/` smoke binaries build and run without kernel headers:
+
+```sh
+make -C proto test        # reliability dedup unit test
+make -C tools/ci test     # proto/reliability/identity/config smoke binaries
+```
+
 After loading the module (`modprobe thunderbolt_ibverbs …`), verify with:
 
 ```sh
