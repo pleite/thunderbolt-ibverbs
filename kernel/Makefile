@@ -30,7 +30,7 @@ ifneq ($(shell test -n "$(_tbv_ib_verbs_h)" && \
     ccflags-y += -DTBV_KERNEL_HAS_IB_DMAH
 endif
 
-# Feature detection: ib_umem_get_va() added in newer kernels.
+# Feature detection: ib_umem_get_va() added in Linux 7.2.
 _tbv_ib_umem_h := $(firstword $(wildcard \
     $(KDIR)/include/rdma/ib_umem.h \
     $(_tbv_kdir_common)/include/rdma/ib_umem.h))
