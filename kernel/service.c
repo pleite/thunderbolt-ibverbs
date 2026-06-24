@@ -177,8 +177,8 @@ static bool tbv_service_has_pending_apple_rail_locked(struct tbv_state *state)
 static void tbv_service_refresh_apple_rails_pending(struct tbv_state *state)
 {
 	mutex_lock(&state->lock);
-	state->apple_rails_pending =
-		tbv_service_has_pending_apple_rail_locked(state);
+	WRITE_ONCE(state->apple_rails_pending,
+		   tbv_service_has_pending_apple_rail_locked(state));
 	mutex_unlock(&state->lock);
 }
 
@@ -263,15 +263,26 @@ tbv_service_next_pending_apple_rail(struct tbv_state *state)
 			return rail;
 		}
 	}
-	state->apple_rails_pending = pending;
+	WRITE_ONCE(state->apple_rails_pending, pending);
 	mutex_unlock(&state->lock);
 	return NULL;
+}
+
+static void tbv_service_apple_rail_work(struct work_struct *work);
+
+#define TBV_APPLE_RAIL_RETRY_DELAY (HZ / 4)
+
+static void tbv_service_schedule_apple_rail_retry(struct tbv_state *state)
+{
+	queue_delayed_work(system_long_wq, &state->apple_rail_work,
+			   TBV_APPLE_RAIL_RETRY_DELAY);
 }
 
 static void tbv_service_apple_rail_work(struct work_struct *work)
 {
 	struct tbv_state *state =
-		container_of(work, struct tbv_state, apple_rail_work);
+		container_of(to_delayed_work(work), struct tbv_state,
+			     apple_rail_work);
 
 	if (!state->services_registered || !state->enable_tunnels)
 		return;
@@ -290,11 +301,12 @@ static void tbv_service_apple_rail_work(struct work_struct *work)
 		if (ret) {
 			struct tbv_peer *peer = rail->peer;
 
-			pr_warn("failed to publish deferred Apple data service peer=%u route=0x%llx rail=0x%x state=%s ret=%d\n",
+			pr_warn("failed to publish deferred Apple data service peer=%u route=0x%llx rail=0x%x state=%s ret=%d; retrying\n",
 				peer->peer_id, peer->xd->route,
 				rail->rail_id,
 				tbv_path_state_name(rail->path.state), ret);
 			tbv_rail_put(rail);
+			tbv_service_schedule_apple_rail_retry(state);
 			return;
 		}
 
@@ -313,7 +325,7 @@ void tbv_services_tbnet_identity_ready(struct tbv_tbnet_identity *identity)
 	if (!tbv_service_tbnet_path_ready(state, NULL))
 		return;
 
-	queue_work(system_long_wq, &state->apple_rail_work);
+	queue_delayed_work(system_long_wq, &state->apple_rail_work, 0);
 }
 
 static bool tbv_service_apple_xdomain_allowed(const struct tb_xdomain *xd)
@@ -451,13 +463,20 @@ static int tbv_service_probe(struct tb_service *svc,
 			} else if (backend == TBV_BACKEND_APPLE &&
 				   tbv_service_state->enable_tunnels) {
 				if (tbv_service_should_defer_apple_rail(tbv_service_state, xd)) {
-					tbv_service_state->apple_rails_pending = true;
+					WRITE_ONCE(tbv_service_state->apple_rails_pending,
+						   true);
 					pr_info("deferring Apple data service id=%d route=0x%llx until ThunderboltIP packet path is active\n",
 						svc->id, xd->route);
 				} else {
 					ret = tbv_service_publish_apple_rail(rail);
-					if (ret)
-						goto err_remove_rail;
+					if (ret) {
+						pr_warn("failed to publish Apple data service id=%d route=0x%llx ret=%d; scheduling retry\n",
+							svc->id, xd->route, ret);
+						WRITE_ONCE(tbv_service_state->apple_rails_pending,
+							   true);
+						tbv_service_schedule_apple_rail_retry(tbv_service_state);
+						ret = 0;
+					}
 				}
 			}
 		}
@@ -654,8 +673,8 @@ int tbv_services_start(struct tbv_state *state, bool bind_services,
 	 */
 	state->apple_rails_wait_tbnet =
 		state->cfg.tbnet_identity == TBV_TBNET_ID_MINIMAL_PACKET;
-	state->apple_rails_pending = false;
-	INIT_WORK(&state->apple_rail_work, tbv_service_apple_rail_work);
+	WRITE_ONCE(state->apple_rails_pending, false);
+	INIT_DELAYED_WORK(&state->apple_rail_work, tbv_service_apple_rail_work);
 
 	if (!bind_services) {
 		pr_info("Thunderbolt service binding disabled\n");
@@ -716,8 +735,8 @@ void tbv_services_stop(struct tbv_state *state)
 		tb_unregister_service_driver(&tbv_service_driver);
 		state->services_registered = false;
 	}
-	cancel_work_sync(&state->apple_rail_work);
-	state->apple_rails_pending = false;
+	cancel_delayed_work_sync(&state->apple_rail_work);
+	WRITE_ONCE(state->apple_rails_pending, false);
 
 	tbv_tbnet_minimal_stop(&state->tbnet_identity);
 	tbv_native_control_stop(state);
