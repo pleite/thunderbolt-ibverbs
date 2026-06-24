@@ -30,15 +30,6 @@ ifneq ($(shell test -n "$(_tbv_ib_verbs_h)" && \
     ccflags-y += -DTBV_KERNEL_HAS_IB_DMAH
 endif
 
-# Feature detection: ib_umem_get_va() added in Linux 7.2.
-_tbv_ib_umem_h := $(firstword $(wildcard \
-    $(KDIR)/include/rdma/ib_umem.h \
-    $(_tbv_kdir_common)/include/rdma/ib_umem.h))
-ifneq ($(shell test -n "$(_tbv_ib_umem_h)" && \
-    grep -q 'ib_umem_get_va' "$(_tbv_ib_umem_h)" 2>/dev/null && echo yes),)
-    ccflags-y += -DTBV_HAS_IB_UMEM_GET_VA_API
-endif
-
 # GPU-direct: compile in the gated reg_user_mr_dmabuf op when requested.
 ifeq ($(tbv_gpu_direct),1)
     ccflags-y += -DCONFIG_TBV_GPU_DIRECT
@@ -53,6 +44,15 @@ _tbv_ib_umem_dmabuf_h := $(firstword $(wildcard \
     $(_tbv_kdir_common)/include/rdma/ib_umem_dmabuf.h))
 ifneq ($(_tbv_ib_umem_dmabuf_h),)
     ccflags-y += -DTBV_KERNEL_HAS_IB_UMEM_DMABUF_H
+endif
+
+# Feature detection: ib_umem_get_va() added in Linux 7.2.
+_tbv_ib_umem_h := $(firstword $(wildcard \
+    $(KDIR)/include/rdma/ib_umem.h \
+    $(_tbv_kdir_common)/include/rdma/ib_umem.h))
+ifneq ($(shell test -n "$(_tbv_ib_umem_h)" && \
+    grep -q 'ib_umem_get_va' "$(_tbv_ib_umem_h)" 2>/dev/null && echo yes),)
+    ccflags-y += -DTBV_HAS_IB_UMEM_GET_VA_API
 endif
 
 .PHONY: all clean modules modules_install help
