@@ -115,7 +115,8 @@ the configured thresholds versus baseline.
 - [Strix Halo vLLM toolbox integration](docs/vllm-toolbox-integration.md) — using the kyuz0 RCCL toolbox over thunderbolt-ibverbs
 - [Toolbox feedback response](docs/toolbox-feedback-response.md) — how the tb-vllm-toolbox upstream recommendations were addressed
 - [GPU-direct RDMA via dma-buf — design and implementation plan](docs/gpu-direct-plan.md) — investigation findings and phased plan for dma-buf MR support on AMD AI MAX+ 395 (Strix Halo)
-- [Upstream sync analysis](docs/UPSTREAM_SYNC.md) — change table, applicability assessment, and integration path for upstream v0.3.1–v0.3.4 and open PRs
+- [Upstream sync analysis](docs/UPSTREAM_SYNC.md) — detailed compatibility/conflict analysis for upstream patch integration
+- [Upstream sync execution plan](docs/upstream-sync/README.md) — post-v0.3.4 session plan and per-feature launch sequence
 
 ## Status
 
@@ -145,6 +146,10 @@ they drive, are tracked in [docs/FINDINGS.md](docs/FINDINGS.md). All findings
 have been addressed, so the automation that filed an issue + branch + draft PR
 per open finding is archived under
 [scripts/archive/fixes/](scripts/archive/fixes/).
+
+Post-v0.3.4 upstream integration work is handled by an active toolkit:
+[scripts/upstream-sync/](scripts/upstream-sync/), with per-feature specs in
+[docs/upstream-sync/steps/](docs/upstream-sync/steps/).
 
 ## License
 
