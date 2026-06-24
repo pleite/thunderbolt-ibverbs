@@ -9,5 +9,6 @@ Toolkits kept for reference after the work they drove has shipped.
 
 Both toolkits drove the analysis/roadmap work catalogued in
 [`docs/FINDINGS.md`](../../docs/FINDINGS.md) and [`docs/ROADMAP.md`](../../docs/ROADMAP.md)
-to completion, so there is no active automation under [`scripts/`](../) at this
-time. New analysis-driven work would add a fresh toolkit alongside these.
+to completion. New active upstream-integration automation now lives in
+[`scripts/upstream-sync/`](../upstream-sync/); this `archive/` tree remains
+reference-only.

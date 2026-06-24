@@ -1,4 +1,4 @@
-# Upstream synchronization — v0.3.1 through v0.3.4
+# Upstream synchronization — v0.3.1 through post-v0.3.4 merges
 
 > **Document status:** living reference — update each time upstream releases or
 > a new batch of changes is evaluated.
@@ -11,6 +11,12 @@
 > **Purpose:** prevent regression by cataloguing every upstream change, assessing
 > whether it applies to this fork, and specifying the exact integration path
 > before any merge is attempted.
+
+> **2026-06-24 addendum (new upstream merges):**
+> upstream PRs **#44**, **#46**, **#49**, and **#50** are now merged and should
+> be treated as active integration targets. The execution plan and per-feature
+> launch specs are tracked in [`docs/upstream-sync/README.md`](upstream-sync/README.md)
+> and launched with [`scripts/upstream-sync/`](../scripts/upstream-sync/).
 
 ---
 
