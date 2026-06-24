@@ -470,11 +470,14 @@ static int tbv_service_probe(struct tb_service *svc,
 				} else {
 					ret = tbv_service_publish_apple_rail(rail);
 					if (ret) {
+						struct tbv_state *st =
+							tbv_service_state;
+
 						pr_warn("failed to publish Apple data service id=%d route=0x%llx ret=%d; scheduling retry\n",
 							svc->id, xd->route, ret);
-						WRITE_ONCE(tbv_service_state->apple_rails_pending,
+						WRITE_ONCE(st->apple_rails_pending,
 							   true);
-						tbv_service_schedule_apple_rail_retry(tbv_service_state);
+						tbv_service_schedule_apple_rail_retry(st);
 						ret = 0;
 					}
 				}
