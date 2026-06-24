@@ -36,7 +36,7 @@ _tbv_ib_umem_h := $(firstword $(wildcard \
     $(_tbv_kdir_common)/include/rdma/ib_umem.h))
 ifneq ($(shell test -n "$(_tbv_ib_umem_h)" && \
     grep -q 'ib_umem_get_va' "$(_tbv_ib_umem_h)" 2>/dev/null && echo yes),)
-    ccflags-y += -DTBV_KERNEL_HAS_IB_UMEM_GET_VA
+    ccflags-y += -DTBV_HAS_IB_UMEM_GET_VA_API
 endif
 
 # GPU-direct: compile in the gated reg_user_mr_dmabuf op when requested.

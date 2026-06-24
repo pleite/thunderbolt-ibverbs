@@ -143,7 +143,7 @@ struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	if (!mr)
 		return ERR_PTR(-ENOMEM);
 
-#ifdef TBV_KERNEL_HAS_IB_UMEM_GET_VA
+#ifdef TBV_HAS_IB_UMEM_GET_VA_API
 	mr->umem = ib_umem_get_va(pd->device, start, length, access);
 #else
 	mr->umem = ib_umem_get(pd->device, start, length, access);
