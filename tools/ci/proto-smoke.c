@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "proto/apple_tx.h"
 #include "proto/native_data.h"
 #include "proto/tbnet.h"
 
@@ -160,6 +161,33 @@ static int test_minimal_tbnet_e2e_policy(void)
 	return 0;
 }
 
+static int test_apple_tx_admission_policy(void)
+{
+	/* Zero-frame SENDs do not need the exclusive window. */
+	if (tbv_apple_tx_requires_exclusive_window(0))
+		return 1;
+
+	/* All non-empty SENDs require exclusive serialization (upstream #44). */
+	if (!tbv_apple_tx_requires_exclusive_window(1))
+		return 2;
+	if (!tbv_apple_tx_requires_exclusive_window(2))
+		return 3;
+	if (!tbv_apple_tx_requires_exclusive_window(64))
+		return 4;
+
+	/* Frame charge is capped to max_frames when the window is active. */
+	if (tbv_apple_tx_frame_charge(10, 64) != 10)
+		return 5;
+	if (tbv_apple_tx_frame_charge(100, 64) != 64)
+		return 6;
+
+	/* Frame charge is zero when the window is disabled (max_frames == 0). */
+	if (tbv_apple_tx_frame_charge(10, 0) != 0)
+		return 7;
+
+	return 0;
+}
+
 int main(void)
 {
 	unsigned char hello_buf[TBV_NATIVE_WIRE_HELLO_MSG_SIZE];
@@ -247,6 +275,8 @@ int main(void)
 		return 15;
 	if (test_minimal_tbnet_e2e_policy())
 		return 16;
+	if (test_apple_tx_admission_policy())
+		return 17;
 
 	puts("protocol header smoke OK");
 	return 0;
