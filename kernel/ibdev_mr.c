@@ -9,7 +9,6 @@
 #include <linux/overflow.h>
 #include <linux/random.h>
 #include <linux/slab.h>
-#include <linux/version.h>
 #include <linux/workqueue.h>
 #ifdef CONFIG_TBV_GPU_DIRECT
 #include <linux/dma-buf.h>
@@ -144,7 +143,7 @@ struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	if (!mr)
 		return ERR_PTR(-ENOMEM);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+#ifdef TBV_KERNEL_HAS_IB_UMEM_GET_VA
 	mr->umem = ib_umem_get_va(pd->device, start, length, access);
 #else
 	mr->umem = ib_umem_get(pd->device, start, length, access);
