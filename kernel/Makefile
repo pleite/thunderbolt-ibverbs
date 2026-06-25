@@ -46,15 +46,13 @@ ifneq ($(_tbv_ib_umem_dmabuf_h),)
     ccflags-y += -DTBV_KERNEL_HAS_IB_UMEM_DMABUF_H
 endif
 
-# Linux 7.2 renamed ib_umem_get() to ib_umem_get_va() to make the 'start'
-# vs 'virt_addr' split explicit.  Probe ib_umem.h rather than using
-# LINUX_VERSION_CODE so the build adapts to backports.
+# Feature detection: ib_umem_get_va() added in Linux 7.2.
 _tbv_ib_umem_h := $(firstword $(wildcard \
     $(KDIR)/include/rdma/ib_umem.h \
     $(_tbv_kdir_common)/include/rdma/ib_umem.h))
 ifneq ($(shell test -n "$(_tbv_ib_umem_h)" && \
     grep -q 'ib_umem_get_va' "$(_tbv_ib_umem_h)" 2>/dev/null && echo yes),)
-    ccflags-y += -DTBV_KERNEL_HAS_IB_UMEM_GET_VA
+    ccflags-y += -DTBV_HAS_IB_UMEM_GET_VA_API
 endif
 
 .PHONY: all clean modules modules_install help
