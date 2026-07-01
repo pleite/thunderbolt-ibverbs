@@ -109,6 +109,7 @@ the configured thresholds versus baseline.
 - [Contributing guide](CONTRIBUTING.md) — contributor workflow and expectations
 - [Wire protocol spec](proto/WIRE_PROTOCOL.md) — native control/data frame contracts
 - [Module parameter reference](docs/MODULE_PARAMETERS.md) — full `thunderbolt_ibverbs` parameter catalog
+- [Multi-port topology guide](docs/MULTI-PORT-TOPOLOGY.md) — two-machine dual-port (all lanes) and four-machine ring configuration
 - [Architecture overview](docs/ARCHITECTURE.md) — kernel module ↔ provider ↔ verbs layer diagram and data path description
 - [Troubleshooting guide](docs/TROUBLESHOOTING.md) — symptom-by-symptom checklist
 - [Detailed contributor notes](docs/CONTRIBUTING.md) — build instructions, code style, and PR process
